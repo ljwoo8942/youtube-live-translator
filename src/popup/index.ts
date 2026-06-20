@@ -1,4 +1,4 @@
-import { loadSettings, saveSettings } from "../shared/storage";
+import { loadSettings } from "../shared/storage";
 import type { MessageResponse } from "../shared/messages";
 import type { ContentMode, InputMode, SttProvider, TranslationProvider, TranslatorSettings } from "../shared/types";
 import "./style.css";
@@ -10,16 +10,15 @@ function activeTab(): Promise<chrome.tabs.Tab | undefined> {
   return chrome.tabs.query({ active: true, currentWindow: true }).then((tabs) => tabs[0]);
 }
 
-async function notifyActiveTab(): Promise<void> {
-  const tab = await activeTab();
-  if (tab?.id) {
-    await chrome.tabs.sendMessage(tab.id, { type: "SETTINGS_UPDATED", settings }).catch(() => undefined);
+async function persist(patch: Partial<TranslatorSettings>): Promise<void> {
+  const response = await chrome.runtime.sendMessage<MessageResponse<{ settings: TranslatorSettings; revision: number }>>({
+    type: "SAVE_SETTINGS",
+    patch
+  });
+  if (!response?.ok) {
+    throw new Error(response?.error ?? "설정을 저장하지 못했습니다.");
   }
-}
-
-async function persist(): Promise<void> {
-  await saveSettings(settings);
-  await notifyActiveTab();
+  settings = response.settings;
 }
 
 async function stopActiveTabAudio(): Promise<void> {
@@ -245,8 +244,7 @@ function render(): void {
 
   enabled?.addEventListener("change", () => {
     runAction(async () => {
-      settings.enabled = enabled.checked;
-      await persist();
+      await persist({ enabled: enabled.checked });
       if (!settings.enabled) {
         await stopActiveTabAudio();
         setStatus("자막을 껐습니다.");
@@ -258,14 +256,15 @@ function render(): void {
 
   document.querySelector("#save")?.addEventListener("click", () => {
     runAction(async () => {
-      settings.enabled = Boolean(enabled?.checked);
-      settings.inputMode = (inputMode?.value ?? settings.inputMode) as InputMode;
-      settings.contentMode = (contentMode?.value ?? settings.contentMode) as ContentMode;
-      settings.translationProvider = (translationProvider?.value ?? settings.translationProvider) as TranslationProvider;
-      settings.sttProvider = (sttProvider?.value ?? settings.sttProvider) as SttProvider;
-      settings.sourceLanguage = sourceLanguage?.value || "auto";
-      settings.targetLanguage = targetLanguage?.value.trim() || "ko";
-      await persist();
+      await persist({
+        enabled: Boolean(enabled?.checked),
+        inputMode: (inputMode?.value ?? settings.inputMode) as InputMode,
+        contentMode: (contentMode?.value ?? settings.contentMode) as ContentMode,
+        translationProvider: (translationProvider?.value ?? settings.translationProvider) as TranslationProvider,
+        sttProvider: (sttProvider?.value ?? settings.sttProvider) as SttProvider,
+        sourceLanguage: sourceLanguage?.value || "auto",
+        targetLanguage: targetLanguage?.value.trim() || "ko"
+      });
       if (!settings.enabled) {
         await stopActiveTabAudio();
       }
@@ -281,16 +280,17 @@ function render(): void {
 
   document.querySelector("#startAudio")?.addEventListener("click", () => {
     runAction(async () => {
-      settings.enabled = true;
-      settings.inputMode = "audio";
-      settings.contentMode = (contentMode?.value ?? settings.contentMode) as ContentMode;
-      settings.translationProvider = (translationProvider?.value ?? settings.translationProvider) as TranslationProvider;
-      settings.sttProvider = (sttProvider?.value ?? settings.sttProvider) as SttProvider;
-      settings.sourceLanguage = sourceLanguage?.value || "auto";
-      settings.targetLanguage = targetLanguage?.value.trim() || "ko";
+      await persist({
+        enabled: true,
+        inputMode: "audio",
+        contentMode: (contentMode?.value ?? settings.contentMode) as ContentMode,
+        translationProvider: (translationProvider?.value ?? settings.translationProvider) as TranslationProvider,
+        sttProvider: (sttProvider?.value ?? settings.sttProvider) as SttProvider,
+        sourceLanguage: sourceLanguage?.value || "auto",
+        targetLanguage: targetLanguage?.value.trim() || "ko"
+      });
       if (enabled) enabled.checked = true;
       if (inputMode) inputMode.value = "audio";
-      await persist();
 
       const tab = await activeTab();
       const response = await chrome.runtime.sendMessage<MessageResponse<{ tabId: number; mode?: string }>>({

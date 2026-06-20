@@ -1,5 +1,5 @@
-import { loadSettings, patchSettings } from "../shared/storage";
-import type { CaptionSegment, PageCaptionSnapshot, PageCaptionTrack } from "../shared/types";
+import { loadSettings, loadSettingsSnapshot, patchSettings, toContentSettings } from "../shared/storage";
+import type { CaptionSegment, PageCaptionSnapshot, PageCaptionTrack, TranslatorSettings } from "../shared/types";
 import type { CaptionTranslationEntry, MessageResponse, RuntimeMessage } from "../shared/messages";
 import { getErrorMessage } from "../shared/messages";
 import { TRANSLATION_PROMPT_VERSION } from "../shared/translationVersion";
@@ -33,6 +33,7 @@ const STREAM_PARTIAL_TRANSLATION_MIN_CHARACTERS = 5;
 
 let creatingOffscreen: Promise<void> | undefined;
 let activeAudioTabId: number | undefined;
+let lastBroadcastSettingsRevision = -1;
 let startingAudioCapture: { tabId: number; promise: Promise<MessageResponse<{ tabId: number; mode?: string }>> } | undefined;
 const translationCache = new Map<string, string>();
 const translationInFlight = new Map<string, Promise<MessageResponse<{ translatedText: string; provider: string }>>>();
@@ -44,6 +45,10 @@ const lastFinalTranscriptByTab = new Map<number, { text: string; at: number }>()
 const lastPartialTranslationByTab = new Map<number, { text: string; at: number }>();
 const streamTranslationGenerationByTab = new Map<number, number>();
 const audioContextByTab = new Map<number, string[]>();
+
+void chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" }).catch((error) => {
+  console.debug("Could not restrict local storage to trusted extension contexts", error);
+});
 type PretranslateJob = {
   cancelled: boolean;
   currentTimeMs: number;
@@ -1428,6 +1433,31 @@ async function notifyTab(tabId: number, message: RuntimeMessage): Promise<void> 
   }
 }
 
+async function broadcastContentSettings(settings: TranslatorSettings, revision: number): Promise<void> {
+  if (revision <= lastBroadcastSettingsRevision) {
+    return;
+  }
+  lastBroadcastSettingsRevision = revision;
+  const tabs = await chrome.tabs.query({ url: ["*://www.youtube.com/*", "*://m.youtube.com/*"] });
+  const message: RuntimeMessage = { type: "SETTINGS_UPDATED", settings: toContentSettings(settings) };
+  await Promise.all(tabs.flatMap((tab) => (tab.id ? [notifyTab(tab.id, message)] : [])));
+}
+
+async function saveSettingsPatch(patch: Partial<TranslatorSettings>) {
+  const snapshot = await patchSettings(patch);
+  await broadcastContentSettings(snapshot.settings, snapshot.revision);
+  return snapshot;
+}
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== "local" || (!changes.translatorSettings && !changes.translatorSettingsRevision)) {
+    return;
+  }
+  void loadSettingsSnapshot()
+    .then((snapshot) => broadcastContentSettings(snapshot.settings, snapshot.revision))
+    .catch((error) => console.debug("Could not broadcast stored settings", error));
+});
+
 function segmentWithAudioContext(tabId: number, segment: CaptionSegment): CaptionSegment {
   const context = audioContextByTab.get(tabId) ?? [];
   return context.length > 0 ? { ...segment, contextText: context.join("\n") } : segment;
@@ -1679,7 +1709,7 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
   void (async () => {
     try {
       if (message.type === "GET_SETTINGS") {
-        sendResponse({ ok: true, settings: await loadSettings() });
+        sendResponse({ ok: true, settings: toContentSettings(await loadSettings()) });
         return;
       }
 
@@ -1741,14 +1771,20 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
       }
 
       if (message.type === "MINI_CONTROL_UPDATE") {
-        const nextSettings = await patchSettings(message.patch);
-        if (sender.tab?.id) {
-          await notifyTab(sender.tab.id, { type: "SETTINGS_UPDATED", settings: nextSettings });
-          if (!nextSettings.enabled) {
-            await stopAudioCapture(sender.tab.id);
-          }
+        const snapshot = await saveSettingsPatch(message.patch);
+        if (!snapshot.settings.enabled && sender.tab?.id) {
+          await stopAudioCapture(sender.tab.id);
         }
-        sendResponse({ ok: true, settings: nextSettings });
+        sendResponse({ ok: true, settings: toContentSettings(snapshot.settings), revision: snapshot.revision });
+        return;
+      }
+
+      if (message.type === "SAVE_SETTINGS") {
+        const snapshot = await saveSettingsPatch(message.patch);
+        if (!snapshot.settings.enabled && activeAudioTabId) {
+          await stopAudioCapture(activeAudioTabId);
+        }
+        sendResponse({ ok: true, settings: snapshot.settings, revision: snapshot.revision });
         return;
       }
 

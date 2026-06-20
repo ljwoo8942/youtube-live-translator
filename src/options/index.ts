@@ -1,5 +1,5 @@
 import { DEFAULT_SETTINGS } from "../shared/defaults";
-import { loadSettings, saveSettings } from "../shared/storage";
+import { diffSettings, loadSettings } from "../shared/storage";
 import type {
   ApiAuthHeaderMode,
   AiEndpointMode,
@@ -1039,9 +1039,20 @@ function collectSettings(): TranslatorSettings {
   };
 }
 
+async function saveSettingsPatch(patch: Partial<TranslatorSettings>): Promise<TranslatorSettings> {
+  const response = await chrome.runtime.sendMessage<MessageResponse<{ settings: TranslatorSettings; revision: number }>>({
+    type: "SAVE_SETTINGS",
+    patch
+  });
+  if (!response?.ok) {
+    throw new Error(response?.error ?? "설정을 저장하지 못했습니다.");
+  }
+  return response.settings;
+}
+
 async function saveCurrentSettings(): Promise<void> {
-  settings = collectSettings();
-  await saveSettings(settings);
+  const nextSettings = collectSettings();
+  settings = await saveSettingsPatch(diffSettings(settings, nextSettings));
   if (!settings.enabled) {
     await chrome.runtime.sendMessage({ type: "STOP_AUDIO_CAPTURE" }).catch(() => undefined);
   }
@@ -1567,8 +1578,8 @@ function bindActions(): void {
 
   byId<HTMLButtonElement>("restore").addEventListener("click", () => {
     runAction(async () => {
-      settings = structuredClone(DEFAULT_SETTINGS);
-      await saveSettings(settings);
+      const defaultSettings = structuredClone(DEFAULT_SETTINGS);
+      settings = await saveSettingsPatch(diffSettings(settings, defaultSettings));
       render();
       setStatus("기본값으로 복원했습니다.");
     });

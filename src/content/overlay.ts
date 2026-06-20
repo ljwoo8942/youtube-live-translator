@@ -1,4 +1,4 @@
-import type { CaptionSegment, TranslatorSettings } from "../shared/types";
+import type { CaptionSegment, ContentSettings } from "../shared/types";
 
 export class TranslatorOverlay {
   private host: HTMLDivElement | undefined;
@@ -11,7 +11,7 @@ export class TranslatorOverlay {
   private hasTranslation = false;
   private controlsBound = false;
 
-  ensure(settings: TranslatorSettings): void {
+  ensure(settings: ContentSettings): void {
     const player = findPlayerElement();
     if (!player) {
       return;
@@ -185,7 +185,7 @@ export class TranslatorOverlay {
     this.applySettings(settings);
   }
 
-  applySettings(settings: TranslatorSettings): void {
+  applySettings(settings: ContentSettings): void {
     if (!this.host) {
       return;
     }
@@ -215,14 +215,14 @@ export class TranslatorOverlay {
     });
   }
 
-  setControlStatus(text: string, settings: TranslatorSettings): void {
+  setControlStatus(text: string, settings: ContentSettings): void {
     this.ensure(settings);
     if (this.controlStatusLine) {
       this.controlStatusLine.textContent = text;
     }
   }
 
-  showTranslation(segment: CaptionSegment, translatedText: string, provider: string, settings: TranslatorSettings): void {
+  showTranslation(segment: CaptionSegment, translatedText: string, provider: string, settings: ContentSettings): void {
     this.ensure(settings);
     if (!this.host || !this.translationLine || !this.sourceLine || !this.statusLine) {
       return;
@@ -235,7 +235,7 @@ export class TranslatorOverlay {
     this.statusLine.textContent = provider === "cache" ? "" : provider;
   }
 
-  showStatus(text: string, settings: TranslatorSettings): void {
+  showStatus(text: string, settings: ContentSettings): void {
     this.ensure(settings);
     if (!this.host || !this.translationLine || !this.statusLine) {
       return;
@@ -250,7 +250,7 @@ export class TranslatorOverlay {
     this.statusLine.textContent = text;
   }
 
-  showError(text: string, settings: TranslatorSettings): void {
+  showError(text: string, settings: ContentSettings): void {
     this.ensure(settings);
     if (!this.host || !this.translationLine || !this.statusLine) {
       return;
@@ -262,7 +262,7 @@ export class TranslatorOverlay {
     this.statusLine.textContent = "";
   }
 
-  showSegmentError(segment: CaptionSegment, error: string, settings: TranslatorSettings): void {
+  showSegmentError(segment: CaptionSegment, error: string, settings: ContentSettings): void {
     this.ensure(settings);
     if (!this.host || !this.translationLine || !this.sourceLine || !this.statusLine) {
       return;
@@ -300,7 +300,7 @@ export class TranslatorOverlay {
     this.controlsBound = false;
   }
 
-  private updateControlButtons(settings: TranslatorSettings): void {
+  private updateControlButtons(settings: ContentSettings): void {
     if (!this.controlsLine) {
       return;
     }

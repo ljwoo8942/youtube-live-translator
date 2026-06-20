@@ -1,8 +1,15 @@
 import { DEFAULT_SETTINGS, SETTINGS_KEY } from "./defaults";
-import type { TranslatorSettings } from "./types";
+import type { ContentSettings, SettingsSnapshot, TranslatorSettings } from "./types";
 
 type PlainObject = Record<string, unknown>;
 const OFFICIAL_CAPTION_POLICY_VERSION = 1;
+const SETTINGS_REVISION_KEY = "translatorSettingsRevision";
+
+type StoredSettings = Partial<TranslatorSettings> & {
+  officialCaptionPolicyVersion?: number;
+};
+
+let settingsWriteQueue: Promise<void> = Promise.resolve();
 
 function isPlainObject(value: unknown): value is PlainObject {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -27,10 +34,16 @@ function mergeDeep<T extends PlainObject>(base: T, override: unknown): T {
 }
 
 export async function loadSettings(): Promise<TranslatorSettings> {
-  const stored = (await chrome.storage.local.get(SETTINGS_KEY)) as {
-    [SETTINGS_KEY]?: Partial<TranslatorSettings>;
+  return (await loadSettingsSnapshot()).settings;
+}
+
+export async function loadSettingsSnapshot(): Promise<SettingsSnapshot> {
+  const stored = (await chrome.storage.local.get([SETTINGS_KEY, SETTINGS_REVISION_KEY])) as {
+    [SETTINGS_KEY]?: StoredSettings;
+    [SETTINGS_REVISION_KEY]?: unknown;
   };
   const settings = mergeDeep(DEFAULT_SETTINGS as unknown as PlainObject, stored[SETTINGS_KEY]) as TranslatorSettings;
+  let revision = typeof stored[SETTINGS_REVISION_KEY] === "number" ? stored[SETTINGS_REVISION_KEY] : 0;
   const rawProvider = (settings as unknown as { translationProvider?: string }).translationProvider;
   if (rawProvider === "google") {
     settings.translationProvider = "openai";
@@ -43,23 +56,77 @@ export async function loadSettings(): Promise<TranslatorSettings> {
     settings.inputMode = "captionsThenAudio";
     settings.pretranslateEnabled = true;
     (settings as unknown as PlainObject).officialCaptionPolicyVersion = OFFICIAL_CAPTION_POLICY_VERSION;
-    await saveSettings(settings);
+    revision += 1;
+    await saveSettings(settings, revision);
   }
-  return settings;
+  return { settings, revision };
 }
 
-export async function saveSettings(settings: TranslatorSettings): Promise<void> {
+async function saveSettings(settings: TranslatorSettings, revision: number): Promise<void> {
   await chrome.storage.local.set({
     [SETTINGS_KEY]: {
       ...settings,
       officialCaptionPolicyVersion: OFFICIAL_CAPTION_POLICY_VERSION
-    }
+    },
+    [SETTINGS_REVISION_KEY]: revision
   });
 }
 
-export async function patchSettings(patch: Partial<TranslatorSettings>): Promise<TranslatorSettings> {
-  const current = await loadSettings();
-  const merged = mergeDeep(current as unknown as PlainObject, patch) as TranslatorSettings;
-  await saveSettings(merged);
-  return merged;
+export function toContentSettings(settings: TranslatorSettings): ContentSettings {
+  return {
+    enabled: settings.enabled,
+    inputMode: settings.inputMode,
+    contentMode: settings.contentMode,
+    pretranslateEnabled: settings.pretranslateEnabled,
+    miniControlsEnabled: settings.miniControlsEnabled,
+    streamingSttEnabled: settings.streamingSttEnabled,
+    streamingSttEndpoint: settings.streamingSttEndpoint,
+    speakerTurnDetection: settings.speakerTurnDetection,
+    sourceLanguage: settings.sourceLanguage,
+    targetLanguage: settings.targetLanguage,
+    translationProvider: settings.translationProvider,
+    sttProvider: settings.sttProvider,
+    latencyOffsetMs: settings.latencyOffsetMs,
+    audioChunkMs: settings.audioChunkMs,
+    overlayStyle: { ...settings.overlayStyle },
+    streamingSttModel: settings.whisper.model
+  };
+}
+
+function diffDeep(previous: PlainObject, next: PlainObject): PlainObject {
+  const patch: PlainObject = {};
+  for (const [key, nextValue] of Object.entries(next)) {
+    const previousValue = previous[key];
+    if (isPlainObject(previousValue) && isPlainObject(nextValue)) {
+      const nestedPatch = diffDeep(previousValue, nextValue);
+      if (Object.keys(nestedPatch).length > 0) {
+        patch[key] = nestedPatch;
+      }
+    } else if (!Object.is(previousValue, nextValue)) {
+      patch[key] = nextValue;
+    }
+  }
+  return patch;
+}
+
+export function diffSettings(previous: TranslatorSettings, next: TranslatorSettings): Partial<TranslatorSettings> {
+  return diffDeep(previous as unknown as PlainObject, next as unknown as PlainObject) as Partial<TranslatorSettings>;
+}
+
+export function patchSettings(patch: Partial<TranslatorSettings>): Promise<SettingsSnapshot> {
+  const write = settingsWriteQueue.then(async () => {
+    const current = await loadSettingsSnapshot();
+    if (Object.keys(patch).length === 0) {
+      return current;
+    }
+    const settings = mergeDeep(current.settings as unknown as PlainObject, patch) as TranslatorSettings;
+    const revision = current.revision + 1;
+    await saveSettings(settings, revision);
+    return { settings, revision };
+  });
+  settingsWriteQueue = write.then(
+    () => undefined,
+    () => undefined
+  );
+  return write;
 }

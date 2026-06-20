@@ -100,6 +100,22 @@ export type TranslatorSettings = {
   whisper: WhisperProviderSettings;
 };
 
+// Content scripts only need behavior and presentation settings. Keep provider
+// endpoints and credentials inside trusted extension contexts.
+export type ContentSettings = Omit<
+  TranslatorSettings,
+  "openai" | "apiStt" | "ollama" | "lmStudio" | "whisper"
+> & {
+  streamingSttModel: string;
+};
+
+export type MiniControlSettingsPatch = Partial<Pick<TranslatorSettings, "enabled" | "contentMode" | "overlayStyle">>;
+
+export type SettingsSnapshot = {
+  settings: TranslatorSettings;
+  revision: number;
+};
+
 export type TranslationRequest = {
   segment: CaptionSegment;
 };

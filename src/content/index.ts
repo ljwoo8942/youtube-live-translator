@@ -1,4 +1,4 @@
-import type { CaptionSegment, PageCaptionSnapshot, TranslatorSettings } from "../shared/types";
+import type { CaptionSegment, ContentSettings, MiniControlSettingsPatch, PageCaptionSnapshot } from "../shared/types";
 import type { CaptionTranslationEntry, MessageResponse, RuntimeMessage } from "../shared/messages";
 import { TranslatorOverlay, findVideoElement } from "./overlay";
 import {
@@ -26,7 +26,7 @@ const OVERLAY_REFRESH_DELAY_MS = 100;
 const OFFICIAL_CAPTION_DOM_READ_DELAY_MS = 30;
 const OFFICIAL_TIMED_TEXT_GRACE_MS = 650;
 
-let settings: TranslatorSettings;
+let settings: ContentSettings;
 let timedTextSegments: Awaited<ReturnType<typeof fetchTimedTextSegments>> = [];
 let timedTextVideoId = "";
 let timedTextCaptionHash = "";
@@ -56,8 +56,8 @@ let pendingTimedTextTrackKey = "";
 let lastVisibleOfficialCaptionKey = "";
 let pageCaptionSnapshot: PageCaptionSnapshot | undefined;
 
-async function loadContentSettings(): Promise<TranslatorSettings> {
-  const response = await chrome.runtime.sendMessage<MessageResponse<{ settings: TranslatorSettings }>>({
+async function loadContentSettings(): Promise<ContentSettings> {
+  const response = await chrome.runtime.sendMessage<MessageResponse<{ settings: ContentSettings }>>({
     type: "GET_SETTINGS"
   });
   if (response?.ok) {
@@ -265,8 +265,8 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-async function updateSettingsFromMini(patch: Partial<TranslatorSettings>): Promise<void> {
-  const response = await chrome.runtime.sendMessage<MessageResponse<{ settings: TranslatorSettings }>>({
+async function updateSettingsFromMini(patch: MiniControlSettingsPatch): Promise<void> {
+  const response = await chrome.runtime.sendMessage<MessageResponse<{ settings: ContentSettings }>>({
     type: "MINI_CONTROL_UPDATE",
     patch
   });
@@ -669,7 +669,7 @@ function shouldStartAudioFallback(): boolean {
   return missingForMs >= AUDIO_FALLBACK_STALE_CAPTION_MS;
 }
 
-function audioCaptureSettingsKey(value: TranslatorSettings): string {
+function audioCaptureSettingsKey(value: ContentSettings): string {
   const usesStreamingWhisper = value.sttProvider === "whisper" && value.streamingSttEnabled;
   return [
     value.inputMode,
@@ -679,7 +679,7 @@ function audioCaptureSettingsKey(value: TranslatorSettings): string {
     value.sttProvider,
     value.streamingSttEnabled,
     usesStreamingWhisper ? value.streamingSttEndpoint : "",
-    usesStreamingWhisper ? value.whisper.model : "",
+    usesStreamingWhisper ? value.streamingSttModel : "",
     usesStreamingWhisper ? value.speakerTurnDetection : ""
   ].join("|");
 }
@@ -742,8 +742,11 @@ async function disableTranslator(): Promise<void> {
   await chrome.runtime.sendMessage({ type: "STOP_AUDIO_CAPTURE" }).catch(() => undefined);
 }
 
-function applySettingsUpdate(nextSettings: TranslatorSettings): void {
+function applySettingsUpdate(nextSettings: ContentSettings): void {
   const previousSettings = settings;
+  if (JSON.stringify(previousSettings) === JSON.stringify(nextSettings)) {
+    return;
+  }
   const wasAudioCaptureActive = Boolean(previousSettings?.enabled && audioCaptureRequested);
   const shouldStopAudio =
     wasAudioCaptureActive && (!nextSettings.enabled || nextSettings.inputMode === "captions");

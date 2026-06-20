@@ -1,4 +1,10 @@
-import type { CaptionSegment, PageCaptionSnapshot, TranslatorSettings } from "./types";
+import type {
+  CaptionSegment,
+  ContentSettings,
+  MiniControlSettingsPatch,
+  PageCaptionSnapshot,
+  TranslatorSettings
+} from "./types";
 
 export type CaptionTranslationEntry = {
   id: string;
@@ -50,8 +56,9 @@ export type RuntimeMessage =
   | { type: "AUDIO_TRANSCRIPT"; tabId: number; segment: CaptionSegment }
   | { type: "STREAM_STT_TRANSCRIPT"; tabId: number; segment: CaptionSegment; isFinal: boolean }
   | { type: "AUDIO_CAPTURE_STATUS"; state: string; error?: string; tabId?: number; statusText?: string }
-  | { type: "SETTINGS_UPDATED"; settings: TranslatorSettings }
-  | { type: "MINI_CONTROL_UPDATE"; patch: Partial<TranslatorSettings> }
+  | { type: "SETTINGS_UPDATED"; settings: ContentSettings }
+  | { type: "SAVE_SETTINGS"; patch: Partial<TranslatorSettings> }
+  | { type: "MINI_CONTROL_UPDATE"; patch: MiniControlSettingsPatch }
   | { type: "RESET_AUDIO_CAPTURE_COOLDOWN"; tabId?: number }
   | { type: "OPEN_OPTIONS_PAGE" }
   | { type: "GET_SETTINGS" }

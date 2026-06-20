@@ -1,4 +1,4 @@
-import type { CaptionSegment, PageCaptionSnapshot, PageCaptionTrack, TranslatorSettings } from "../shared/types";
+import type { CaptionSegment, ContentSettings, PageCaptionSnapshot, PageCaptionTrack } from "../shared/types";
 import { findVideoElement } from "./overlay";
 
 type CaptionTrack = PageCaptionTrack & {
@@ -306,7 +306,7 @@ function selectedOfficialCaptionTrack(selection: CaptionSelection): CaptionTrack
   };
 }
 
-function configuredOfficialCaptionTrack(tracks: CaptionTrack[], settings: TranslatorSettings): CaptionTrack | undefined {
+function configuredOfficialCaptionTrack(tracks: CaptionTrack[], settings: ContentSettings): CaptionTrack | undefined {
   const configuredLanguage = settings.sourceLanguage.trim().toLowerCase().replace(/_/g, "-");
   if (!configuredLanguage || configuredLanguage === "auto") {
     return undefined;
@@ -336,7 +336,7 @@ function matchingOfficialCaptionTrack(
   );
 }
 
-function chooseTrack(tracks: CaptionTrack[], settings: TranslatorSettings, selection = currentCaptionSelection()): CaptionTrack | undefined {
+function chooseTrack(tracks: CaptionTrack[], settings: ContentSettings, selection = currentCaptionSelection()): CaptionTrack | undefined {
   const officialTracks = tracks.filter(isOfficialCaptionTrack);
   if (selection.autoTranslationActive) {
     // Never consume the caption currently rendered by YouTube's translation
@@ -370,7 +370,7 @@ function chooseTrack(tracks: CaptionTrack[], settings: TranslatorSettings, selec
   );
 }
 
-export function getSelectedOfficialCaptionTrackKey(settings: TranslatorSettings): string | undefined {
+export function getSelectedOfficialCaptionTrackKey(settings: ContentSettings): string | undefined {
   const videoId = getVideoId();
   if (!videoId) {
     return undefined;
@@ -449,7 +449,7 @@ function hasSentenceBoundary(text: string): boolean {
 function canMergeTimedTextSegment(
   current: TimedTextSegment,
   next: TimedTextSegment,
-  settings: TranslatorSettings
+  settings: ContentSettings
 ): boolean {
   const gapMs = next.startMs - current.endMs;
   if (gapMs < -250 || gapMs > MERGE_MAX_GAP_MS) {
@@ -482,7 +482,7 @@ function mergeTimedTextPair(current: TimedTextSegment, next: TimedTextSegment): 
   };
 }
 
-function mergeShortTimedTextSegments(segments: TimedTextSegment[], settings: TranslatorSettings): TimedTextSegment[] {
+function mergeShortTimedTextSegments(segments: TimedTextSegment[], settings: ContentSettings): TimedTextSegment[] {
   if (segments.length < 2) {
     return segments;
   }
@@ -572,7 +572,7 @@ export function hashCaptionSegments(segments: CaptionSegment[]): string {
 }
 
 export async function fetchTimedTextSegmentsWithMetadata(
-  settings: TranslatorSettings,
+  settings: ContentSettings,
   pageSnapshot?: PageCaptionSnapshot
 ): Promise<TimedTextFetchResult | undefined> {
   const videoId = getVideoId();
@@ -609,11 +609,11 @@ export async function fetchTimedTextSegmentsWithMetadata(
   return { videoId, trackLanguage: track.languageCode ?? settings.sourceLanguage, trackKey: captionTrackKey(track), segments: [] };
 }
 
-export async function fetchTimedTextSegments(settings: TranslatorSettings): Promise<TimedTextSegment[]> {
+export async function fetchTimedTextSegments(settings: ContentSettings): Promise<TimedTextSegment[]> {
   return (await fetchTimedTextSegmentsWithMetadata(settings))?.segments ?? [];
 }
 
-export function getCurrentTimedTextSegment(segments: TimedTextSegment[], settings: TranslatorSettings): TimedTextSegment | undefined {
+export function getCurrentTimedTextSegment(segments: TimedTextSegment[], settings: ContentSettings): TimedTextSegment | undefined {
   const video = findVideoElement();
   if (!video) {
     return undefined;
