@@ -1,0 +1,22 @@
+# JavaScript build and dependency output
+node_modules/
+dist/
+
+# Local Python runtime and cache
+.venv-stt/
+__pycache__/
+*.py[cod]
+
+# Local STT output and diagnostics
+*.log
+*.err.log
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Local agent and editor state
+.agents/
+.DS_Store
+Thumbs.db
