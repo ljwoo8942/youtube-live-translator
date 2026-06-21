@@ -44,6 +44,31 @@ export class TranslatorOverlay {
       bottom: `calc(100vh - ${playerRect.bottom}px + ${this.playerBottom()})`
     });
   };
+  private readonly repairFullscreenGesture = (event: MouseEvent) => {
+    if (!event.isTrusted || document.fullscreenElement) {
+      return;
+    }
+    const target = event.target;
+    if (!(target instanceof Element) || !target.closest(".ytp-fullscreen-button")) {
+      return;
+    }
+
+    const player = findPlayerElement();
+    if (!player) {
+      return;
+    }
+
+    // Let YouTube process its normal click first. If it remains in the theater
+    // layout, this still runs inside the same trusted user gesture.
+    queueMicrotask(() => {
+      if (document.fullscreenElement || player.classList.contains("ytp-fullscreen") || !player.isConnected) {
+        return;
+      }
+      void player.requestFullscreen().catch((error) => {
+        console.debug("YouTube fullscreen fallback was rejected", error);
+      });
+    });
+  };
 
   ensure(settings: ContentSettings): void {
     const player = findPlayerElement();
@@ -332,6 +357,7 @@ export class TranslatorOverlay {
     this.playerClassObserver?.disconnect();
     this.playerClassObserver = undefined;
     document.removeEventListener("fullscreenchange", this.syncHostPlacement);
+    document.removeEventListener("click", this.repairFullscreenGesture, true);
     window.removeEventListener("resize", this.syncHostPlacement);
     window.removeEventListener("scroll", this.syncHostPlacement, true);
     this.host?.remove();
@@ -356,6 +382,7 @@ export class TranslatorOverlay {
     this.playerClassObserver = new MutationObserver(this.syncHostPlacement);
     this.playerClassObserver.observe(this.player, { attributes: true, attributeFilter: ["class"] });
     document.addEventListener("fullscreenchange", this.syncHostPlacement);
+    document.addEventListener("click", this.repairFullscreenGesture, true);
     window.addEventListener("resize", this.syncHostPlacement);
     window.addEventListener("scroll", this.syncHostPlacement, true);
   }
