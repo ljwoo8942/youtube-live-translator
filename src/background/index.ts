@@ -966,10 +966,10 @@ function pretranslateJobKey(tabId: number, context: CaptionCacheContext): string
   ].join("|");
 }
 
-function cancelTabPretranslationJobs(tabId: number, exceptKey?: string): void {
+function cancelTabPretranslationJobs(tabId: number, exceptKey?: string, keepVideoId?: string): void {
   const prefix = `${tabId}|`;
   for (const [key, job] of pretranslateJobs.entries()) {
-    if (key.startsWith(prefix) && key !== exceptKey) {
+    if (key.startsWith(prefix) && key !== exceptKey && (!keepVideoId || !key.startsWith(`${prefix}${keepVideoId}|`))) {
       job.cancelled = true;
       pretranslateJobs.delete(key);
     }
@@ -1130,6 +1130,7 @@ async function handlePretranslateCaptions(
       captionHash: message.captionHash,
       translated: cachedMap.size,
       total: message.segments.length,
+      translationConfigRevision: message.translationConfigRevision,
       statusText: `선번역 실패: ${getErrorMessage(error)}`
     });
   });
@@ -1155,6 +1156,7 @@ async function runPretranslationJob(
     captionHash: message.captionHash,
     translated,
     total: message.segments.length,
+    translationConfigRevision: message.translationConfigRevision,
     statusText: translated >= message.segments.length ? "캐시된 번역 자막 사용 중" : "현재 위치 자막 우선 번역 중..."
   });
 
@@ -1204,7 +1206,8 @@ async function runPretranslationJob(
       videoId: message.videoId,
       captionHash: message.captionHash,
       translations: safeTranslations,
-      provider: result.provider
+      provider: result.provider,
+      translationConfigRevision: message.translationConfigRevision
     });
     await notifyTab(tabId, {
       type: "PRETRANSLATE_PROGRESS",
@@ -1212,6 +1215,7 @@ async function runPretranslationJob(
       captionHash: message.captionHash,
       translated,
       total: message.segments.length,
+      translationConfigRevision: message.translationConfigRevision,
       statusText: translated >= message.segments.length ? "전체 자막 선번역 완료" : `자막 선번역 중 ${translated}/${message.segments.length}`
     });
   }
@@ -1433,28 +1437,34 @@ async function notifyTab(tabId: number, message: RuntimeMessage): Promise<void> 
   }
 }
 
-async function broadcastContentSettings(settings: TranslatorSettings, revision: number): Promise<void> {
+async function broadcastContentSettings(settings: TranslatorSettings, revision: number, translationConfigRevision: number): Promise<void> {
   if (revision <= lastBroadcastSettingsRevision) {
     return;
   }
   lastBroadcastSettingsRevision = revision;
   const tabs = await chrome.tabs.query({ url: ["*://www.youtube.com/*", "*://m.youtube.com/*"] });
-  const message: RuntimeMessage = { type: "SETTINGS_UPDATED", settings: toContentSettings(settings) };
+  const message: RuntimeMessage = {
+    type: "SETTINGS_UPDATED",
+    settings: toContentSettings(settings, translationConfigRevision)
+  };
   await Promise.all(tabs.flatMap((tab) => (tab.id ? [notifyTab(tab.id, message)] : [])));
 }
 
 async function saveSettingsPatch(patch: Partial<TranslatorSettings>) {
   const snapshot = await patchSettings(patch);
-  await broadcastContentSettings(snapshot.settings, snapshot.revision);
+  await broadcastContentSettings(snapshot.settings, snapshot.revision, snapshot.translationConfigRevision);
   return snapshot;
 }
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
-  if (areaName !== "local" || (!changes.translatorSettings && !changes.translatorSettingsRevision)) {
+  if (
+    areaName !== "local" ||
+    (!changes.translatorSettings && !changes.translatorSettingsRevision && !changes.translatorTranslationConfigRevision)
+  ) {
     return;
   }
   void loadSettingsSnapshot()
-    .then((snapshot) => broadcastContentSettings(snapshot.settings, snapshot.revision))
+    .then((snapshot) => broadcastContentSettings(snapshot.settings, snapshot.revision, snapshot.translationConfigRevision))
     .catch((error) => console.debug("Could not broadcast stored settings", error));
 });
 
@@ -1709,7 +1719,8 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
   void (async () => {
     try {
       if (message.type === "GET_SETTINGS") {
-        sendResponse({ ok: true, settings: toContentSettings(await loadSettings()) });
+        const snapshot = await loadSettingsSnapshot();
+        sendResponse({ ok: true, settings: toContentSettings(snapshot.settings, snapshot.translationConfigRevision) });
         return;
       }
 
@@ -1775,7 +1786,19 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
         if (!snapshot.settings.enabled && sender.tab?.id) {
           await stopAudioCapture(sender.tab.id);
         }
-        sendResponse({ ok: true, settings: toContentSettings(snapshot.settings), revision: snapshot.revision });
+        sendResponse({
+          ok: true,
+          settings: toContentSettings(snapshot.settings, snapshot.translationConfigRevision),
+          revision: snapshot.revision
+        });
+        return;
+      }
+
+      if (message.type === "CANCEL_PRETRANSLATION") {
+        if (sender.tab?.id) {
+          cancelTabPretranslationJobs(sender.tab.id, undefined, message.keepVideoId);
+        }
+        sendResponse({ ok: true });
         return;
       }
 

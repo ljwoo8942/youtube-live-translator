@@ -107,6 +107,7 @@ export type ContentSettings = Omit<
   "openai" | "apiStt" | "ollama" | "lmStudio" | "whisper"
 > & {
   streamingSttModel: string;
+  translationConfigRevision: number;
 };
 
 export type MiniControlSettingsPatch = Partial<Pick<TranslatorSettings, "enabled" | "contentMode" | "overlayStyle">>;
@@ -114,6 +115,7 @@ export type MiniControlSettingsPatch = Partial<Pick<TranslatorSettings, "enabled
 export type SettingsSnapshot = {
   settings: TranslatorSettings;
   revision: number;
+  translationConfigRevision: number;
 };
 
 export type TranslationRequest = {

@@ -159,7 +159,12 @@ function clearCaptionTrackRefreshTimers(): void {
   captionTrackRefreshTimers = [];
 }
 
+async function cancelPretranslation(keepVideoId?: string): Promise<void> {
+  await chrome.runtime.sendMessage({ type: "CANCEL_PRETRANSLATION", keepVideoId }).catch(() => undefined);
+}
+
 function beginVideoSession(videoId: string): void {
+  void cancelPretranslation(videoId);
   activeVideoId = videoId;
   timedTextLoadToken += 1;
   lastSentKey = "";
@@ -345,7 +350,10 @@ async function requestPretranslation(): Promise<void> {
   }
 
   const priorityBucket = Math.floor(currentVideoTimeMs() / PRETRANSLATE_PRIORITY_BUCKET_MS);
-  const requestKey = `${timedTextVideoId}:${timedTextCaptionHash}:${settings.targetLanguage}:${settings.translationProvider}:${settings.contentMode}:${priorityBucket}`;
+  const requestVideoId = timedTextVideoId;
+  const requestCaptionHash = timedTextCaptionHash;
+  const requestTranslationConfigRevision = settings.translationConfigRevision;
+  const requestKey = `${requestVideoId}:${requestCaptionHash}:${settings.targetLanguage}:${settings.translationProvider}:${requestTranslationConfigRevision}:${settings.contentMode}:${priorityBucket}`;
   if (requestKey === pretranslateRequestKey) {
     return;
   }
@@ -356,12 +364,20 @@ async function requestPretranslation(): Promise<void> {
       MessageResponse<{ translations: CaptionTranslationEntry[]; total: number; cached: number }>
     >({
       type: "PRETRANSLATE_CAPTIONS",
-      videoId: timedTextVideoId,
-      captionHash: timedTextCaptionHash,
+      videoId: requestVideoId,
+      captionHash: requestCaptionHash,
       trackLanguage: timedTextTrackLanguage,
       currentTimeMs: currentVideoTimeMs(),
+      translationConfigRevision: requestTranslationConfigRevision,
       segments: timedTextSegments
     });
+    if (
+      requestVideoId !== timedTextVideoId ||
+      requestCaptionHash !== timedTextCaptionHash ||
+      requestTranslationConfigRevision !== settings.translationConfigRevision
+    ) {
+      return;
+    }
     if (response?.ok) {
       mergeTimedTextTranslations(response.translations);
       if (response.total > 0 && response.cached > 0) {
@@ -754,6 +770,7 @@ function applySettingsUpdate(nextSettings: ContentSettings): void {
     wasAudioCaptureActive &&
     !shouldStopAudio &&
     audioCaptureSettingsKey(previousSettings) !== audioCaptureSettingsKey(nextSettings);
+  const translationConfigChanged = previousSettings.translationConfigRevision !== nextSettings.translationConfigRevision;
   settings = nextSettings;
   lastSentKey = "";
 
@@ -773,6 +790,23 @@ function applySettingsUpdate(nextSettings: ContentSettings): void {
   if (!activeVideoId) {
     activeVideoId = currentWatchVideoId();
   }
+
+  if (translationConfigChanged) {
+    timedTextTranslations = new Map();
+    pretranslateRequestKey = "";
+    pretranslateRetryBlockedUntil = 0;
+    const currentSegment = getCurrentTimedTextSegment(timedTextSegments, settings);
+    if (currentSegment) {
+      renderTimedTextSegment(currentSegment);
+    }
+    void cancelPretranslation().then(() => {
+      if (settings.translationConfigRevision === nextSettings.translationConfigRevision) {
+        void requestPretranslation();
+      }
+    });
+    return;
+  }
+
   void loadTimedText(activeVideoId);
 }
 
@@ -938,7 +972,8 @@ function installObservers(): void {
       if (
         settings.enabled &&
         message.videoId === timedTextVideoId &&
-        message.captionHash === timedTextCaptionHash
+        message.captionHash === timedTextCaptionHash &&
+        message.translationConfigRevision === settings.translationConfigRevision
       ) {
         mergeTimedTextTranslations(message.translations);
         showCurrentTimedTextTranslation(message.provider || "pretranslated");
@@ -952,6 +987,7 @@ function installObservers(): void {
         settings.enabled &&
         message.videoId === timedTextVideoId &&
         message.captionHash === timedTextCaptionHash &&
+        message.translationConfigRevision === settings.translationConfigRevision &&
         message.statusText
       ) {
         if (/실패|오류/.test(message.statusText)) {

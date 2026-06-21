@@ -4,6 +4,7 @@ import type { ContentSettings, SettingsSnapshot, TranslatorSettings } from "./ty
 type PlainObject = Record<string, unknown>;
 const OFFICIAL_CAPTION_POLICY_VERSION = 1;
 const SETTINGS_REVISION_KEY = "translatorSettingsRevision";
+const TRANSLATION_CONFIG_REVISION_KEY = "translatorTranslationConfigRevision";
 
 type StoredSettings = Partial<TranslatorSettings> & {
   officialCaptionPolicyVersion?: number;
@@ -38,12 +39,15 @@ export async function loadSettings(): Promise<TranslatorSettings> {
 }
 
 export async function loadSettingsSnapshot(): Promise<SettingsSnapshot> {
-  const stored = (await chrome.storage.local.get([SETTINGS_KEY, SETTINGS_REVISION_KEY])) as {
+  const stored = (await chrome.storage.local.get([SETTINGS_KEY, SETTINGS_REVISION_KEY, TRANSLATION_CONFIG_REVISION_KEY])) as {
     [SETTINGS_KEY]?: StoredSettings;
     [SETTINGS_REVISION_KEY]?: unknown;
+    [TRANSLATION_CONFIG_REVISION_KEY]?: unknown;
   };
   const settings = mergeDeep(DEFAULT_SETTINGS as unknown as PlainObject, stored[SETTINGS_KEY]) as TranslatorSettings;
   let revision = typeof stored[SETTINGS_REVISION_KEY] === "number" ? stored[SETTINGS_REVISION_KEY] : 0;
+  const translationConfigRevision =
+    typeof stored[TRANSLATION_CONFIG_REVISION_KEY] === "number" ? stored[TRANSLATION_CONFIG_REVISION_KEY] : 0;
   const rawProvider = (settings as unknown as { translationProvider?: string }).translationProvider;
   if (rawProvider === "google") {
     settings.translationProvider = "openai";
@@ -57,22 +61,23 @@ export async function loadSettingsSnapshot(): Promise<SettingsSnapshot> {
     settings.pretranslateEnabled = true;
     (settings as unknown as PlainObject).officialCaptionPolicyVersion = OFFICIAL_CAPTION_POLICY_VERSION;
     revision += 1;
-    await saveSettings(settings, revision);
+    await saveSettings(settings, revision, translationConfigRevision);
   }
-  return { settings, revision };
+  return { settings, revision, translationConfigRevision };
 }
 
-async function saveSettings(settings: TranslatorSettings, revision: number): Promise<void> {
+async function saveSettings(settings: TranslatorSettings, revision: number, translationConfigRevision: number): Promise<void> {
   await chrome.storage.local.set({
     [SETTINGS_KEY]: {
       ...settings,
       officialCaptionPolicyVersion: OFFICIAL_CAPTION_POLICY_VERSION
     },
-    [SETTINGS_REVISION_KEY]: revision
+    [SETTINGS_REVISION_KEY]: revision,
+    [TRANSLATION_CONFIG_REVISION_KEY]: translationConfigRevision
   });
 }
 
-export function toContentSettings(settings: TranslatorSettings): ContentSettings {
+export function toContentSettings(settings: TranslatorSettings, translationConfigRevision: number): ContentSettings {
   return {
     enabled: settings.enabled,
     inputMode: settings.inputMode,
@@ -89,8 +94,19 @@ export function toContentSettings(settings: TranslatorSettings): ContentSettings
     latencyOffsetMs: settings.latencyOffsetMs,
     audioChunkMs: settings.audioChunkMs,
     overlayStyle: { ...settings.overlayStyle },
-    streamingSttModel: settings.whisper.model
+    streamingSttModel: settings.whisper.model,
+    translationConfigRevision
   };
+}
+
+function translationConfigSignature(settings: TranslatorSettings): string {
+  return JSON.stringify({
+    provider: settings.translationProvider,
+    openai: settings.openai,
+    apiSttApiKey: settings.apiStt.apiKey,
+    ollama: settings.ollama,
+    lmStudio: settings.lmStudio
+  });
 }
 
 function diffDeep(previous: PlainObject, next: PlainObject): PlainObject {
@@ -121,8 +137,12 @@ export function patchSettings(patch: Partial<TranslatorSettings>): Promise<Setti
     }
     const settings = mergeDeep(current.settings as unknown as PlainObject, patch) as TranslatorSettings;
     const revision = current.revision + 1;
-    await saveSettings(settings, revision);
-    return { settings, revision };
+    const translationConfigRevision =
+      translationConfigSignature(current.settings) === translationConfigSignature(settings)
+        ? current.translationConfigRevision
+        : current.translationConfigRevision + 1;
+    await saveSettings(settings, revision, translationConfigRevision);
+    return { settings, revision, translationConfigRevision };
   });
   settingsWriteQueue = write.then(
     () => undefined,

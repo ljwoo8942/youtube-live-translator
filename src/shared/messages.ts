@@ -21,6 +21,7 @@ export type RuntimeMessage =
       captionHash: string;
       trackLanguage: string;
       currentTimeMs: number;
+      translationConfigRevision: number;
       segments: CaptionSegment[];
     }
   | {
@@ -29,6 +30,7 @@ export type RuntimeMessage =
       captionHash: string;
       translated: number;
       total: number;
+      translationConfigRevision: number;
       statusText?: string;
     }
   | {
@@ -37,6 +39,7 @@ export type RuntimeMessage =
       captionHash: string;
       translations: CaptionTranslationEntry[];
       provider: string;
+      translationConfigRevision: number;
     }
   | {
       type: "START_AUDIO_CAPTURE";
@@ -59,6 +62,7 @@ export type RuntimeMessage =
   | { type: "SETTINGS_UPDATED"; settings: ContentSettings }
   | { type: "SAVE_SETTINGS"; patch: Partial<TranslatorSettings> }
   | { type: "MINI_CONTROL_UPDATE"; patch: MiniControlSettingsPatch }
+  | { type: "CANCEL_PRETRANSLATION"; keepVideoId?: string }
   | { type: "RESET_AUDIO_CAPTURE_COOLDOWN"; tabId?: number }
   | { type: "OPEN_OPTIONS_PAGE" }
   | { type: "GET_SETTINGS" }
