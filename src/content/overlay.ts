@@ -8,8 +8,42 @@ export class TranslatorOverlay {
   private statusLine: HTMLDivElement | undefined;
   private controlsLine: HTMLDivElement | undefined;
   private controlStatusLine: HTMLSpanElement | undefined;
+  private player: HTMLElement | undefined;
+  private playerResizeObserver: ResizeObserver | undefined;
+  private playerClassObserver: MutationObserver | undefined;
   private hasTranslation = false;
   private controlsBound = false;
+  private readonly syncHostPlacement = () => {
+    const { host, player } = this;
+    if (!host || !player || !host.isConnected) {
+      return;
+    }
+
+    const mountInPlayer = this.isPlayerFullscreen(player);
+    const parent = mountInPlayer ? player : document.body || document.documentElement;
+    if (host.parentElement !== parent) {
+      parent.append(host);
+    }
+
+    host.dataset.portal = String(!mountInPlayer);
+    if (mountInPlayer) {
+      // A fullscreen document only paints descendants of the fullscreen player.
+      this.setHostBox({ position: "absolute", left: "0px", right: "0px", width: "auto", bottom: this.playerBottom() });
+      return;
+    }
+
+    const playerRect = player.getBoundingClientRect();
+    if (playerRect.width <= 0 || playerRect.height <= 0) {
+      return;
+    }
+    this.setHostBox({
+      position: "fixed",
+      left: `${playerRect.left}px`,
+      right: "auto",
+      width: `${playerRect.width}px`,
+      bottom: `calc(100vh - ${playerRect.bottom}px + ${this.playerBottom()})`
+    });
+  };
 
   ensure(settings: ContentSettings): void {
     const player = findPlayerElement();
@@ -17,12 +51,14 @@ export class TranslatorOverlay {
       return;
     }
 
-    if (this.host?.isConnected && this.host.parentElement === player) {
+    if (this.host?.isConnected && this.player === player) {
+      this.syncHostPlacement();
       this.applySettings(settings);
       return;
     }
 
     this.destroy();
+    this.removeStaleOverlayHosts();
 
     this.host = document.createElement("div");
     this.host.id = "yt-live-translator-overlay";
@@ -181,7 +217,10 @@ export class TranslatorOverlay {
     this.controlsLine = this.shadow.querySelector(".controls") as HTMLDivElement;
     this.controlStatusLine = this.shadow.querySelector(".control-status") as HTMLSpanElement;
     this.host.dataset.empty = "true";
-    player.append(this.host);
+    this.player = player;
+    this.installPlacementObservers();
+    (document.body || document.documentElement).append(this.host);
+    this.syncHostPlacement();
     this.applySettings(settings);
   }
 
@@ -288,6 +327,13 @@ export class TranslatorOverlay {
   }
 
   destroy(): void {
+    this.playerResizeObserver?.disconnect();
+    this.playerResizeObserver = undefined;
+    this.playerClassObserver?.disconnect();
+    this.playerClassObserver = undefined;
+    document.removeEventListener("fullscreenchange", this.syncHostPlacement);
+    window.removeEventListener("resize", this.syncHostPlacement);
+    window.removeEventListener("scroll", this.syncHostPlacement, true);
     this.host?.remove();
     this.host = undefined;
     this.shadow = undefined;
@@ -296,8 +342,58 @@ export class TranslatorOverlay {
     this.statusLine = undefined;
     this.controlsLine = undefined;
     this.controlStatusLine = undefined;
+    this.player = undefined;
     this.hasTranslation = false;
     this.controlsBound = false;
+  }
+
+  private installPlacementObservers(): void {
+    if (!this.player) {
+      return;
+    }
+    this.playerResizeObserver = new ResizeObserver(this.syncHostPlacement);
+    this.playerResizeObserver.observe(this.player);
+    this.playerClassObserver = new MutationObserver(this.syncHostPlacement);
+    this.playerClassObserver.observe(this.player, { attributes: true, attributeFilter: ["class"] });
+    document.addEventListener("fullscreenchange", this.syncHostPlacement);
+    window.addEventListener("resize", this.syncHostPlacement);
+    window.addEventListener("scroll", this.syncHostPlacement, true);
+  }
+
+  private removeStaleOverlayHosts(): void {
+    for (const staleHost of document.querySelectorAll<HTMLElement>("#yt-live-translator-overlay")) {
+      if (staleHost !== this.host) {
+        staleHost.remove();
+      }
+    }
+  }
+
+  private isPlayerFullscreen(player: HTMLElement): boolean {
+    const fullscreenElement = document.fullscreenElement;
+    return Boolean(
+      player.classList.contains("ytp-fullscreen") ||
+        player.matches(":fullscreen") ||
+        (fullscreenElement && (fullscreenElement === player || fullscreenElement.contains(player) || player.contains(fullscreenElement)))
+    );
+  }
+
+  private playerBottom(): string {
+    return "calc(var(--ytlt-bottom, 86px) + var(--ytlt-caption-clearance, 0px))";
+  }
+
+  private setHostBox(box: { position: "absolute" | "fixed"; left: string; right: string; width: string; bottom: string }): void {
+    if (!this.host) {
+      return;
+    }
+    this.host.style.setProperty("position", box.position, "important");
+    this.host.style.setProperty("left", box.left, "important");
+    this.host.style.setProperty("right", box.right, "important");
+    this.host.style.setProperty("width", box.width, "important");
+    this.host.style.setProperty("bottom", box.bottom, "important");
+    this.host.style.setProperty("top", "auto", "important");
+    this.host.style.setProperty("height", "auto", "important");
+    this.host.style.setProperty("margin", "0", "important");
+    this.host.style.setProperty("padding", "0", "important");
   }
 
   private updateControlButtons(settings: ContentSettings): void {

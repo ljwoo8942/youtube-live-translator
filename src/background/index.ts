@@ -122,8 +122,22 @@ const PROBABLE_AUDIO_PROMPT_LEAK_PARTS = [
   "donottranslate",
   "ignoreinstruments",
   "livestreamspeech",
+  "livestreamconversation",
+  "clearlyaudiblespokenvoices",
   "ignoremusicgamesounds",
   "backgroundnoise",
+  "englishandkoreanlyrics",
+  "koreanandenglishlyrics",
+  "englishkoreanlyrics",
+  "koreanenglishlyrics",
+  "lyricsinenglishandkorean",
+  "lyricsinkoreanandenglish",
+  "영어와한국어가사",
+  "한국어와영어가사",
+  "영어한국어가사",
+  "한국어영어가사",
+  "영어와한국어의가사",
+  "한국어와영어의가사",
   "그대로듣고녹음",
   "그대로받아쓰",
   "표준영어",
@@ -775,11 +789,22 @@ function normalizeSubtitleLines(text: string): string {
     .join("\n");
 }
 
+function isUnsupportedJapanesePregnancyTranslation(sourceText: string, translatedText: string): boolean {
+  const source = sourceText.replace(/[\s　]/g, "");
+  const describesHavingAChild = /(?:子供|子ども|こども)(?:が|を)?(?:でき|出来)/u.test(source);
+  const explicitlyMentionsPregnancy = /(?:妊娠|身ごも|懐妊|孕)/u.test(source);
+  return describesHavingAChild && !explicitlyMentionsPregnancy && /(?:임신|수태|잉태)/u.test(translatedText);
+}
+
 function sanitizeTranslatedSubtitle(segment: CaptionSegment, translatedText: string, contentMode: string): string {
   const normalized = normalizeSubtitleLines(translatedText);
   const hasAllowedLyricRefrain =
     contentMode === "lyrics" && isIntentionalLyricRefrain(segment.text) && isIntentionalLyricRefrain(normalized);
   if (!normalized || isModelRefusalOrMetaText(normalized) || (hasExcessiveTextRepetition(normalized) && !hasAllowedLyricRefrain)) {
+    return "";
+  }
+  if (isUnsupportedJapanesePregnancyTranslation(segment.text, normalized)) {
+    console.debug("Blocked unsupported pregnancy translation", { source: segment.text, translated: normalized });
     return "";
   }
 

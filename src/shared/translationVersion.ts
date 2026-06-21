@@ -1,1 +1,1 @@
-export const TRANSLATION_PROMPT_VERSION = "subtitle-lyric-mixed-hooks-v14";
+export const TRANSLATION_PROMPT_VERSION = "subtitle-japanese-role-accuracy-v15";
