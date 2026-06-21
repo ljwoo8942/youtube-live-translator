@@ -39,26 +39,27 @@ Default GPU settings are tuned for an RTX 5070 12 GB:
 - compute type: `int8_float16`
 - beam size: `1`
 - VAD: enabled
-- stream window: `7s`
-- stream decode interval: `1.5s`
+- stream window: `6s`
+- stream decode interval: `1.1s`
 
 When the extension sends `content_mode=lyrics`, the server switches to a song-friendly profile:
 
 - VAD: disabled, because accompaniment often makes vocal VAD unreliable
 - beam size: `3` by default
-- stream window: `14s`
-- stream decode interval: `2s`
-- minimum audio before decode: `4s`
+- stream window: `12s`
+- stream decode interval: `1.6s`
+- minimum audio before decode: `3s`
 - overlap after finalized text: `1.2s`
 - multilingual vocal prompt and a more permissive no-speech threshold
 
-When the extension sends `content_mode=live`, the server switches to a live/noisy speech profile:
+When the extension sends `content_mode=live`, the server uses a speech-first hybrid profile for streams that alternate between talking and singing:
 
-- VAD: enabled, with no-VAD retry when streaming returns empty text
+- VAD: enabled for ordinary speech; when the speech pass is empty, one song-aware, no-VAD lyrics pass checks for sung vocals
+- the lyrics fallback releases a forced source-language hint so mixed-language songs can be detected
 - beam size: `2` by default
-- stream window: `9s`
-- stream decode interval: `1.6s`
-- minimum audio before decode: `2.6s`
+- stream window: `8s`
+- stream decode interval: `1.3s`
+- minimum audio before decode: `2.1s`
 - overlap after finalized text: `1s`
 
 Override with environment variables such as `YT_TRANSLATOR_STT_MODEL`, `YT_TRANSLATOR_STT_DEVICE`, `YT_TRANSLATOR_STT_COMPUTE_TYPE`, `YT_TRANSLATOR_STT_STREAM_WINDOW_SECONDS`, or `YT_TRANSLATOR_STT_STREAM_DECODE_INTERVAL_SECONDS`.

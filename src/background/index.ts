@@ -62,6 +62,8 @@ const PROBABLE_AUDIO_HALLUCINATION_KEYS = new Set([
   "youyouyouyou",
   "thankyou",
   "thanks",
+  "pleasedonottrythisathome",
+  "pleasedonotreuploadthisvideo",
   "thankyouforwatching",
   "thanksforwatching",
   "pleasesubscribe",

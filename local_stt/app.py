@@ -72,7 +72,7 @@ LYRICS_INITIAL_PROMPT = os.environ.get(
 )
 LIVE_INITIAL_PROMPT = os.environ.get(
     "YT_TRANSLATOR_STT_LIVE_INITIAL_PROMPT",
-    "Live stream speech. Transcribe the speaker's voice in the original language or languages. The speaker may code-switch between languages. Ignore music, game sounds, and background noise. Do not translate.",
+    "Live stream conversation. Transcribe clearly audible spoken voices in their original language or languages. Speakers may code-switch between languages. Ignore music, game sounds, background noise, silence, and UI sounds. Do not translate.",
 )
 LYRICS_NO_SPEECH_THRESHOLD = float(os.environ.get("YT_TRANSLATOR_STT_LYRICS_NO_SPEECH_THRESHOLD", "0.85"))
 LIVE_NO_SPEECH_THRESHOLD = float(os.environ.get("YT_TRANSLATOR_STT_LIVE_NO_SPEECH_THRESHOLD", "0.72"))
@@ -88,6 +88,8 @@ PROBABLE_HALLUCINATION_KEYS = {
     "youyouyouyou",
     "thankyou",
     "thanks",
+    "pleasedonottrythisathome",
+    "pleasedonotreuploadthisvideo",
     "thankyouforwatching",
     "thanksforwatching",
     "pleasesubscribe",
@@ -146,6 +148,8 @@ PROMPT_LEAK_KEY_PARTS = {
     "donottranslate",
     "ignoreinstruments",
     "livestreamspeech",
+    "livestreamconversation",
+    "clearlyaudiblespokenvoices",
     "ignoremusicgamesounds",
     "backgroundnoise",
     "그대로듣고녹음",
@@ -261,6 +265,7 @@ def _server_config() -> dict[str, Any]:
         "empty_retry_no_vad": EMPTY_RETRY_NO_VAD,
         "live_profile": {
             "vad_filter": DEFAULT_VAD,
+            "lyrics_fallback_on_empty": True,
             "stream_window_seconds": LIVE_STREAM_WINDOW_SECONDS,
             "stream_min_audio_seconds": LIVE_STREAM_MIN_AUDIO_SECONDS,
             "stream_decode_interval_seconds": LIVE_STREAM_DECODE_INTERVAL_SECONDS,
@@ -659,6 +664,29 @@ def _transcribe_audio(
     return list(segments), info, vad_filter
 
 
+def _transcribe_live_lyrics_fallback(
+    whisper_model: WhisperModel,
+    audio: Any,
+    language: str | None,
+    preserve_turns: bool = False,
+) -> tuple[str, list[Any], Any, bool, int]:
+    """Probe sung vocals only after the low-latency live-speech pass is empty."""
+    lyrics_audio = _prepare_audio_for_mode(audio, "lyrics")
+    lyrics_beam_size = _beam_size_for_mode("lyrics")
+    segment_list, info, vad_used = _transcribe_audio(
+        whisper_model,
+        lyrics_audio,
+        _effective_language_for_mode(language, "lyrics"),
+        _vad_for_mode("lyrics"),
+        lyrics_beam_size,
+        _initial_prompt_for_mode("lyrics", language),
+        _no_speech_threshold_for_mode("lyrics"),
+    )
+    segment_list = _filter_transcription_segments(segment_list, "lyrics")
+    text = _segment_text(segment_list, preserve_turns)
+    return text, segment_list, info, vad_used, lyrics_beam_size
+
+
 def _stream_transcribe_text(
     whisper_model: WhisperModel,
     audio: Any,
@@ -685,7 +713,14 @@ def _stream_transcribe_text(
     )
     segment_list = _filter_transcription_segments(segment_list, content_mode)
     text = _segment_text(segment_list, preserve_turns)
-    if not text and vad_filter:
+    if not text and _is_live_mode(content_mode):
+        text, _segments, _info, vad_used, beam_size = _transcribe_live_lyrics_fallback(
+            whisper_model,
+            audio,
+            language,
+            preserve_turns,
+        )
+    elif not text and vad_filter:
         segment_list, _info, vad_used = _transcribe_audio(
             whisper_model,
             prepared_audio,
@@ -801,7 +836,13 @@ async def transcriptions(
             )
             segment_list = _filter_transcription_segments(segment_list, content_mode)
             text = _segment_text(segment_list)
-            if not text and vad_filter and EMPTY_RETRY_NO_VAD:
+            if not text and _is_live_mode(content_mode):
+                text, segment_list, info, vad_used, beam_size = _transcribe_live_lyrics_fallback(
+                    whisper_model,
+                    audio,
+                    language,
+                )
+            elif not text and vad_filter and EMPTY_RETRY_NO_VAD:
                 segment_list, info, vad_used = _transcribe_audio(
                     whisper_model,
                     prepared_audio,
