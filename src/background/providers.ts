@@ -427,6 +427,22 @@ function sourceLanguageGuidance(sourceLanguage: string): string {
   return `${languageNameOrCode(sourceLanguage)} as the primary source language, but the subtitle may include other languages`;
 }
 
+function meaningIntegrityGuidance(settings: TranslatorSettings, target: string): string {
+  const mode = effectiveContentMode(settings);
+  const lyricAllowance =
+    mode === "lyrics"
+      ? "For lyrics, imagery and word order may be reshaped for singable target-language phrasing, but never add or remove an event, action, relationship, or emotional turn."
+      : "";
+  return [
+    `Before output, silently check fidelity: preserve who did what to whom, negation, tense/aspect, number, uncertainty, quotation, and temporal, conditional, or causal relationships in ${target}.`,
+    "Do not invent an action, motive, cause, transition, or explanation merely to make a fragment sound fluent. Context may resolve an omission, but cannot supply a new fact.",
+    "When the source is genuinely ambiguous, use concise neutral wording in the target language instead of choosing a vivid unsupported interpretation.",
+    lyricAllowance
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
 function japaneseKoreanAccuracyGuidance(settings: TranslatorSettings, target: string): string {
   if (!isKoreanTarget(settings.targetLanguage || target)) {
     return "";
@@ -434,7 +450,9 @@ function japaneseKoreanAccuracyGuidance(settings: TranslatorSettings, target: st
   return [
     "Japanese-to-Korean accuracy check: determine predicate roles and idioms before wording; never mechanically map Japanese が to a Korean subject or reverse who feels, acts, or receives something.",
     "For a person-modifying phrase such as 人が嫌いな子, use the predicate meaning and context (normally 사람을 싫어하는 아이), not a reversed reading such as 사람이 싫은 아이.",
-    "Treat Xに子供ができる as X에게 아이가 생기다 or X가 아이를 갖게 되다. Do not use 임신 unless the Japanese explicitly says 妊娠, 身ごもる, 懐妊, or an equivalent pregnancy expression."
+    "Treat Xに子供ができる as X에게 아이가 생기다 or X가 아이를 갖게 되다. Do not use 임신 unless the Japanese explicitly says 妊娠, 身ごもる, 懐妊, or an equivalent pregnancy expression.",
+    "Treat 気付けば as 어느새 or 정신 차려 보니 when it marks an unplanned realization or passage of time. Never invent a causal action such as 마음을 열다 unless the source explicitly contains that action.",
+    "Example: 人が嫌いなあの子に気付けば子供ができた means 사람을 싫어하던 그 아이에게도 어느새 아이가 생겼다; do not add 마음을 열고."
   ].join(" ");
 }
 
@@ -444,12 +462,14 @@ function subtitleQualityGuidance(settings: TranslatorSettings, target: string): 
     ? "For Korean, write like a skilled Korean subtitle editor: use native word order, natural particles, and the fitting speech level. Do not preserve Japanese or English syntax, fillers, repeated subjects, or pronunciation when Korean would express the meaning more naturally."
     : "Use the target language's natural word order, register, and subtitle conventions instead of copying source syntax.";
   const japaneseKoreanAccuracy = japaneseKoreanAccuracyGuidance(settings, target);
+  const meaningIntegrity = meaningIntegrityGuidance(settings, target);
   const lyricMixedLanguageGuidance =
     effectiveContentMode(settings) === "lyrics" && koreanTarget
       ? "For Korean lyrics, preserve a clearly sung, standalone English interjection or hook in its original Latin form instead of translating or Korean-transliterating it: for example oh, yeah, baby, la la, wow wow, na na na, and ah-ah. Translate Japanese emotional interjections and onomatopoeia into natural Korean only, without parenthetical original text: for example しくしく as 훌쩍훌쩍 and ああ as 아아. In mixed Japanese-English lines, handle each phrase by this rule. Do not mistake katakana English, wasei-eigo, Japanglish, or Japanese-styled English for literal English when context shows a Japanese meaning."
       : "";
   return [
     "Write a polished subtitle, not a word-by-word gloss. Apply this order: preserve only the facts, emotion, and intent in CURRENT; use CONTEXT only to resolve ellipsis, pronouns, tone, or idioms; then rewrite it as a concise native subtitle.",
+    meaningIntegrity,
     koreanGuidance,
     "When Japanese appears, resolve omitted subjects and Japanese-style fragments from context without inventing facts. Interpret katakana English, wasei-eigo, Japanglish, and stylized English hooks by their Japanese in-context meaning, not by their spelling or pronunciation.",
     japaneseKoreanAccuracy,
@@ -531,12 +551,14 @@ function compactLocalTranslationPrompt(
   const turnGuidance = turnSeparatedGuidance(text);
   const lyricDiction = lyricDictionGuidance(settings, target);
   const japaneseKoreanAccuracy = japaneseKoreanAccuracyGuidance(settings, target);
+  const meaningIntegrity = meaningIntegrityGuidance(settings, target);
 
   if (!isKoreanTarget(settings.targetLanguage || target)) {
     return {
       system: [
         `Translate CURRENT into one natural ${target} subtitle.`,
         "Output only the translation. Prefer meaning and tone over source word order.",
+        meaningIntegrity,
         turnGuidance,
         "Context is reference only. Do not add speakers, explanations, or missing content."
       ].join(" "),
@@ -556,6 +578,7 @@ function compactLocalTranslationPrompt(
       "현재 자막만 자연스러운 한국어 유튜브 자막으로 번역한다.",
       "번역문만 출력한다. 분석, 원문, 라벨, 설명은 출력하지 않는다.",
       "CURRENT에 있는 정보·정서·의도만 보존하고, CONTEXT는 생략된 주어·관계·말투·관용 표현을 판단하는 참고로만 쓴다.",
+      meaningIntegrity,
       "직역 초안을 그대로 내보내지 말고, 뜻을 보존한 자연스러운 한국어 가사/대사 한 줄로 다시 구성한다. 직역 어순·불필요한 주어·반복어·발음 표기를 버리고 한국어다운 어순과 조사·어미로 다듬는다. 단, 가사에서 실제 영어로 불린 독립 훅은 원문 라틴 표기를 유지한다. 짧은 조각은 억지로 완결하지 않는다.",
       "일본어가 있으면 생략을 문맥으로 해석하고, 가타카나 영어·와세이에이고·재플리시는 철자나 발음이 아니라 일본어권에서 쓰인 뜻으로 옮긴다.",
       japaneseKoreanAccuracy,
@@ -609,9 +632,10 @@ function batchTranslationPrompt(
     const target = languageNameOrCode(settings.targetLanguage);
     const noThink = isQwenLikeModel(config.model) ? " Include /no_think in your internal instruction and do not output reasoning." : "";
     const japaneseKoreanAccuracy = japaneseKoreanAccuracyGuidance(settings, target);
+    const meaningIntegrity = meaningIntegrityGuidance(settings, target);
     return {
       system:
-        `Translate each CURRENT YouTube subtitle into fluent ${target}. Prioritize natural subtitle phrasing and meaning over source word order. ${japaneseKoreanAccuracy} Preserve newline-separated turns within each segment; do not merge turns or invent speaker names. Context is reference only and must not be translated. Return strict JSON only: an array of {"id","translatedText"}. Keep each id unchanged, output no markdown or explanation, and never invent missing content.${noThink}`,
+        `Translate each CURRENT YouTube subtitle into fluent ${target}. Prioritize natural subtitle phrasing and meaning over source word order. ${meaningIntegrity} ${japaneseKoreanAccuracy} Preserve newline-separated turns within each segment; do not merge turns or invent speaker names. Context is reference only and must not be translated. Return strict JSON only: an array of {"id","translatedText"}. Keep each id unchanged, output no markdown or explanation, and never invent missing content.${noThink}`,
       user: JSON.stringify({
         targetLanguage: target,
         segments: segments.map((segment) => ({

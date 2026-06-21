@@ -756,20 +756,17 @@ async function startAudioFallbackIfNeeded(): Promise<void> {
   if (shouldStartAudioFallback()) {
     audioStopRequested = false;
     audioCaptureRequested = true;
-    overlay.setAudioCaptureActive(true);
     overlay.showStatus("음성 인식을 시작하는 중...", settings);
     try {
       const response = await chrome.runtime.sendMessage<MessageResponse<{ tabId: number }>>({ type: "START_AUDIO_CAPTURE" });
       if (!response?.ok) {
         overlay.showError(response?.error ?? "음성 캡처 시작 응답을 받지 못했습니다. 확장 프로그램을 새로고침해 주세요.", settings);
         audioCaptureRequested = false;
-        overlay.setAudioCaptureActive(false);
         audioStartBlockedUntil = Date.now() + 12_000;
       }
     } catch (error) {
       overlay.showError(getErrorMessage(error), settings);
       audioCaptureRequested = false;
-      overlay.setAudioCaptureActive(false);
       audioStartBlockedUntil = Date.now() + 12_000;
     }
   }
@@ -786,7 +783,6 @@ async function stopAudioFallback(force = false): Promise<void> {
     return;
   }
   audioStopRequested = true;
-  overlay.setAudioCaptureActive(false);
   if (!audioCaptureRequested && !force) {
     return;
   }
@@ -809,7 +805,6 @@ async function disableTranslator(): Promise<void> {
   resetTimedTextState();
   audioCaptureRequested = false;
   audioStopRequested = true;
-  overlay.setAudioCaptureActive(false);
   audioStartBlockedUntil = 0;
   overlay.destroy();
   await chrome.runtime.sendMessage({ type: "STOP_AUDIO_CAPTURE" }).catch(() => undefined);
@@ -1104,23 +1099,19 @@ function installObservers(): void {
       if (message.state === "recording") {
         if (audioStopRequested || !settings.enabled || settings.inputMode === "captions" || !isYouTubeWatchPage()) {
           audioCaptureRequested = false;
-          overlay.setAudioCaptureActive(false);
           void chrome.runtime.sendMessage({ type: "STOP_AUDIO_CAPTURE" }).catch(() => undefined);
           sendResponse({ ok: true });
           return;
         }
         audioCaptureRequested = true;
-        overlay.setAudioCaptureActive(true);
         audioStartBlockedUntil = 0;
         overlay.showStatus(message.statusText ?? "음성 인식 중...", settings);
         overlay.setControlStatus(controlStatusText(), settings);
       } else if (message.state === "idle") {
         audioCaptureRequested = false;
-        overlay.setAudioCaptureActive(false);
         overlay.setControlStatus(controlStatusText(), settings);
       } else if (message.error) {
         audioCaptureRequested = false;
-        overlay.setAudioCaptureActive(false);
         audioStartBlockedUntil = Date.now() + 12_000;
         overlay.showError(message.error, settings);
         overlay.setControlStatus(controlStatusText(), settings);

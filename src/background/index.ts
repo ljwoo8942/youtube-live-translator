@@ -796,6 +796,13 @@ function isUnsupportedJapanesePregnancyTranslation(sourceText: string, translate
   return describesHavingAChild && !explicitlyMentionsPregnancy && /(?:임신|수태|잉태)/u.test(translatedText);
 }
 
+function isUnsupportedJapaneseAddedAction(sourceText: string, translatedText: string): boolean {
+  const source = sourceText.replace(/[\s　]/g, "");
+  const isNeutralRealization = /気付けば/u.test(source);
+  const hasExplicitHeartOpening = /(?:心を開|心開|気持ちを開)/u.test(source);
+  return isNeutralRealization && !hasExplicitHeartOpening && /마음(?:을)?\s*열/u.test(translatedText);
+}
+
 function sanitizeTranslatedSubtitle(segment: CaptionSegment, translatedText: string, contentMode: string): string {
   const normalized = normalizeSubtitleLines(translatedText);
   const hasAllowedLyricRefrain =
@@ -805,6 +812,10 @@ function sanitizeTranslatedSubtitle(segment: CaptionSegment, translatedText: str
   }
   if (isUnsupportedJapanesePregnancyTranslation(segment.text, normalized)) {
     console.debug("Blocked unsupported pregnancy translation", { source: segment.text, translated: normalized });
+    return "";
+  }
+  if (isUnsupportedJapaneseAddedAction(segment.text, normalized)) {
+    console.debug("Blocked unsupported Japanese added action", { source: segment.text, translated: normalized });
     return "";
   }
 

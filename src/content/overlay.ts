@@ -12,7 +12,6 @@ export class TranslatorOverlay {
   private playerResizeObserver: ResizeObserver | undefined;
   private playerClassObserver: MutationObserver | undefined;
   private hasTranslation = false;
-  private audioCaptureActive = false;
   private controlsBound = false;
   private readonly syncHostPlacement = () => {
     const { host, player } = this;
@@ -45,42 +44,6 @@ export class TranslatorOverlay {
       bottom: `calc(100vh - ${playerRect.bottom}px + ${this.playerBottom()})`
     });
   };
-  private readonly repairFullscreenGesture = (event: MouseEvent) => {
-    if (!event.isTrusted || document.fullscreenElement) {
-      return;
-    }
-    const target = event.target;
-    if (!(target instanceof Element) || !target.closest(".ytp-fullscreen-button")) {
-      return;
-    }
-
-    const player = findPlayerElement();
-    if (!player) {
-      return;
-    }
-
-    if (this.audioCaptureActive) {
-      // tabCapture-backed modes can occasionally leave YouTube in theater mode.
-      // Requesting fullscreen in the trusted click keeps the video transition
-      // independent of the active STT capture path.
-      void player.requestFullscreen().catch((error) => {
-        console.debug("YouTube capture-mode fullscreen request was rejected", error);
-      });
-      return;
-    }
-
-    // Let YouTube process its normal click first. If it remains in the theater
-    // layout, this still runs inside the same trusted user gesture.
-    queueMicrotask(() => {
-      if (document.fullscreenElement || player.classList.contains("ytp-fullscreen") || !player.isConnected) {
-        return;
-      }
-      void player.requestFullscreen().catch((error) => {
-        console.debug("YouTube fullscreen fallback was rejected", error);
-      });
-    });
-  };
-
   ensure(settings: ContentSettings): void {
     const player = findPlayerElement();
     if (!player) {
@@ -274,10 +237,6 @@ export class TranslatorOverlay {
     this.updateControlButtons(settings);
   }
 
-  setAudioCaptureActive(active: boolean): void {
-    this.audioCaptureActive = active;
-  }
-
   bindMiniControls(onAction: (action: string) => void): void {
     if (!this.controlsLine || this.controlsBound) {
       return;
@@ -372,7 +331,6 @@ export class TranslatorOverlay {
     this.playerClassObserver?.disconnect();
     this.playerClassObserver = undefined;
     document.removeEventListener("fullscreenchange", this.syncHostPlacement);
-    document.removeEventListener("click", this.repairFullscreenGesture, true);
     window.removeEventListener("resize", this.syncHostPlacement);
     window.removeEventListener("scroll", this.syncHostPlacement, true);
     this.host?.remove();
@@ -385,7 +343,6 @@ export class TranslatorOverlay {
     this.controlStatusLine = undefined;
     this.player = undefined;
     this.hasTranslation = false;
-    this.audioCaptureActive = false;
     this.controlsBound = false;
   }
 
@@ -398,7 +355,6 @@ export class TranslatorOverlay {
     this.playerClassObserver = new MutationObserver(this.syncHostPlacement);
     this.playerClassObserver.observe(this.player, { attributes: true, attributeFilter: ["class"] });
     document.addEventListener("fullscreenchange", this.syncHostPlacement);
-    document.addEventListener("click", this.repairFullscreenGesture, true);
     window.addEventListener("resize", this.syncHostPlacement);
     window.addEventListener("scroll", this.syncHostPlacement, true);
   }
@@ -414,8 +370,7 @@ export class TranslatorOverlay {
   private isPlayerFullscreen(player: HTMLElement): boolean {
     const fullscreenElement = document.fullscreenElement;
     return Boolean(
-      player.classList.contains("ytp-fullscreen") ||
-        player.matches(":fullscreen") ||
+      player.matches(":fullscreen") ||
         (fullscreenElement && (fullscreenElement === player || fullscreenElement.contains(player) || player.contains(fullscreenElement)))
     );
   }
