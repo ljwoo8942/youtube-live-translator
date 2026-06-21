@@ -25,6 +25,7 @@ const PRETRANSLATE_PRIORITY_BUCKET_MS = 5_000;
 const OVERLAY_REFRESH_DELAY_MS = 100;
 const OFFICIAL_CAPTION_DOM_READ_DELAY_MS = 30;
 const OFFICIAL_TIMED_TEXT_GRACE_MS = 650;
+const VIDEO_SESSION_CAPTION_RETRY_DELAYS_MS = [0, 450, 1800, 4200, 8000];
 
 let settings: ContentSettings;
 let timedTextSegments: Awaited<ReturnType<typeof fetchTimedTextSegments>> = [];
@@ -41,6 +42,7 @@ let activeVideoId = "";
 let lastSentKey = "";
 let lastCaptionSeenAt = 0;
 let audioCaptureRequested = false;
+let audioStopRequested = false;
 let timedTextLoadToken = 0;
 let timedTextLoading = false;
 let timedTextLoadStartedAt = 0;
@@ -52,9 +54,11 @@ let audioStartBlockedUntil = 0;
 let overlayRefreshTimer: number | undefined;
 let officialCaptionDomReadTimer: number | undefined;
 let captionTrackRefreshTimers: number[] = [];
+let videoSessionCaptionLoadTimers: number[] = [];
 let pendingTimedTextTrackKey = "";
 let lastVisibleOfficialCaptionKey = "";
 let pageCaptionSnapshot: PageCaptionSnapshot | undefined;
+let observedVideoElement: HTMLVideoElement | null = null;
 
 async function loadContentSettings(): Promise<ContentSettings> {
   const response = await chrome.runtime.sendMessage<MessageResponse<{ settings: ContentSettings }>>({
@@ -159,6 +163,38 @@ function clearCaptionTrackRefreshTimers(): void {
   captionTrackRefreshTimers = [];
 }
 
+function clearVideoSessionCaptionLoadTimers(): void {
+  for (const timer of videoSessionCaptionLoadTimers) {
+    window.clearTimeout(timer);
+  }
+  videoSessionCaptionLoadTimers = [];
+}
+
+function scheduleVideoSessionCaptionLoads(videoId: string): void {
+  clearVideoSessionCaptionLoadTimers();
+  if (!settings.enabled || settings.inputMode === "audio" || !videoId) {
+    return;
+  }
+
+  for (const delayMs of VIDEO_SESSION_CAPTION_RETRY_DELAYS_MS) {
+    const timer = window.setTimeout(() => {
+      videoSessionCaptionLoadTimers = videoSessionCaptionLoadTimers.filter((scheduled) => scheduled !== timer);
+      if (
+        videoId !== activeVideoId ||
+        videoId !== currentWatchVideoId() ||
+        timedTextSegments.length > 0 ||
+        timedTextLoading ||
+        !settings.enabled ||
+        settings.inputMode === "audio"
+      ) {
+        return;
+      }
+      void loadTimedText(videoId);
+    }, delayMs);
+    videoSessionCaptionLoadTimers.push(timer);
+  }
+}
+
 async function cancelPretranslation(keepVideoId?: string): Promise<void> {
   await chrome.runtime.sendMessage({ type: "CANCEL_PRETRANSLATION", keepVideoId }).catch(() => undefined);
 }
@@ -174,6 +210,8 @@ function beginVideoSession(videoId: string): void {
   audioStartBlockedUntil = 0;
   resetTimedTextState();
   clearCaptionTrackRefreshTimers();
+  clearVideoSessionCaptionLoadTimers();
+  observedVideoElement = findVideoElement();
   if (audioCaptureRequested) {
     void stopAudioFallback();
   }
@@ -182,7 +220,7 @@ function beginVideoSession(videoId: string): void {
 
   if (settings.enabled && videoId && settings.inputMode !== "audio") {
     overlay.showStatus("새 영상의 공식 자막을 확인하는 중...", settings);
-    void loadTimedText(videoId);
+    scheduleVideoSessionCaptionLoads(videoId);
   }
 }
 
@@ -247,6 +285,10 @@ function controlStatusText(): string {
 }
 
 function ensureOverlay(): void {
+  if (!isYouTubeWatchPage()) {
+    overlay.destroy();
+    return;
+  }
   overlay.ensure(settings);
   overlay.bindMiniControls((action) => {
     void handleMiniControl(action);
@@ -591,6 +633,8 @@ async function loadTimedText(expectedVideoId = activeVideoId): Promise<void> {
             : "원문 공식 자막을 아직 읽지 못해 음성 자막을 준비하는 중...",
           settings
         );
+      } else {
+        clearVideoSessionCaptionLoadTimers();
       }
 
       // Do not wait for the next 250 ms timer tick after timed text arrives.
@@ -614,6 +658,7 @@ function retryTimedTextIfNeeded(): void {
     settings.enabled &&
     settings.inputMode !== "audio" &&
     isYouTubeWatchPage() &&
+    !timedTextLoading &&
     timedTextSegments.length === 0 &&
     Date.now() - lastTimedTextAttemptAt > TIMED_TEXT_RETRY_MS
   ) {
@@ -701,7 +746,7 @@ function audioCaptureSettingsKey(value: ContentSettings): string {
 }
 
 async function startAudioFallbackIfNeeded(): Promise<void> {
-  if (!settings.enabled || settings.inputMode === "captions" || audioCaptureRequested || !isYouTubeWatchPage()) {
+  if (!settings.enabled || settings.inputMode === "captions" || audioCaptureRequested || stoppingAudioCapture || !isYouTubeWatchPage()) {
     return;
   }
   if (Date.now() < audioStartBlockedUntil) {
@@ -709,18 +754,22 @@ async function startAudioFallbackIfNeeded(): Promise<void> {
   }
 
   if (shouldStartAudioFallback()) {
+    audioStopRequested = false;
     audioCaptureRequested = true;
+    overlay.setAudioCaptureActive(true);
     overlay.showStatus("음성 인식을 시작하는 중...", settings);
     try {
       const response = await chrome.runtime.sendMessage<MessageResponse<{ tabId: number }>>({ type: "START_AUDIO_CAPTURE" });
       if (!response?.ok) {
         overlay.showError(response?.error ?? "음성 캡처 시작 응답을 받지 못했습니다. 확장 프로그램을 새로고침해 주세요.", settings);
         audioCaptureRequested = false;
+        overlay.setAudioCaptureActive(false);
         audioStartBlockedUntil = Date.now() + 12_000;
       }
     } catch (error) {
       overlay.showError(getErrorMessage(error), settings);
       audioCaptureRequested = false;
+      overlay.setAudioCaptureActive(false);
       audioStartBlockedUntil = Date.now() + 12_000;
     }
   }
@@ -732,8 +781,13 @@ async function restartAudioFallback(): Promise<void> {
   await startAudioFallbackIfNeeded();
 }
 
-async function stopAudioFallback(): Promise<void> {
-  if (!audioCaptureRequested || stoppingAudioCapture) {
+async function stopAudioFallback(force = false): Promise<void> {
+  if (stoppingAudioCapture) {
+    return;
+  }
+  audioStopRequested = true;
+  overlay.setAudioCaptureActive(false);
+  if (!audioCaptureRequested && !force) {
     return;
   }
   stoppingAudioCapture = true;
@@ -751,8 +805,11 @@ async function disableTranslator(): Promise<void> {
   lastSentKey = "";
   timedTextLoadToken += 1;
   clearCaptionTrackRefreshTimers();
+  clearVideoSessionCaptionLoadTimers();
   resetTimedTextState();
   audioCaptureRequested = false;
+  audioStopRequested = true;
+  overlay.setAudioCaptureActive(false);
   audioStartBlockedUntil = 0;
   overlay.destroy();
   await chrome.runtime.sendMessage({ type: "STOP_AUDIO_CAPTURE" }).catch(() => undefined);
@@ -764,8 +821,10 @@ function applySettingsUpdate(nextSettings: ContentSettings): void {
     return;
   }
   const wasAudioCaptureActive = Boolean(previousSettings?.enabled && audioCaptureRequested);
-  const shouldStopAudio =
-    wasAudioCaptureActive && (!nextSettings.enabled || nextSettings.inputMode === "captions");
+  const inputModeChanged = previousSettings.inputMode !== nextSettings.inputMode;
+  const shouldPauseAudioForOfficialCaptions =
+    inputModeChanged && previousSettings.inputMode === "audio" && nextSettings.inputMode === "captionsThenAudio";
+  const shouldStopAudio = !nextSettings.enabled || nextSettings.inputMode === "captions" || shouldPauseAudioForOfficialCaptions;
   const shouldRestartAudio =
     wasAudioCaptureActive &&
     !shouldStopAudio &&
@@ -780,7 +839,7 @@ function applySettingsUpdate(nextSettings: ContentSettings): void {
   }
 
   if (shouldStopAudio) {
-    void stopAudioFallback();
+    void stopAudioFallback(true);
   } else if (shouldRestartAudio) {
     void restartAudioFallback();
   }
@@ -824,16 +883,45 @@ function handleUrlChange(): void {
   scheduleOverlayRefresh();
 }
 
+function handleVideoElementChange(): void {
+  const nextVideoElement = findVideoElement();
+  if (nextVideoElement === observedVideoElement) {
+    return;
+  }
+  observedVideoElement = nextVideoElement;
+
+  const videoId = currentWatchVideoId();
+  if (!videoId || !settings.enabled || !isYouTubeWatchPage()) {
+    return;
+  }
+  if (videoId !== activeVideoId) {
+    beginVideoSession(videoId);
+    return;
+  }
+  // YouTube can replace the media element after SPA navigation while its
+  // player response is still pending. Retry only when captions have not yet
+  // been acquired, avoiding a reset during normal playback.
+  if (settings.inputMode !== "audio" && (timedTextVideoId !== videoId || timedTextSegments.length === 0)) {
+    beginVideoSession(videoId);
+  }
+}
+
+function resyncVideoSessionAfterNavigation(): void {
+  currentUrl = "";
+  handleUrlChange();
+  handleVideoElementChange();
+  if (activeVideoId && settings.enabled && settings.inputMode !== "audio" && timedTextSegments.length === 0) {
+    scheduleVideoSessionCaptionLoads(activeVideoId);
+  }
+}
+
 async function tick(): Promise<void> {
   handleUrlChange();
+  handleVideoElementChange();
 
   if (!settings.enabled || !isYouTubeWatchPage()) {
     await stopAudioFallback();
-    if (!settings.enabled) {
-      overlay.destroy();
-    } else {
-      overlay.clear();
-    }
+    overlay.destroy();
     return;
   }
 
@@ -912,14 +1000,10 @@ function installObservers(): void {
     },
     true
   );
-  document.addEventListener("yt-navigate-finish", () => {
-    currentUrl = "";
-    handleUrlChange();
-  });
-  document.addEventListener("yt-page-data-updated", () => {
-    currentUrl = "";
-    handleUrlChange();
-  });
+  document.addEventListener("yt-navigate-finish", resyncVideoSessionAfterNavigation);
+  document.addEventListener("yt-page-data-updated", resyncVideoSessionAfterNavigation);
+  document.addEventListener("yt-player-updated", resyncVideoSessionAfterNavigation);
+  window.addEventListener("popstate", resyncVideoSessionAfterNavigation);
   document.addEventListener(
     "click",
     (event) => {
@@ -1018,15 +1102,25 @@ function installObservers(): void {
 
     if (message.type === "AUDIO_CAPTURE_STATUS") {
       if (message.state === "recording") {
+        if (audioStopRequested || !settings.enabled || settings.inputMode === "captions" || !isYouTubeWatchPage()) {
+          audioCaptureRequested = false;
+          overlay.setAudioCaptureActive(false);
+          void chrome.runtime.sendMessage({ type: "STOP_AUDIO_CAPTURE" }).catch(() => undefined);
+          sendResponse({ ok: true });
+          return;
+        }
         audioCaptureRequested = true;
+        overlay.setAudioCaptureActive(true);
         audioStartBlockedUntil = 0;
         overlay.showStatus(message.statusText ?? "음성 인식 중...", settings);
         overlay.setControlStatus(controlStatusText(), settings);
       } else if (message.state === "idle") {
         audioCaptureRequested = false;
+        overlay.setAudioCaptureActive(false);
         overlay.setControlStatus(controlStatusText(), settings);
       } else if (message.error) {
         audioCaptureRequested = false;
+        overlay.setAudioCaptureActive(false);
         audioStartBlockedUntil = Date.now() + 12_000;
         overlay.showError(message.error, settings);
         overlay.setControlStatus(controlStatusText(), settings);
@@ -1056,10 +1150,11 @@ function installObservers(): void {
 async function main(): Promise<void> {
   settings = await loadContentSettings();
   activeVideoId = currentWatchVideoId();
+  observedVideoElement = findVideoElement();
   lastCaptionSeenAt = 0;
   ensureOverlay();
   installObservers();
-  void loadTimedText(activeVideoId);
+  scheduleVideoSessionCaptionLoads(activeVideoId);
   window.setInterval(() => {
     void runTick();
   }, 250);

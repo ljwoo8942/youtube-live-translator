@@ -12,6 +12,7 @@ export class TranslatorOverlay {
   private playerResizeObserver: ResizeObserver | undefined;
   private playerClassObserver: MutationObserver | undefined;
   private hasTranslation = false;
+  private audioCaptureActive = false;
   private controlsBound = false;
   private readonly syncHostPlacement = () => {
     const { host, player } = this;
@@ -55,6 +56,16 @@ export class TranslatorOverlay {
 
     const player = findPlayerElement();
     if (!player) {
+      return;
+    }
+
+    if (this.audioCaptureActive) {
+      // tabCapture-backed modes can occasionally leave YouTube in theater mode.
+      // Requesting fullscreen in the trusted click keeps the video transition
+      // independent of the active STT capture path.
+      void player.requestFullscreen().catch((error) => {
+        console.debug("YouTube capture-mode fullscreen request was rejected", error);
+      });
       return;
     }
 
@@ -263,6 +274,10 @@ export class TranslatorOverlay {
     this.updateControlButtons(settings);
   }
 
+  setAudioCaptureActive(active: boolean): void {
+    this.audioCaptureActive = active;
+  }
+
   bindMiniControls(onAction: (action: string) => void): void {
     if (!this.controlsLine || this.controlsBound) {
       return;
@@ -370,6 +385,7 @@ export class TranslatorOverlay {
     this.controlStatusLine = undefined;
     this.player = undefined;
     this.hasTranslation = false;
+    this.audioCaptureActive = false;
     this.controlsBound = false;
   }
 

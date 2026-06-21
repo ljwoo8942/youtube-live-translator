@@ -1480,6 +1480,9 @@ async function broadcastContentSettings(settings: TranslatorSettings, revision: 
 async function saveSettingsPatch(patch: Partial<TranslatorSettings>) {
   const snapshot = await patchSettings(patch);
   await broadcastContentSettings(snapshot.settings, snapshot.revision, snapshot.translationConfigRevision);
+  if (!snapshot.settings.enabled || snapshot.settings.inputMode === "captions") {
+    await stopAudioCapture();
+  }
   return snapshot;
 }
 
@@ -1810,7 +1813,7 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
 
       if (message.type === "MINI_CONTROL_UPDATE") {
         const snapshot = await saveSettingsPatch(message.patch);
-        if (!snapshot.settings.enabled && sender.tab?.id) {
+        if ((!snapshot.settings.enabled || snapshot.settings.inputMode === "captions") && sender.tab?.id) {
           await stopAudioCapture(sender.tab.id);
         }
         sendResponse({
@@ -1831,9 +1834,6 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
 
       if (message.type === "SAVE_SETTINGS") {
         const snapshot = await saveSettingsPatch(message.patch);
-        if (!snapshot.settings.enabled && activeAudioTabId) {
-          await stopAudioCapture(activeAudioTabId);
-        }
         sendResponse({ ok: true, settings: snapshot.settings, revision: snapshot.revision });
         return;
       }
