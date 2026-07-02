@@ -571,6 +571,10 @@ function render(): void {
               <span>로컬 STT WebSocket 스트리밍 사용</span>
             </label>
             <label class="check">
+              <input id="lyricsAssistEnabled" type="checkbox" />
+              <span>제목·설명의 가사 검색으로 공식 자막 문맥 보조 + STT 보정</span>
+            </label>
+            <label class="check">
               <input id="speakerTurnDetection" type="checkbox" />
               <span>다화자 발화 분리 - 화자 이름은 추정하지 않고 발화 경계를 줄별로 유지</span>
             </label>
@@ -864,7 +868,7 @@ function render(): void {
             <button id="fasterWhisperProbe" type="button">faster-whisper 연결 확인</button>
             <button id="localPipelineTest" type="button">STT + 번역 API 전체 테스트</button>
           </div>
-          <span class="hint">RTX 5070 12GB 기준 기본 STT는 small입니다. 끊김이 없고 인식률이 부족하면 medium으로 올려서 확인하세요. STT는 로컬 GPU로 처리하고 번역만 AI API 키를 사용합니다. 테스트 전 ${LOCAL_STT_START_HINT}</span>
+          <span class="hint">RTX 5070 12GB 기준 기본 STT는 small입니다. base도 안정 프로파일을 사용하지만, 끊김이 없고 인식률이 부족하면 medium으로 테스트하세요. STT는 로컬 GPU로 처리하고 번역만 AI API 키를 사용합니다. 테스트 전 ${LOCAL_STT_START_HINT}</span>
         </section>
 
         <section class="section full">
@@ -882,7 +886,7 @@ function render(): void {
               모델
               <select id="whisperModel">
                 <option value="tiny">tiny - 가장 가벼움</option>
-                <option value="base">base - 가벼움</option>
+                <option value="base">base - 가벼움/안정 보강</option>
                 <option value="small">small - 기본/안정성 우선</option>
                 <option value="medium">medium - 정확도 우선</option>
                 <option value="large-v3-turbo">large-v3-turbo - 무거움</option>
@@ -917,6 +921,7 @@ function fillValues(): void {
   setInput("contentMode", settings.contentMode);
   setInput("pretranslateEnabled", settings.pretranslateEnabled);
   setInput("miniControlsEnabled", settings.miniControlsEnabled);
+  setInput("lyricsAssistEnabled", settings.lyricsAssistEnabled);
   setInput("streamingSttEnabled", settings.streamingSttEnabled);
   setInput("streamingSttEndpoint", settings.streamingSttEndpoint);
   setInput("speakerTurnDetection", settings.speakerTurnDetection);
@@ -986,6 +991,8 @@ function collectSettings(): TranslatorSettings {
     contentMode: selectValue<ContentMode>("contentMode"),
     pretranslateEnabled: checkboxValue("pretranslateEnabled"),
     miniControlsEnabled: checkboxValue("miniControlsEnabled"),
+    miniControlsCollapsed: settings.miniControlsCollapsed,
+    lyricsAssistEnabled: checkboxValue("lyricsAssistEnabled"),
     streamingSttEnabled: checkboxValue("streamingSttEnabled"),
     streamingSttEndpoint: inputValue("streamingSttEndpoint", DEFAULT_SETTINGS.streamingSttEndpoint),
     speakerTurnDetection: checkboxValue("speakerTurnDetection"),
@@ -1053,9 +1060,6 @@ async function saveSettingsPatch(patch: Partial<TranslatorSettings>): Promise<Tr
 async function saveCurrentSettings(): Promise<void> {
   const nextSettings = collectSettings();
   settings = await saveSettingsPatch(diffSettings(settings, nextSettings));
-  if (!settings.enabled) {
-    await chrome.runtime.sendMessage({ type: "STOP_AUDIO_CAPTURE" }).catch(() => undefined);
-  }
   setStatus("설정을 저장했습니다. YouTube 탭에 바로 반영됩니다.");
 }
 
@@ -1336,6 +1340,7 @@ function applyLocalGpuPreset(): void {
   setInput("contentMode", "auto");
   setInput("pretranslateEnabled", true);
   setInput("miniControlsEnabled", true);
+  setInput("lyricsAssistEnabled", true);
   setInput("streamingSttEnabled", true);
   setInput("streamingSttEndpoint", DEFAULT_SETTINGS.streamingSttEndpoint);
   setInput("translationProvider", "openai");
@@ -1365,6 +1370,7 @@ function applyLyricsSttPreset(): void {
   setInput("sourceLanguage", "auto");
   setInput("pretranslateEnabled", true);
   setInput("miniControlsEnabled", true);
+  setInput("lyricsAssistEnabled", true);
   setInput("streamingSttEnabled", true);
   setInput("streamingSttEndpoint", DEFAULT_SETTINGS.streamingSttEndpoint);
   setInput("translationProvider", "openai");
@@ -1395,6 +1401,7 @@ function applyLiveSttPreset(): void {
   setInput("contentMode", "live");
   setInput("pretranslateEnabled", true);
   setInput("miniControlsEnabled", true);
+  setInput("lyricsAssistEnabled", true);
   setInput("streamingSttEnabled", true);
   setInput("streamingSttEndpoint", DEFAULT_SETTINGS.streamingSttEndpoint);
   setInput("translationProvider", "openai");
@@ -1420,6 +1427,7 @@ function applyApiKeyAudioPreset(): void {
   setInput("contentMode", "auto");
   setInput("pretranslateEnabled", true);
   setInput("miniControlsEnabled", true);
+  setInput("lyricsAssistEnabled", true);
   setInput("streamingSttEnabled", false);
   setInput("translationProvider", "openai");
   setInput("sttProvider", "openai");

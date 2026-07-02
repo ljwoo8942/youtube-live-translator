@@ -5,9 +5,22 @@ import "./style.css";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 let settings: TranslatorSettings;
+let currentTabIsYouTube = false;
 
 function activeTab(): Promise<chrome.tabs.Tab | undefined> {
   return chrome.tabs.query({ active: true, currentWindow: true }).then((tabs) => tabs[0]);
+}
+
+function isSupportedYouTubeUrl(url?: string): boolean {
+  if (!url) {
+    return false;
+  }
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:" && ["www.youtube.com", "m.youtube.com"].includes(parsed.hostname);
+  } catch {
+    return false;
+  }
 }
 
 async function persist(patch: Partial<TranslatorSettings>): Promise<void> {
@@ -21,9 +34,44 @@ async function persist(patch: Partial<TranslatorSettings>): Promise<void> {
   settings = response.settings;
 }
 
-async function stopActiveTabAudio(): Promise<void> {
+async function ensureTabCapturePermission(): Promise<void> {
+  if (await chrome.permissions.contains({ permissions: ["tabCapture"] })) {
+    return;
+  }
+  const granted = await chrome.permissions.request({ permissions: ["tabCapture"] });
+  if (!granted) {
+    throw new Error("음성 자막을 사용하려면 YouTube 탭 캡처 권한을 허용해야 합니다.");
+  }
+}
+
+type PreparedAudioCapture = {
+  tabId?: number;
+  videoId?: string;
+};
+
+async function prepareAudioCapture(): Promise<PreparedAudioCapture> {
+  await ensureTabCapturePermission();
   const tab = await activeTab();
-  await chrome.runtime.sendMessage({ type: "STOP_AUDIO_CAPTURE", tabId: tab?.id }).catch(() => undefined);
+  const prepared = tab?.id
+    ? await chrome.tabs
+        .sendMessage<MessageResponse<{ videoId: string }>>(tab.id, { type: "PREPARE_AUDIO_CAPTURE" })
+        .catch(() => undefined)
+    : undefined;
+  return {
+    tabId: tab?.id,
+    videoId: prepared?.ok ? prepared.videoId : undefined
+  };
+}
+
+function startPreparedAudioCapture(
+  prepared: PreparedAudioCapture
+): Promise<MessageResponse<{ tabId: number; mode?: string }> | undefined> {
+  return chrome.runtime.sendMessage<MessageResponse<{ tabId: number; mode?: string }>>({
+    type: "START_AUDIO_CAPTURE",
+    tabId: prepared.tabId,
+    videoId: prepared.videoId,
+    ensureTabCapturePermission: true
+  });
 }
 
 function setStatus(text: string): void {
@@ -31,6 +79,10 @@ function setStatus(text: string): void {
   if (node) {
     node.textContent = text;
   }
+}
+
+function closePopupAfterSuccess(): void {
+  window.setTimeout(() => window.close(), 120);
 }
 
 function getErrorMessage(error: unknown): string {
@@ -97,6 +149,19 @@ function sttProviderLabel(provider: SttProvider): string {
   }
 }
 
+function sttModelLabel(settings: TranslatorSettings): string {
+  switch (settings.sttProvider) {
+    case "whisper":
+      return `STT ${settings.whisper.model || "모델"}`;
+    case "openai":
+      return `STT ${settings.apiStt.model || "API 모델"}`;
+    case "lmStudio":
+      return `STT ${settings.lmStudio.sttModel || "LM Studio 모델"}`;
+    default:
+      return "STT 모델";
+  }
+}
+
 function translationModelLabel(settings: TranslatorSettings): string {
   switch (settings.translationProvider) {
     case "openai":
@@ -122,6 +187,31 @@ function setSelectWithCustomOption(select: HTMLSelectElement | null, value: stri
 
 function render(): void {
   if (!app) {
+    return;
+  }
+
+  if (!currentTabIsYouTube) {
+    app.innerHTML = `
+      <section class="shell">
+        <div class="global-nav">
+          <span class="brand">YT Translator</span>
+        </div>
+        <section class="hero-tile">
+          <p class="eyebrow">YouTube only</p>
+          <h1>YouTube에서만 작동합니다</h1>
+          <p class="tagline">인강 사이트나 다른 웹사이트에서는 자막/음성 캡처 기능을 사용하지 않습니다.</p>
+        </section>
+        <div class="actions">
+          <button id="options" class="primary">전체 설정</button>
+        </div>
+        <div id="status" class="status">YouTube 영상 탭에서 다시 열어 주세요.</div>
+      </section>
+    `;
+    document.querySelector("#options")?.addEventListener("click", () => {
+      runAction(async () => {
+        await chrome.runtime.openOptionsPage();
+      });
+    });
     return;
   }
 
@@ -152,6 +242,7 @@ function render(): void {
           <span>${inputModeLabel(settings.inputMode)}</span>
           <span>${contentModeLabel(settings.contentMode)}</span>
           <span>${sttProviderLabel(settings.sttProvider)}</span>
+          <span>${sttModelLabel(settings)}</span>
           <span>${translationProviderLabel(settings.translationProvider)}</span>
           <span>${translationModelLabel(settings)}</span>
         </div>
@@ -214,6 +305,10 @@ function render(): void {
           목표 언어
           <input id="targetLanguage" placeholder="ko" />
         </label>
+        <label class="panel-switch">
+          <span>영상 미니 컨트롤</span>
+          <input id="miniControlsEnabled" type="checkbox" />
+        </label>
       </section>
 
       <div class="actions">
@@ -233,6 +328,7 @@ function render(): void {
   const sttProvider = document.querySelector<HTMLSelectElement>("#sttProvider");
   const sourceLanguage = document.querySelector<HTMLSelectElement>("#sourceLanguage");
   const targetLanguage = document.querySelector<HTMLInputElement>("#targetLanguage");
+  const miniControlsEnabled = document.querySelector<HTMLInputElement>("#miniControlsEnabled");
 
   if (enabled) enabled.checked = settings.enabled;
   if (inputMode) inputMode.value = settings.inputMode;
@@ -241,16 +337,38 @@ function render(): void {
   if (sttProvider) sttProvider.value = settings.sttProvider;
   setSelectWithCustomOption(sourceLanguage, settings.sourceLanguage);
   if (targetLanguage) targetLanguage.value = settings.targetLanguage;
+  if (miniControlsEnabled) miniControlsEnabled.checked = settings.miniControlsEnabled;
 
   enabled?.addEventListener("change", () => {
     runAction(async () => {
-      await persist({ enabled: enabled.checked });
-      if (!settings.enabled) {
-        await stopActiveTabAudio();
+      if (!enabled.checked) {
+        await persist({ enabled: false });
         setStatus("자막을 껐습니다.");
-      } else {
-        setStatus("자막을 켰습니다.");
+        closePopupAfterSuccess();
+        return;
       }
+      if (inputMode?.value === "audio") {
+        const prepared = await prepareAudioCapture();
+        await persist({ enabled: true });
+        const response = await startPreparedAudioCapture(prepared);
+        const mode = response?.ok && response.mode ? ` (${response.mode})` : "";
+        setStatus(response?.ok ? `자막을 켜고 음성 인식을 준비했습니다${mode}.` : response?.error ?? "음성 인식을 준비하지 못했습니다.");
+        if (response?.ok) {
+          closePopupAfterSuccess();
+        }
+        return;
+      }
+      await persist({ enabled: true });
+      setStatus("자막을 켰습니다.");
+      closePopupAfterSuccess();
+    });
+  });
+
+  miniControlsEnabled?.addEventListener("change", () => {
+    runAction(async () => {
+      await persist({ miniControlsEnabled: miniControlsEnabled.checked });
+      setStatus(miniControlsEnabled.checked ? "영상 미니 컨트롤을 표시합니다." : "영상 미니 컨트롤을 숨겼습니다.");
+      closePopupAfterSuccess();
     });
   });
 
@@ -263,12 +381,11 @@ function render(): void {
         translationProvider: (translationProvider?.value ?? settings.translationProvider) as TranslationProvider,
         sttProvider: (sttProvider?.value ?? settings.sttProvider) as SttProvider,
         sourceLanguage: sourceLanguage?.value || "auto",
-        targetLanguage: targetLanguage?.value.trim() || "ko"
+        targetLanguage: targetLanguage?.value.trim() || "ko",
+        miniControlsEnabled: Boolean(miniControlsEnabled?.checked)
       });
-      if (!settings.enabled) {
-        await stopActiveTabAudio();
-      }
       setStatus("저장했습니다.");
+      closePopupAfterSuccess();
     });
   });
 
@@ -280,6 +397,7 @@ function render(): void {
 
   document.querySelector("#startAudio")?.addEventListener("click", () => {
     runAction(async () => {
+      const prepared = await prepareAudioCapture();
       await persist({
         enabled: true,
         inputMode: "audio",
@@ -292,26 +410,38 @@ function render(): void {
       if (enabled) enabled.checked = true;
       if (inputMode) inputMode.value = "audio";
 
-      const tab = await activeTab();
-      const response = await chrome.runtime.sendMessage<MessageResponse<{ tabId: number; mode?: string }>>({
-        type: "START_AUDIO_CAPTURE",
-        tabId: tab?.id
-      });
+      const response = await startPreparedAudioCapture(prepared);
       const mode = response?.ok && response.mode ? ` (${response.mode})` : "";
       setStatus(response?.ok ? `음성 자막을 켜고 시작했습니다${mode}.` : response?.error ?? "음성 인식 시작 응답을 받지 못했습니다.");
+      if (response?.ok) {
+        closePopupAfterSuccess();
+      }
     });
   });
 
   document.querySelector("#stopAudio")?.addEventListener("click", () => {
     runAction(async () => {
       const tab = await activeTab();
-      const response = await chrome.runtime.sendMessage<MessageResponse>({ type: "STOP_AUDIO_CAPTURE", tabId: tab?.id });
+      const prepared = tab?.id
+        ? await chrome.tabs
+            .sendMessage<MessageResponse<{ videoId: string }>>(tab.id, { type: "PREPARE_AUDIO_STOP" })
+            .catch(() => undefined)
+        : undefined;
+      const response = await chrome.runtime.sendMessage<MessageResponse>({
+        type: "STOP_AUDIO_CAPTURE",
+        tabId: tab?.id,
+        videoId: prepared?.ok ? prepared.videoId : undefined
+      });
       setStatus(response?.ok ? "음성 인식을 중지했습니다." : response?.error ?? "음성 인식 중지 응답을 받지 못했습니다.");
+      if (response?.ok) {
+        closePopupAfterSuccess();
+      }
     });
   });
 }
 
 async function main(): Promise<void> {
+  currentTabIsYouTube = isSupportedYouTubeUrl((await activeTab())?.url);
   settings = await loadSettings();
   render();
 }

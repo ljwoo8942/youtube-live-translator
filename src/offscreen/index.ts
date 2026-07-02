@@ -3,10 +3,12 @@ import type { MessageResponse, RuntimeMessage } from "../shared/messages";
 let activeStream: MediaStream | undefined;
 let mediaRecorder: MediaRecorder | undefined;
 let audioContext: AudioContext | undefined;
+let audioSource: MediaStreamAudioSourceNode | undefined;
 let processorNode: ScriptProcessorNode | undefined;
 let silentGain: GainNode | undefined;
 let sttSocket: WebSocket | undefined;
 let activeTabId: number | undefined;
+let activeVideoId: string | undefined;
 let chunkTimer: number | undefined;
 let activeAudioChunkMs = 8000;
 let activeMode: "stream" | "chunk" | undefined;
@@ -15,6 +17,7 @@ let stoppingCapture = false;
 let streamSequence = 0;
 let streamFrameCount = 0;
 let lastClientStreamStatusAt = 0;
+let captureLifecycleQueue: Promise<void> = Promise.resolve();
 const discardedRecorders = new WeakSet<MediaRecorder>();
 
 type StreamingConfig = {
@@ -30,9 +33,15 @@ function chooseMimeType(): string {
   return candidates.find((candidate) => !candidate || MediaRecorder.isTypeSupported(candidate)) ?? "";
 }
 
-async function relayStatus(state: string, error?: string, tabId = activeTabId, statusText?: string): Promise<void> {
+async function relayStatus(
+  state: string,
+  error?: string,
+  tabId = activeTabId,
+  statusText?: string,
+  videoId = activeVideoId
+): Promise<void> {
   try {
-    await chrome.runtime.sendMessage({ type: "AUDIO_CAPTURE_STATUS", state, error, tabId, statusText });
+    await chrome.runtime.sendMessage({ type: "AUDIO_CAPTURE_STATUS", state, error, tabId, videoId, statusText });
   } catch (sendError) {
     console.debug("Audio capture status relay failed", sendError);
   }
@@ -53,12 +62,23 @@ function stopRecorderForChunk(): void {
   mediaRecorder.stop();
 }
 
+function discardActiveRecorder(): void {
+  clearChunkTimer();
+  cyclingRecorder = false;
+  const recorder = mediaRecorder;
+  mediaRecorder = undefined;
+  if (recorder && recorder.state !== "inactive") {
+    discardedRecorders.add(recorder);
+    recorder.stop();
+  }
+}
+
 function scheduleChunkStop(): void {
   clearChunkTimer();
   chunkTimer = window.setTimeout(stopRecorderForChunk, activeAudioChunkMs);
 }
 
-async function sendAudioBlob(blob: Blob, mimeType: string, tabId: number): Promise<void> {
+async function sendAudioBlob(blob: Blob, mimeType: string, tabId: number, videoId: string): Promise<void> {
   if (!blob.size) {
     return;
   }
@@ -71,6 +91,7 @@ async function sendAudioBlob(blob: Blob, mimeType: string, tabId: number): Promi
   await chrome.runtime.sendMessage<MessageResponse>({
     type: "AUDIO_CHUNK",
     tabId,
+    videoId,
     audioBase64,
     mimeType: blob.type || mimeType || "audio/webm"
   });
@@ -91,12 +112,13 @@ function blobToBase64(blob: Blob): Promise<string> {
 }
 
 function startRecorderCycle(): void {
-  if (!activeStream || !activeTabId) {
+  if (!activeStream || !activeTabId || !activeVideoId) {
     return;
   }
 
   activeMode = "chunk";
   const tabIdForRecorder = activeTabId;
+  const videoIdForRecorder = activeVideoId;
   const mimeType = chooseMimeType();
   const chunks: Blob[] = [];
   const recorder = new MediaRecorder(activeStream, mimeType ? { mimeType } : undefined);
@@ -109,17 +131,21 @@ function startRecorderCycle(): void {
   });
 
   recorder.addEventListener("stop", () => {
-    const shouldRestart = cyclingRecorder && Boolean(activeStream && activeTabId === tabIdForRecorder);
+    const shouldRestart =
+      cyclingRecorder && Boolean(activeStream && activeTabId === tabIdForRecorder && activeVideoId === videoIdForRecorder);
     const shouldDiscard = discardedRecorders.has(recorder);
     cyclingRecorder = false;
     discardedRecorders.delete(recorder);
 
     if (!shouldDiscard) {
-      void sendAudioBlob(new Blob(chunks, { type: mimeType || chunks[0]?.type || "audio/webm" }), mimeType, tabIdForRecorder).catch(
-        (error) => {
-          console.debug("Audio chunk relay failed", error);
-        }
-      );
+      void sendAudioBlob(
+        new Blob(chunks, { type: mimeType || chunks[0]?.type || "audio/webm" }),
+        mimeType,
+        tabIdForRecorder,
+        videoIdForRecorder
+      ).catch((error) => {
+        console.debug("Audio chunk relay failed", error);
+      });
     }
 
     if (shouldRestart) {
@@ -129,8 +155,8 @@ function startRecorderCycle(): void {
 
   recorder.addEventListener("error", (event) => {
     const message = event.error?.message ?? "MediaRecorder 오류가 발생했습니다.";
-    void stopCapture()
-      .then((stoppedTabId) => relayStatus("error", message, stoppedTabId))
+    void enqueueCaptureLifecycle(() => stopCaptureIfSession(tabIdForRecorder, videoIdForRecorder))
+      .then((stopped) => relayStatus("error", message, stopped.tabId, undefined, stopped.videoId))
       .catch((error) => {
         void relayStatus("error", error instanceof Error ? error.message : String(error));
       });
@@ -162,6 +188,23 @@ function streamUrl(config: StreamingConfig): string | undefined {
   }
 }
 
+function mixToMono(buffer: AudioBuffer): Float32Array {
+  const channelCount = Math.max(1, buffer.numberOfChannels);
+  if (channelCount === 1) {
+    return buffer.getChannelData(0);
+  }
+
+  const output = new Float32Array(buffer.length);
+  const channelScale = 1 / channelCount;
+  for (let channel = 0; channel < channelCount; channel += 1) {
+    const input = buffer.getChannelData(channel);
+    for (let index = 0; index < output.length; index += 1) {
+      output[index] += input[index] * channelScale;
+    }
+  }
+  return output;
+}
+
 function downsampleTo16k(input: Float32Array, inputRate: number): Float32Array {
   if (inputRate === 16000) {
     return input;
@@ -171,7 +214,13 @@ function downsampleTo16k(input: Float32Array, inputRate: number): Float32Array {
   const outputLength = Math.max(1, Math.floor(input.length / ratio));
   const output = new Float32Array(outputLength);
   for (let index = 0; index < outputLength; index += 1) {
-    output[index] = input[Math.min(input.length - 1, Math.floor(index * ratio))] ?? 0;
+    const start = Math.floor(index * ratio);
+    const end = Math.min(input.length, Math.max(start + 1, Math.floor((index + 1) * ratio)));
+    let sum = 0;
+    for (let sourceIndex = start; sourceIndex < end; sourceIndex += 1) {
+      sum += input[sourceIndex];
+    }
+    output[index] = sum / Math.max(1, end - start);
   }
   return output;
 }
@@ -180,7 +229,7 @@ function pcm16Buffer(samples: Float32Array): ArrayBuffer {
   const buffer = new ArrayBuffer(samples.length * 2);
   const view = new DataView(buffer);
   for (let index = 0; index < samples.length; index += 1) {
-    const sample = Math.max(-1, Math.min(1, samples[index] ?? 0));
+    const sample = Math.max(-1, Math.min(1, samples[index]));
     view.setInt16(index * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
   }
   return buffer;
@@ -216,8 +265,8 @@ function startStreamingProcessor(source: MediaStreamAudioSourceNode, socket: Web
       return;
     }
 
-    const input = event.inputBuffer.getChannelData(0);
-    const downsampled = downsampleTo16k(input, audioContext.sampleRate);
+    const mixed = mixToMono(event.inputBuffer);
+    const downsampled = downsampleTo16k(mixed, audioContext.sampleRate);
     try {
       socket.send(pcm16Buffer(downsampled));
     } catch {
@@ -236,15 +285,18 @@ function startStreamingProcessor(source: MediaStreamAudioSourceNode, socket: Web
   gain.connect(audioContext.destination);
 }
 
-function relayStreamTranscript(payload: unknown, tabId: number): void {
+function relayStreamTranscript(payload: unknown, tabId: number, videoId: string): void {
+  if (activeTabId !== tabId || activeVideoId !== videoId) {
+    return;
+  }
   if (!payload || typeof payload !== "object") {
     return;
   }
   const object = payload as Record<string, unknown>;
   if (object.type === "error") {
     const text = typeof object.text === "string" ? object.text : "스트리밍 STT 오류가 발생했습니다.";
-    void relayStatus("recording", undefined, tabId, `${text} HTTP STT fallback`);
-    if (activeStream && activeTabId === tabId && activeMode === "stream") {
+    void relayStatus("recording", undefined, tabId, `${text} HTTP STT fallback`, videoId);
+    if (activeStream && activeTabId === tabId && activeVideoId === videoId && activeMode === "stream") {
       teardownStreamingNodes();
       startRecorderCycle();
     }
@@ -252,7 +304,7 @@ function relayStreamTranscript(payload: unknown, tabId: number): void {
   }
   if (object.type === "status") {
     const text = typeof object.text === "string" ? object.text : "스트리밍 STT 상태 확인 중";
-    void relayStatus("recording", undefined, tabId, text);
+    void relayStatus("recording", undefined, tabId, text, videoId);
     return;
   }
   const text = typeof object.text === "string" ? object.text.trim() : "";
@@ -267,6 +319,7 @@ function relayStreamTranscript(payload: unknown, tabId: number): void {
   void chrome.runtime.sendMessage<MessageResponse>({
     type: "STREAM_STT_TRANSCRIPT",
     tabId,
+    videoId,
     isFinal,
     segment: {
       id: `stream-${seq}-${isFinal ? "final" : "partial"}`,
@@ -281,14 +334,15 @@ function relayStreamTranscript(payload: unknown, tabId: number): void {
 }
 
 async function startStreamingStt(source: MediaStreamAudioSourceNode, config: StreamingConfig): Promise<boolean> {
-  if (!activeTabId || !config.endpoint) {
+  if (!activeTabId || !activeVideoId || !config.endpoint) {
     return false;
   }
 
   const tabIdForSocket = activeTabId;
+  const videoIdForSocket = activeVideoId;
   const url = streamUrl(config);
   if (!url) {
-    void relayStatus("recording", undefined, tabIdForSocket, "스트리밍 STT URL 오류, HTTP STT fallback");
+    void relayStatus("recording", undefined, tabIdForSocket, "스트리밍 STT URL 오류, HTTP STT fallback", videoIdForSocket);
     return false;
   }
 
@@ -296,7 +350,7 @@ async function startStreamingStt(source: MediaStreamAudioSourceNode, config: Str
   try {
     socket = new WebSocket(url);
   } catch {
-    void relayStatus("recording", undefined, tabIdForSocket, "스트리밍 STT 연결 생성 실패, HTTP STT fallback");
+    void relayStatus("recording", undefined, tabIdForSocket, "스트리밍 STT 연결 생성 실패, HTTP STT fallback", videoIdForSocket);
     return false;
   }
   socket.binaryType = "arraybuffer";
@@ -319,13 +373,13 @@ async function startStreamingStt(source: MediaStreamAudioSourceNode, config: Str
       settled = true;
       window.clearTimeout(timeout);
       startStreamingProcessor(source, socket);
-      void relayStatus("recording", undefined, tabIdForSocket, "로컬 스트리밍 STT 연결됨");
+      void relayStatus("recording", undefined, tabIdForSocket, "로컬 스트리밍 STT 연결됨", videoIdForSocket);
       resolve(true);
     });
 
     socket.addEventListener("message", (event) => {
       try {
-        relayStreamTranscript(JSON.parse(String(event.data)), tabIdForSocket);
+        relayStreamTranscript(JSON.parse(String(event.data)), tabIdForSocket, videoIdForSocket);
       } catch (error) {
         console.debug("Streaming STT message parse failed", error);
       }
@@ -338,10 +392,17 @@ async function startStreamingStt(source: MediaStreamAudioSourceNode, config: Str
         resolve(false);
         return;
       }
-      if (!stoppingCapture && activeStream && activeTabId === tabIdForSocket && activeMode === "stream") {
+      if (
+        !stoppingCapture &&
+        activeStream &&
+        activeTabId === tabIdForSocket &&
+        activeVideoId === videoIdForSocket &&
+        activeMode === "stream" &&
+        sttSocket === socket
+      ) {
         teardownStreamingNodes();
         startRecorderCycle();
-        void relayStatus("recording", undefined, tabIdForSocket, "스트리밍 STT 끊김, HTTP STT fallback");
+        void relayStatus("recording", undefined, tabIdForSocket, "스트리밍 STT 끊김, HTTP STT fallback", videoIdForSocket);
       }
     });
 
@@ -355,17 +416,16 @@ async function startStreamingStt(source: MediaStreamAudioSourceNode, config: Str
   });
 }
 
-async function stopCapture(): Promise<number | undefined> {
+async function stopCapture(): Promise<{ tabId?: number; videoId?: string }> {
   const stoppedTabId = activeTabId;
+  const stoppedVideoId = activeVideoId;
   stoppingCapture = true;
   try {
     clearChunkTimer();
     cyclingRecorder = false;
     teardownStreamingNodes();
-    if (mediaRecorder && mediaRecorder.state !== "inactive") {
-      discardedRecorders.add(mediaRecorder);
-      mediaRecorder.stop();
-    }
+    discardActiveRecorder();
+    audioSource?.disconnect();
 
     for (const track of activeStream?.getTracks() ?? []) {
       track.stop();
@@ -378,17 +438,86 @@ async function stopCapture(): Promise<number | undefined> {
     mediaRecorder = undefined;
     activeStream = undefined;
     audioContext = undefined;
+    audioSource = undefined;
     activeTabId = undefined;
+    activeVideoId = undefined;
     activeMode = undefined;
     activeAudioChunkMs = 8000;
     streamSequence = 0;
     stoppingCapture = false;
   }
-  return stoppedTabId;
+  return { tabId: stoppedTabId, videoId: stoppedVideoId };
+}
+
+function stopCaptureIfSession(tabId: number, videoId: string): Promise<{ tabId?: number; videoId?: string }> {
+  if (activeTabId !== tabId || activeVideoId !== videoId) {
+    return Promise.resolve({ tabId, videoId });
+  }
+  return stopCapture();
+}
+
+async function reconfigureCapture(
+  tabId: number,
+  videoId: string,
+  expectedVideoId: string | undefined,
+  audioChunkMs: number,
+  useStreaming: boolean,
+  streamingConfig: StreamingConfig
+): Promise<void> {
+  if (
+    !activeStream ||
+    !audioContext ||
+    !audioSource ||
+    activeTabId !== tabId ||
+    (expectedVideoId && activeVideoId !== expectedVideoId)
+  ) {
+    throw new Error("재구성할 활성 오디오 캡처 세션이 없습니다.");
+  }
+
+  stoppingCapture = true;
+  try {
+    discardActiveRecorder();
+    teardownStreamingNodes();
+    audioSource.disconnect();
+    audioSource.connect(audioContext.destination);
+    activeVideoId = videoId;
+    activeAudioChunkMs = Math.max(1000, audioChunkMs);
+    streamSequence = 0;
+
+    if (useStreaming && (await startStreamingStt(audioSource, streamingConfig))) {
+      return;
+    }
+
+    startRecorderCycle();
+    await relayStatus(
+      "recording",
+      undefined,
+      tabId,
+      useStreaming ? "WebSocket 실패, HTTP STT fallback" : "음성 인식 중...",
+      videoId
+    );
+  } finally {
+    stoppingCapture = false;
+  }
+}
+
+function resetCaptureBuffer(tabId: number, videoId: string): void {
+  if (!activeStream || activeTabId !== tabId || activeVideoId !== videoId) {
+    return;
+  }
+  if (activeMode === "stream" && sttSocket?.readyState === WebSocket.OPEN) {
+    sttSocket.send("reset");
+    return;
+  }
+  if (activeMode === "chunk" && mediaRecorder) {
+    discardActiveRecorder();
+    startRecorderCycle();
+  }
 }
 
 async function startCapture(
   tabId: number,
+  videoId: string,
   streamId: string,
   audioChunkMs: number,
   useStreaming: boolean,
@@ -396,6 +525,7 @@ async function startCapture(
 ): Promise<void> {
   await stopCapture();
   activeTabId = tabId;
+  activeVideoId = videoId;
   activeAudioChunkMs = Math.max(1000, audioChunkMs);
 
   const constraints = {
@@ -408,43 +538,97 @@ async function startCapture(
     video: false
   } as unknown as MediaStreamConstraints;
 
-  activeStream = await navigator.mediaDevices.getUserMedia(constraints);
+  try {
+    activeStream = await navigator.mediaDevices.getUserMedia(constraints);
 
-  audioContext = new AudioContext();
-  if (audioContext.state === "suspended") {
-    await audioContext.resume().catch(() => undefined);
+    audioContext = new AudioContext();
+    if (audioContext.state === "suspended") {
+      await audioContext.resume().catch(() => undefined);
+    }
+    audioSource = audioContext.createMediaStreamSource(activeStream);
+    audioSource.connect(audioContext.destination);
+
+    if (useStreaming && (await startStreamingStt(audioSource, streamingConfig))) {
+      return;
+    }
+
+    startRecorderCycle();
+    await relayStatus("recording", undefined, tabId, useStreaming ? "WebSocket 실패, HTTP STT fallback" : "음성 인식 중...");
+  } catch (error) {
+    await stopCaptureIfSession(tabId, videoId);
+    throw error;
   }
-  const source = audioContext.createMediaStreamSource(activeStream);
-  source.connect(audioContext.destination);
+}
 
-  if (useStreaming && (await startStreamingStt(source, streamingConfig))) {
-    return;
-  }
-
-  startRecorderCycle();
-  await relayStatus("recording", undefined, tabId, useStreaming ? "WebSocket 실패, HTTP STT fallback" : "음성 인식 중...");
+function enqueueCaptureLifecycle<T>(operation: () => Promise<T>): Promise<T> {
+  const result = captureLifecycleQueue.then(operation, operation);
+  captureLifecycleQueue = result.then(
+    () => undefined,
+    () => undefined
+  );
+  return result;
 }
 
 chrome.runtime.onMessage.addListener((rawMessage, _sender, sendResponse) => {
   const message = rawMessage as RuntimeMessage;
+  if (!("target" in message) || message.target !== "offscreen") {
+    return false;
+  }
 
   void (async () => {
     try {
-      if (message.type === "START_AUDIO_CAPTURE" && message.streamId && message.tabId) {
-        await startCapture(message.tabId, message.streamId, message.audioChunkMs ?? 8000, Boolean(message.useStreaming), {
-          endpoint: message.streamingSttEndpoint ?? "",
-          model: message.streamingSttModel ?? "",
-          sourceLanguage: message.sourceLanguage ?? "auto",
-          contentMode: message.contentMode ?? "auto",
-          speakerTurnDetection: Boolean(message.speakerTurnDetection)
-        });
+      if (message.type === "START_AUDIO_CAPTURE" && message.streamId && message.tabId && message.videoId) {
+        await enqueueCaptureLifecycle(() =>
+          startCapture(message.tabId!, message.videoId!, message.streamId!, message.audioChunkMs ?? 8000, Boolean(message.useStreaming), {
+            endpoint: message.streamingSttEndpoint ?? "",
+            model: message.streamingSttModel ?? "",
+            sourceLanguage: message.sourceLanguage ?? "auto",
+            contentMode: message.contentMode ?? "auto",
+            speakerTurnDetection: Boolean(message.speakerTurnDetection)
+          })
+        );
+        sendResponse({ ok: true });
+        return;
+      }
+
+      if (message.type === "RECONFIGURE_AUDIO_CAPTURE" && message.tabId && message.videoId) {
+        await enqueueCaptureLifecycle(() =>
+          reconfigureCapture(
+            message.tabId!,
+            message.videoId,
+            message.expectedVideoId,
+            message.audioChunkMs ?? 8000,
+            Boolean(message.useStreaming),
+            {
+              endpoint: message.streamingSttEndpoint ?? "",
+              model: message.streamingSttModel ?? "",
+              sourceLanguage: message.sourceLanguage ?? "auto",
+              contentMode: message.contentMode ?? "auto",
+              speakerTurnDetection: Boolean(message.speakerTurnDetection)
+            }
+          )
+        );
+        sendResponse({ ok: true, mode: activeMode });
+        return;
+      }
+
+      if (message.type === "RESET_AUDIO_CAPTURE_BUFFER" && message.tabId && message.videoId) {
+        resetCaptureBuffer(message.tabId, message.videoId);
         sendResponse({ ok: true });
         return;
       }
 
       if (message.type === "STOP_AUDIO_CAPTURE") {
-        const stoppedTabId = await stopCapture();
-        await relayStatus("idle", undefined, stoppedTabId);
+        if (
+          message.tabId &&
+          message.videoId &&
+          (activeTabId !== message.tabId || activeVideoId !== message.videoId)
+        ) {
+          sendResponse({ ok: true });
+          return;
+        }
+        const stopped = await enqueueCaptureLifecycle(stopCapture);
+        await relayStatus("idle", undefined, stopped.tabId, undefined, stopped.videoId);
         sendResponse({ ok: true });
         return;
       }
@@ -453,6 +637,7 @@ chrome.runtime.onMessage.addListener((rawMessage, _sender, sendResponse) => {
         sendResponse({
           ok: true,
           activeTabId,
+          activeVideoId,
           recording: Boolean(activeStream && activeTabId),
           mode: activeMode
         });
@@ -460,8 +645,20 @@ chrome.runtime.onMessage.addListener((rawMessage, _sender, sendResponse) => {
       }
     } catch (error) {
       const messageText = error instanceof Error ? error.message : String(error);
-      const stoppedTabId = await stopCapture();
-      await relayStatus("error", messageText, stoppedTabId);
+      if (message.type === "START_AUDIO_CAPTURE" && message.tabId && message.videoId) {
+        await relayStatus("error", messageText, message.tabId, undefined, message.videoId);
+      } else if (message.type === "RECONFIGURE_AUDIO_CAPTURE" && message.tabId && message.videoId) {
+        await relayStatus(
+          "recording",
+          undefined,
+          message.tabId,
+          `STT 설정 갱신 실패: ${messageText}`,
+          message.videoId
+        );
+      } else {
+        const stopped = await enqueueCaptureLifecycle(stopCapture);
+        await relayStatus("error", messageText, stopped.tabId, undefined, stopped.videoId);
+      }
       sendResponse({ ok: false, error: messageText });
     }
   })();

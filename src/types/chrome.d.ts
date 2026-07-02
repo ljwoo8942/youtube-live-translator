@@ -49,6 +49,16 @@ declare namespace chrome {
   }
 
   namespace tabs {
+    type OnActivatedInfo = {
+      tabId: number;
+      windowId: number;
+    };
+
+    type OnUpdatedInfo = {
+      url?: string;
+      status?: string;
+    };
+
     type Tab = {
       id?: number;
       url?: string;
@@ -59,6 +69,31 @@ declare namespace chrome {
 
     function query(queryInfo: Record<string, unknown>): Promise<Tab[]>;
     function sendMessage<T = unknown>(tabId: number, message: unknown): Promise<T>;
+    function reload(tabId: number): Promise<void>;
+
+    const onActivated: {
+      addListener(callback: (activeInfo: OnActivatedInfo) => void): void;
+    };
+
+    const onUpdated: {
+      addListener(callback: (tabId: number, changeInfo: OnUpdatedInfo, tab: Tab) => void): void;
+    };
+  }
+
+  namespace action {
+    function enable(tabId?: number): Promise<void>;
+    function disable(tabId?: number): Promise<void>;
+    function setTitle(details: { tabId?: number; title: string }): Promise<void>;
+  }
+
+  namespace permissions {
+    type Permissions = {
+      permissions?: string[];
+      origins?: string[];
+    };
+
+    function contains(permissions: Permissions): Promise<boolean>;
+    function request(permissions: Permissions): Promise<boolean>;
   }
 
   namespace tabCapture {

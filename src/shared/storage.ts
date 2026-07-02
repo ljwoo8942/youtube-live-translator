@@ -84,6 +84,8 @@ export function toContentSettings(settings: TranslatorSettings, translationConfi
     contentMode: settings.contentMode,
     pretranslateEnabled: settings.pretranslateEnabled,
     miniControlsEnabled: settings.miniControlsEnabled,
+    miniControlsCollapsed: settings.miniControlsCollapsed,
+    lyricsAssistEnabled: settings.lyricsAssistEnabled,
     streamingSttEnabled: settings.streamingSttEnabled,
     streamingSttEndpoint: settings.streamingSttEndpoint,
     speakerTurnDetection: settings.speakerTurnDetection,
@@ -136,6 +138,9 @@ export function patchSettings(patch: Partial<TranslatorSettings>): Promise<Setti
       return current;
     }
     const settings = mergeDeep(current.settings as unknown as PlainObject, patch) as TranslatorSettings;
+    if (Object.keys(diffSettings(current.settings, settings)).length === 0) {
+      return current;
+    }
     const revision = current.revision + 1;
     const translationConfigRevision =
       translationConfigSignature(current.settings) === translationConfigSignature(settings)

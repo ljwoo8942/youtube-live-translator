@@ -152,6 +152,20 @@ label {
   font-weight: 600;
 }
 
+.panel-switch {
+  min-height: 46px;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.panel-switch input {
+  width: 18px;
+  min-height: 18px;
+  margin: 0;
+  accent-color: var(--color-primary);
+}
+
 select,
 input {
   width: 100%;

@@ -449,11 +449,35 @@ function japaneseKoreanAccuracyGuidance(settings: TranslatorSettings, target: st
   }
   return [
     "Japanese-to-Korean accuracy check: determine predicate roles and idioms before wording; never mechanically map Japanese が to a Korean subject or reverse who feels, acts, or receives something.",
+    "Preserve lexical strength instead of embellishing it: 探す is 찾다, not 헤매다 unless the source also expresses wandering; きっと with a past assertion normally keeps the speaker's confidence as 분명 ~였어, not the weaker ~였을 거야.",
+    "Preserve uncertainty and paired grammar: ような気がする stays ~것만 같다, and 何度...ても ...ない must keep both the concession and negation as 몇 번 ...해도 ...하지 않아/않을게 according to context.",
+    "In a judgment or choice context, 間違う normally means 틀리다 or 잘못되다. Do not turn it into a person's accidental 실수 unless the source actually describes making a mistake.",
+    "When movement is contrasted with ここに居ようとしてる, translate the intended staying as 여기에 머물려는 거야 or 여기에 남으려는 거야, not the clumsy literal 여기에 있으려고 하는 거야.",
     "For a person-modifying phrase such as 人が嫌いな子, use the predicate meaning and context (normally 사람을 싫어하는 아이), not a reversed reading such as 사람이 싫은 아이.",
     "Treat Xに子供ができる as X에게 아이가 생기다 or X가 아이를 갖게 되다. Do not use 임신 unless the Japanese explicitly says 妊娠, 身ごもる, 懐妊, or an equivalent pregnancy expression.",
     "Treat 気付けば as 어느새 or 정신 차려 보니 when it marks an unplanned realization or passage of time. Never invent a causal action such as 마음을 열다 unless the source explicitly contains that action.",
+    "가타카나 외래어에 확립된 한국어 대응어가 있으면 시적인 의역으로 바꾸지 말고 그 개념을 보존한다. 특히 テレパシー 또는 가사에서 장음을 줄인 テレパシ는 텔레파시이며, 전보·마음·예감으로 바꾸지 않는다. 예: 届いたテレパシ やっと会えた는 전해진 텔레파시, 드디어 만났어.",
+    "가사에서 전부 가타카나로 적힌 구절도 외국어나 이름으로 추측하지 말고 일본어 형태소와 문맥으로 먼저 복원한다. 예: ヨルニニゲタダケ는 夜に逃げただけ이므로 그저 밤으로 도망쳤을 뿐이라는 뜻이며, 여름에 갔다로 옮기지 않는다.",
     "Example: 人が嫌いなあの子に気付けば子供ができた means 사람을 싫어하던 그 아이에게도 어느새 아이가 생겼다; do not add 마음을 열고."
   ].join(" ");
+}
+
+function koreanEndingGuidance(settings: TranslatorSettings, target: string): string {
+  if (!isKoreanTarget(settings.targetLanguage || target)) {
+    return "";
+  }
+  const mode = effectiveContentMode(settings);
+  if (mode === "lyrics") {
+    return [
+      "한국어 가사 자막은 보고서처럼 매 줄을 ~다, ~한다, ~된다, ~였다로 닫지 않는다.",
+      "초안이 딱딱한 서술형으로 끝나면 원문 의미를 유지한 채 노래 자막에 맞는 ~해, ~야, ~네, ~지, ~어, ~아, 명사형, 감탄형, 여운 있는 단문으로 다시 쓴다.",
+      "단, 원문 자체가 선언문·제목·나레이션처럼 일부러 단정하는 경우에만 ~다를 허용한다."
+    ].join(" ");
+  }
+  if (mode === "live") {
+    return "한국어 라이브 자막은 문어체 보고서식 ~다 남발을 피하고, 실제 방송 말투에 맞게 ~해요, ~네요, ~죠, ~거야, ~잖아, 짧은 반응형 문장을 자연스럽게 쓴다.";
+  }
+  return "한국어 일반 자막도 기본값을 문어체 ~다로 두지 않는다. 원문이 공식 나레이션이나 설명문일 때만 ~다를 쓰고, 대화·반응·일상 발화는 자연스러운 구어체 자막으로 옮긴다.";
 }
 
 function subtitleQualityGuidance(settings: TranslatorSettings, target: string): string {
@@ -463,6 +487,7 @@ function subtitleQualityGuidance(settings: TranslatorSettings, target: string): 
     : "Use the target language's natural word order, register, and subtitle conventions instead of copying source syntax.";
   const japaneseKoreanAccuracy = japaneseKoreanAccuracyGuidance(settings, target);
   const meaningIntegrity = meaningIntegrityGuidance(settings, target);
+  const koreanEndings = koreanEndingGuidance(settings, target);
   const lyricMixedLanguageGuidance =
     effectiveContentMode(settings) === "lyrics" && koreanTarget
       ? "For Korean lyrics, preserve a clearly sung, standalone English interjection or hook in its original Latin form instead of translating or Korean-transliterating it: for example oh, yeah, baby, la la, wow wow, na na na, and ah-ah. Translate Japanese emotional interjections and onomatopoeia into natural Korean only, without parenthetical original text: for example しくしく as 훌쩍훌쩍 and ああ as 아아. In mixed Japanese-English lines, handle each phrase by this rule. Do not mistake katakana English, wasei-eigo, Japanglish, or Japanese-styled English for literal English when context shows a Japanese meaning."
@@ -471,11 +496,16 @@ function subtitleQualityGuidance(settings: TranslatorSettings, target: string): 
     "Write a polished subtitle, not a word-by-word gloss. Apply this order: preserve only the facts, emotion, and intent in CURRENT; use CONTEXT only to resolve ellipsis, pronouns, tone, or idioms; then rewrite it as a concise native subtitle.",
     meaningIntegrity,
     koreanGuidance,
+    koreanEndings,
     "When Japanese appears, resolve omitted subjects and Japanese-style fragments from context without inventing facts. Interpret katakana English, wasei-eigo, Japanglish, and stylized English hooks by their Japanese in-context meaning, not by their spelling or pronunciation.",
     japaneseKoreanAccuracy,
     "When languages are mixed, translate every meaningful phrase by its own meaning. Keep only names, titles, and intentional catchphrases that would sound less natural if translated.",
     lyricMixedLanguageGuidance
   ].join(" ");
+}
+
+function edgeMarkerGuidance(): string {
+  return "Preserve subtitle edge markers exactly once: leading or trailing symbols, music notes, bullets, brackets, and quotation/title marks such as ○×△, ♪, 「」, 『』, 【】, (), [], and quotes must remain in the same edge position around the translated subtitle. Never repeat a marker sequence already present in the source, and use only one matching pair of source brackets around the translation.";
 }
 
 function turnSeparatedGuidance(text: string): string {
@@ -487,7 +517,7 @@ function turnSeparatedGuidance(text: string): string {
 function subtitleModeGuidance(settings: TranslatorSettings, target: string): string {
   const mode = effectiveContentMode(settings);
   if (mode === "lyrics") {
-    return `Translate as natural ${target} song subtitles. Preserve the lyric's feeling, imagery, hook, rhythm, and line brevity. Make the line sound like something a viewer would actually read in music subtitles. Do not explain metaphors. Do not turn lyrics into dry prose.`;
+    return `Translate as natural ${target} song subtitles. Preserve the lyric's feeling, imagery, hook, rhythm, and line brevity. Make the line sound like something a viewer would actually read in music subtitles. Do not explain metaphors. Do not turn lyrics into dry prose or documentary narration.`;
   }
   if (mode === "live") {
     return "Translate as live-stream subtitles. Keep it quick, conversational, and readable at a glance. Smooth filler words only when doing so improves readability; keep jokes, reactions, and casual tone alive.";
@@ -506,7 +536,8 @@ function lyricDictionGuidance(settings: TranslatorSettings, target: string): str
       "일본어 축약어·유행어·말장난·조어는 억지로 사전식 단어를 만들지 말고, 분위기를 살린 자연스러운 한국어로 풀거나 훅 자체가 핵심이면 남긴다.",
       "훌쩍, 아아, 음, 라라처럼 노래에서 뜻이나 정서를 이루는 감탄사·의성어·반복 훅은 잡음으로 생략하지 말고, 원문의 반복감이 느껴지게 자연스럽게 살린다.",
       "실제로 영어로 불린 독립 감탄사·후렴 훅은 번역하거나 한글 음역하지 말고 라틴 원형을 유지한다. 예: oh, yeah, baby, la la, wow wow, na na na, ah-ah. 일본어 감정 표현·의성어는 원형 병기 없이 한국어 가사 표현으로만 옮긴다. 예: しくしく은 훌쩍훌쩍, ああ는 아아. 일본어와 영어가 섞인 줄에서는 영어 훅은 유지하고 일본어 부분만 자연스럽게 한국어화한다.",
-      "원문의 말투에 맞춰 짧고 구어적인 가사 표현을 고르되, 근거 없이 감정이나 내용을 덧붙이거나 억지로 운율을 맞추지 않는다."
+      "원문의 말투에 맞춰 짧고 구어적인 가사 표현을 고르되, 근거 없이 감정이나 내용을 덧붙이거나 억지로 운율을 맞추지 않는다.",
+      "문어체 해설처럼 매 줄을 ~다, ~한다, ~된다로 끝내지 않는다. 한국어 노래 자막은 흐름에 맞게 ~해, ~야, ~네, ~지, ~어, ~아, 명사형, 감탄형을 자연스럽게 섞는다. 예: 流れて落ちていく은 흘러내린다보다 흘러내려가 더 가사답다."
     ].join(" ");
   }
   return "For lyrics, prefer simple, vivid, singable target-language diction. Avoid technical, bureaucratic, or dictionary-like terms unless the source clearly uses that domain. Preserve important wordplay, emotional interjections, onomatopoeia, and repeated hooks instead of treating them as noise or forcing an awkward literal equivalent. Do not add content or force a rhyme.";
@@ -519,7 +550,7 @@ function isQwenLikeModel(model?: string): boolean {
 function topPForConfig(settings: TranslatorSettings, config?: OpenAiCompatibleConfig, batch = false): number {
   const mode = effectiveContentMode(settings);
   if (config && isLocalBaseUrl(config.baseUrl)) {
-    return batch ? 0.84 : mode === "lyrics" ? 0.92 : 0.9;
+    return batch ? 0.82 : mode === "lyrics" ? 0.88 : 0.86;
   }
   return batch ? 0.86 : mode === "lyrics" ? 0.92 : 0.9;
 }
@@ -527,8 +558,8 @@ function topPForConfig(settings: TranslatorSettings, config?: OpenAiCompatibleCo
 function translationTemperature(settings: TranslatorSettings, config?: OpenAiCompatibleConfig, batch = false): number {
   const mode = effectiveContentMode(settings);
   if (config && isLocalBaseUrl(config.baseUrl)) {
-    const localBase = mode === "lyrics" ? 0.28 : mode === "live" ? 0.18 : 0.2;
-    return Math.max(0.1, Number((localBase - (batch ? 0.04 : 0)).toFixed(2)));
+    const localBase = mode === "lyrics" ? 0.16 : mode === "live" ? 0.12 : 0.14;
+    return Math.max(0.08, Number((localBase - (batch ? 0.03 : 0)).toFixed(2)));
   }
   const base = mode === "lyrics" ? 0.24 : mode === "live" ? 0.14 : 0.16;
   const batchAdjustment = batch ? -0.05 : 0;
@@ -539,7 +570,8 @@ function compactLocalTranslationPrompt(
   settings: TranslatorSettings,
   text: string,
   contextText?: string,
-  model?: string
+  model?: string,
+  qualityGuidance?: string
 ): { system: string; user: string } {
   const target = languageNameOrCode(settings.targetLanguage);
   const noThink = isQwenLikeModel(model) ? "\n/no_think" : "";
@@ -549,45 +581,73 @@ function compactLocalTranslationPrompt(
     ? contextText.replace(/\s+/g, " ").trim().slice(0, localContextLimit)
     : "";
   const turnGuidance = turnSeparatedGuidance(text);
-  const lyricDiction = lyricDictionGuidance(settings, target);
-  const japaneseKoreanAccuracy = japaneseKoreanAccuracyGuidance(settings, target);
-  const meaningIntegrity = meaningIntegrityGuidance(settings, target);
 
   if (!isKoreanTarget(settings.targetLanguage || target)) {
+    const meaningIntegrity = meaningIntegrityGuidance(settings, target);
+    const edgeMarkers = edgeMarkerGuidance();
     return {
       system: [
         `Translate CURRENT into one natural ${target} subtitle.`,
         "Output only the translation. Prefer meaning and tone over source word order.",
         meaningIntegrity,
+        edgeMarkers,
         turnGuidance,
+        qualityGuidance ? `Mandatory correction: ${qualityGuidance}` : "",
         "Context is reference only. Do not add speakers, explanations, or missing content."
-      ].join(" "),
+      ].filter(Boolean).join(" "),
       user: `${localContext ? `CONTEXT (reference only):\n${localContext}\n\n` : ""}CURRENT:\n${text}\n\nFINAL ${target} SUBTITLE ONLY.${noThink}`
     };
   }
 
   const tone =
     mode === "lyrics"
-      ? "가사는 이미지와 정서를 살린 짧은 한국어 가사 자막으로 쓴다. 비유를 설명문으로 풀지 않는다."
+      ? "가사는 짧고 자연스럽게 쓰되 의미를 희생하거나 비유를 설명문으로 풀지 않는다. 매 줄을 ~다로 끝내는 딱딱한 서술체를 금지하고 노래 자막처럼 부드러운 종결을 쓴다."
       : mode === "live"
         ? "라이브/방송 말투는 반응과 농담을 살려 짧고 구어체로 옮긴다."
         : "일반 영상 자막처럼 읽기 쉬운 자연스러운 구어체로 옮긴다.";
+  const koreanEndings = koreanEndingGuidance(settings, target);
+  const lyricRules =
+    mode === "lyrics"
+      ? [
+          "원문에 실제 라틴 문자로 적힌 영어 훅과 반복 횟수는 그대로 유지한다.",
+          "일본어 감정 표현과 의성어는 자연스러운 한국어로 옮긴다.",
+          "초안이 ~다, ~한다, ~된다, ~였다로 끝나면 원문이 의도적 선언문이 아닌 한 다시 써서 가사다운 종결로 바꾼다.",
+          "가사 흐름에 맞게 ~해, ~야, ~네, ~지, ~어, ~아, 명사형, 감탄형, 여운 있는 단문을 자연스럽게 섞는다.",
+          "정확도 예시: ソソるFlavor Flavor Flavor -> 당기는 Flavor Flavor Flavor.",
+          "정확도 예시: しくしく泣いて oh yeah また会おう -> 훌쩍훌쩍 울고, oh yeah, 다시 만나자.",
+          "문체 예시: 痛むごとに血が流れて落ちていく -> 아플 때마다 피가 흘러내려."
+        ].join(" ")
+      : "";
+
+  const specificCorrections = [
+    text.includes("探す") || text.includes("探し") ? "探す는 찾다이며 さまよう 같은 근거가 없으면 헤매다로 강화하지 않는다." : "",
+    text.includes("きっと") ? "きっと가 과거 단정과 함께 쓰이면 분명 ~였어처럼 확신을 보존하고 ~였을 거야로 약화하지 않는다." : "",
+    text.includes("ような気") || text.includes("ようなき") ? "ような気がする는 ~것만 같다처럼 불확실성을 보존하고, 何度...ても ...ない는 양보와 부정을 모두 살린다." : "",
+    text.includes("間違") ? "판단·선택 문맥의 間違う는 틀리다 또는 잘못되다이며, 실제 실수를 저지르는 문맥이 아니면 실수하다로 바꾸지 않는다." : "",
+    text.includes("居よう") || text.includes("いよう") ? "이동과 대비되는 ここに居ようとしてる는 여기에 있으려고 하는 거야가 아니라 여기에 머물려는 거야 또는 여기에 남으려는 거야로 옮긴다." : ""
+  ].filter(Boolean).join(" ");
 
   return {
     system: [
-      "현재 자막만 자연스러운 한국어 유튜브 자막으로 번역한다.",
-      "번역문만 출력한다. 분석, 원문, 라벨, 설명은 출력하지 않는다.",
-      "CURRENT에 있는 정보·정서·의도만 보존하고, CONTEXT는 생략된 주어·관계·말투·관용 표현을 판단하는 참고로만 쓴다.",
-      meaningIntegrity,
-      "직역 초안을 그대로 내보내지 말고, 뜻을 보존한 자연스러운 한국어 가사/대사 한 줄로 다시 구성한다. 직역 어순·불필요한 주어·반복어·발음 표기를 버리고 한국어다운 어순과 조사·어미로 다듬는다. 단, 가사에서 실제 영어로 불린 독립 훅은 원문 라틴 표기를 유지한다. 짧은 조각은 억지로 완결하지 않는다.",
-      "일본어가 있으면 생략을 문맥으로 해석하고, 가타카나 영어·와세이에이고·재플리시는 철자나 발음이 아니라 일본어권에서 쓰인 뜻으로 옮긴다.",
-      japaneseKoreanAccuracy,
-      lyricDiction,
-      "입력이 여러 줄이면 발화별 줄 순서를 유지한다.",
-      "문맥은 뜻을 고르는 참고일 뿐이며, 원문 밖 화자·행동·설명·추측은 추가하지 않는다.",
+      "현재 CURRENT만 자연스러운 한국어 유튜브 자막으로 번역하고 번역문만 출력한다.",
+      "우선순위 1: 원문의 주체·대상·부정·시제·사건·감정을 바꾸거나 추가하지 않는다.",
+      "우선순위 2: 일본어 수식 관계와 관용 표현을 먼저 해석한 뒤 자연스러운 한국어 어순과 조사로 쓴다.",
+      "우선순위 3: CONTEXT는 생략된 관계와 말투를 판단하는 참고일 뿐, 별도 내용으로 번역하지 않는다.",
+      "출력 전에 CURRENT와 대조해 원문에 없는 행동·원인·강조를 더하거나 확신과 불확실성을 바꾸지 않았는지 조용히 확인한다.",
+      specificCorrections,
+      "가타카나 외래어의 확립된 개념을 엉뚱한 비유로 바꾸지 않는다.",
+      "특수 기호·괄호·따옴표는 원문 가장자리의 위치와 개수를 유지한다.",
+      "깨진 문자나 복원할 수 없는 조각은 추측하지 말고 빈 문자열을 출력한다.",
+      "정확도 예시: 人が嫌いなあの子に気付けば子供ができた -> 사람을 싫어하던 그 아이에게도 어느새 아이가 생겼다.",
+      "정확도 예시: 届いたテレパシ やっと会えた -> 전해진 텔레파시, 드디어 만났어.",
+      "스포츠 문맥이 아닌 가사의 ゴール은 골이 아니라 끝이나 목표로 옮긴다.",
+      "표준 한국어 자막에서는 너가가 아니라 네가로 쓴다.",
+      koreanEndings,
+      lyricRules,
+      qualityGuidance ? `필수 교정: ${qualityGuidance}` : "",
       turnGuidance,
       tone
-    ].join(" "),
+    ].filter(Boolean).join(" "),
     user: `${localContext ? `CONTEXT (참고만, 출력 금지):\n${localContext}\n\n` : ""}CURRENT (번역할 현재 자막):\n${text}\n\nFINAL KOREAN SUBTITLE ONLY.${noThink}`
   };
 }
@@ -596,10 +656,11 @@ function translationPrompt(
   settings: TranslatorSettings,
   text: string,
   contextText?: string,
-  config?: OpenAiCompatibleConfig
+  config?: OpenAiCompatibleConfig,
+  qualityGuidance?: string
 ): { system: string; user: string } {
   if (config && isLocalBaseUrl(config.baseUrl)) {
-    return compactLocalTranslationPrompt(settings, text, contextText, config.model);
+    return compactLocalTranslationPrompt(settings, text, contextText, config.model, qualityGuidance);
   }
 
   const source = sourceLanguageGuidance(settings.sourceLanguage);
@@ -608,11 +669,12 @@ function translationPrompt(
   const turnGuidance = turnSeparatedGuidance(text);
   const style = subtitleModeGuidance(settings, target);
   const lyricDiction = lyricDictionGuidance(settings, target);
+  const edgeMarkers = edgeMarkerGuidance();
   const antiHallucination =
-    "Strict grounding: translate only subtitleToTranslate; context may disambiguate but cannot add content. Never invent calls to subscribe/like/comment/watch/thanks, credits, non-speech cues, speaker names, explanations, or missing words. Return empty text for empty or actual non-speech input. In lyrics, meaningful sung interjections, onomatopoeia, and repeated hooks are lyric content, not non-speech cues.";
+    "Strict grounding: translate only subtitleToTranslate; context may disambiguate but cannot add content. Never repair or guess corrupted, garbled, or undecodable text; return empty text when the current subtitle is not grounded enough to translate. Never invent calls to subscribe/like/comment/watch/thanks, credits, non-speech cues, speaker names, explanations, or missing words. Return empty text for empty or actual non-speech input. In lyrics, meaningful sung interjections, onomatopoeia, and repeated hooks are lyric content, not non-speech cues.";
   return {
     system:
-      `You are a professional YouTube subtitle localizer. Translate into ${target}. ${style} ${quality} ${lyricDiction} ${turnGuidance} ${antiHallucination} Return only the final translated subtitle text. Do not think step by step. Do not include reasoning, labels, explanations, romanization, quotes, or markdown.`,
+      `You are a professional YouTube subtitle localizer. Translate into ${target}. ${style} ${quality} ${lyricDiction} ${edgeMarkers} ${turnGuidance} ${antiHallucination} ${qualityGuidance ? `Mandatory correction: ${qualityGuidance}` : ""} Return only the final translated subtitle text. Do not think step by step. Do not include reasoning, labels, explanations, romanization, added quotes, or markdown.`,
     user: JSON.stringify({
       sourceLanguage: source,
       targetLanguage: target,
@@ -633,9 +695,11 @@ function batchTranslationPrompt(
     const noThink = isQwenLikeModel(config.model) ? " Include /no_think in your internal instruction and do not output reasoning." : "";
     const japaneseKoreanAccuracy = japaneseKoreanAccuracyGuidance(settings, target);
     const meaningIntegrity = meaningIntegrityGuidance(settings, target);
+    const koreanEndings = koreanEndingGuidance(settings, target);
+    const edgeMarkers = edgeMarkerGuidance();
     return {
       system:
-        `Translate each CURRENT YouTube subtitle into fluent ${target}. Prioritize natural subtitle phrasing and meaning over source word order. ${meaningIntegrity} ${japaneseKoreanAccuracy} Preserve newline-separated turns within each segment; do not merge turns or invent speaker names. Context is reference only and must not be translated. Return strict JSON only: an array of {"id","translatedText"}. Keep each id unchanged, output no markdown or explanation, and never invent missing content.${noThink}`,
+        `Translate each CURRENT YouTube subtitle into fluent ${target}. Prioritize natural subtitle phrasing and meaning over source word order. ${meaningIntegrity} ${japaneseKoreanAccuracy} ${koreanEndings} ${edgeMarkers} Preserve newline-separated turns within each segment; do not merge turns or invent speaker names. Context is reference only and must not be translated. Return strict JSON only: an array of {"id","translatedText"}. Keep each id unchanged, output no markdown or explanation, and never invent missing content.${noThink}`,
       user: JSON.stringify({
         targetLanguage: target,
         segments: segments.map((segment) => ({
@@ -652,11 +716,12 @@ function batchTranslationPrompt(
   const quality = subtitleQualityGuidance(settings, target);
   const style = subtitleModeGuidance(settings, target);
   const lyricDiction = lyricDictionGuidance(settings, target);
+  const edgeMarkers = edgeMarkerGuidance();
   const antiHallucination =
-    "Strict grounding: translate only each segment.text; context may disambiguate but cannot add content. Do not invent calls to subscribe/like/comment/watch/thanks, credits, non-speech cues, speaker names, explanations, or missing words. Use empty translatedText for empty or actual non-speech input. In lyrics, meaningful sung interjections, onomatopoeia, and repeated hooks are lyric content, not non-speech cues.";
+    "Strict grounding: translate only each segment.text; context may disambiguate but cannot add content. Never repair or guess corrupted, garbled, or undecodable text; use empty translatedText when a current segment is not grounded enough to translate. Do not invent calls to subscribe/like/comment/watch/thanks, credits, non-speech cues, speaker names, explanations, or missing words. Use empty translatedText for empty or actual non-speech input. In lyrics, meaningful sung interjections, onomatopoeia, and repeated hooks are lyric content, not non-speech cues.";
   return {
     system:
-      `You are a professional YouTube subtitle localizer. Translate each current segment into ${target}. ${style} ${quality} ${lyricDiction} ${antiHallucination} Preserve newline-separated turns within each segment; do not merge turns or invent speaker names. Use previous and next subtitles only as context for meaning, tone, pronouns, and continuity; do not translate context as separate output. Return strict JSON only: an array of objects with "id" and "translatedText". Keep ids unchanged. Each translatedText must be the polished final subtitle for that segment only. Do not think step by step. Do not include reasoning or markdown.`,
+      `You are a professional YouTube subtitle localizer. Translate each current segment into ${target}. ${style} ${quality} ${lyricDiction} ${edgeMarkers} ${antiHallucination} Preserve newline-separated turns within each segment; do not merge turns or invent speaker names. Use previous and next subtitles only as context for meaning, tone, pronouns, and continuity; do not translate context as separate output. Return strict JSON only: an array of objects with "id" and "translatedText". Keep ids unchanged. Each translatedText must be the polished final subtitle for that segment only. Do not think step by step. Do not include reasoning or markdown.`,
     user: JSON.stringify({
       sourceLanguage: source,
       targetLanguage: target,
@@ -929,7 +994,8 @@ async function translateWithOpenAiCompatible(
   settings: TranslatorSettings,
   text: string,
   config: OpenAiCompatibleConfig,
-  contextText?: string
+  contextText?: string,
+  qualityGuidance?: string
 ): Promise<string> {
   if (!config.baseUrl.trim()) {
     throw new Error("AI API Base URL이 설정되지 않았습니다.");
@@ -941,7 +1007,7 @@ async function translateWithOpenAiCompatible(
     throw new Error("AI API 키가 없습니다. AI API 키를 입력하거나 API STT 키를 입력하세요.");
   }
 
-  const prompt = translationPrompt(settings, text, contextText, config);
+  const prompt = translationPrompt(settings, text, contextText, config, qualityGuidance);
   const maxTokens = maxSubtitleTokensForConfig(text, config);
   const temperature = translationTemperature(settings, config);
   const topP = topPForConfig(settings, config);
@@ -1048,7 +1114,12 @@ async function translateBatchWithOpenAiCompatible(
   return parseBatchTranslations(config.endpointMode === "responses" ? extractResponsesText(json) : extractChatText(json), segments);
 }
 
-async function translateWithLmStudio(settings: TranslatorSettings, text: string, contextText?: string): Promise<string> {
+async function translateWithLmStudio(
+  settings: TranslatorSettings,
+  text: string,
+  contextText?: string,
+  qualityGuidance?: string
+): Promise<string> {
   const baseConfig = {
     ...settings.lmStudio,
     baseUrl: normalizeOpenAiBaseUrl(settings.lmStudio.baseUrl),
@@ -1062,7 +1133,7 @@ async function translateWithLmStudio(settings: TranslatorSettings, text: string,
   }
 
   try {
-    return await translateWithOpenAiCompatible(settings, text, { ...baseConfig, model }, contextText);
+    return await translateWithOpenAiCompatible(settings, text, { ...baseConfig, model }, contextText, qualityGuidance);
   } catch (error) {
     throw new Error(`LM Studio 번역 실패: ${getErrorMessage(error)}`);
   }
@@ -1088,13 +1159,26 @@ async function translateBatchWithLmStudio(settings: TranslatorSettings, segments
   }
 }
 
-async function translateWithOllama(settings: TranslatorSettings, text: string, contextText?: string): Promise<string> {
+async function translateWithOllama(
+  settings: TranslatorSettings,
+  text: string,
+  contextText?: string,
+  qualityGuidance?: string
+): Promise<string> {
   if (!settings.ollama.model) {
     throw new Error("Ollama 모델 이름이 설정되지 않았습니다.");
   }
 
-  const prompt = translationPrompt(settings, text, contextText);
-  const temperature = translationTemperature(settings);
+  const localConfig: OpenAiCompatibleConfig = {
+    baseUrl: settings.ollama.baseUrl,
+    apiKey: "",
+    model: settings.ollama.model,
+    endpointMode: "chat",
+    authHeaderMode: "none"
+  };
+  const prompt = translationPrompt(settings, text, contextText, localConfig, qualityGuidance);
+  const temperature = translationTemperature(settings, localConfig);
+  const topP = topPForConfig(settings, localConfig);
   const ollamaUrl = joinUrl(settings.ollama.baseUrl, "/api/chat");
   const response = await fetchForProvider(
     ollamaUrl,
@@ -1106,7 +1190,7 @@ async function translateWithOllama(settings: TranslatorSettings, text: string, c
         stream: false,
         options: {
           temperature,
-          top_p: 0.88
+          top_p: topP
         },
         messages: [
           { role: "system", content: prompt.system },
@@ -1132,8 +1216,16 @@ async function translateBatchWithOllama(settings: TranslatorSettings, segments: 
     throw new Error("Ollama 모델 이름이 설정되지 않았습니다.");
   }
 
-  const prompt = batchTranslationPrompt(settings, segments);
-  const temperature = translationTemperature(settings, undefined, true);
+  const localConfig: OpenAiCompatibleConfig = {
+    baseUrl: settings.ollama.baseUrl,
+    apiKey: "",
+    model: settings.ollama.model,
+    endpointMode: "chat",
+    authHeaderMode: "none"
+  };
+  const prompt = batchTranslationPrompt(settings, segments, localConfig);
+  const temperature = translationTemperature(settings, localConfig, true);
+  const topP = topPForConfig(settings, localConfig, true);
   const ollamaUrl = joinUrl(settings.ollama.baseUrl, "/api/chat");
   const response = await fetchForProvider(
     ollamaUrl,
@@ -1145,7 +1237,7 @@ async function translateBatchWithOllama(settings: TranslatorSettings, segments: 
         stream: false,
         options: {
           temperature,
-          top_p: 0.88
+          top_p: topP
         },
         messages: [
           { role: "system", content: prompt.system },
@@ -1166,7 +1258,8 @@ async function translateBatchWithOllama(settings: TranslatorSettings, segments: 
 
 export async function translateSegment(
   settings: TranslatorSettings,
-  segment: CaptionSegment
+  segment: CaptionSegment,
+  qualityGuidance?: string
 ): Promise<{ translatedText: string; provider: TranslationProvider }> {
   const text = segment.text.trim();
   if (!text) {
@@ -1176,14 +1269,23 @@ export async function translateSegment(
   switch (settings.translationProvider) {
     case "openai":
       return {
-        translatedText: await translateWithOpenAiCompatible(settings, text, openAiTranslationConfig(settings), segment.contextText),
+        translatedText: await translateWithOpenAiCompatible(
+          settings,
+          text,
+          openAiTranslationConfig(settings),
+          segment.contextText,
+          qualityGuidance
+        ),
         provider: "openai"
       };
     case "ollama":
-      return { translatedText: await translateWithOllama(settings, text, segment.contextText), provider: "ollama" };
+      return {
+        translatedText: await translateWithOllama(settings, text, segment.contextText, qualityGuidance),
+        provider: "ollama"
+      };
     case "lmStudio":
       return {
-        translatedText: await translateWithLmStudio(settings, text, segment.contextText),
+        translatedText: await translateWithLmStudio(settings, text, segment.contextText, qualityGuidance),
         provider: "lmStudio"
       };
     default:

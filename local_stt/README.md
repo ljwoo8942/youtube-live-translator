@@ -36,7 +36,7 @@ Default GPU settings are tuned for an RTX 5070 12 GB:
 
 - model: `small`
 - device: `cuda`
-- compute type: `int8_float16`
+- compute type: `float16` (`int8` when the device is CPU)
 - beam size: `1`
 - VAD: enabled
 - stream window: `6s`
@@ -49,17 +49,31 @@ When the extension sends `content_mode=lyrics`, the server switches to a song-fr
 - stream window: `12s`
 - stream decode interval: `1.6s`
 - minimum audio before decode: `3s`
-- overlap after finalized text: `1.2s`
-- multilingual vocal prompt and a more permissive no-speech threshold
+- overlap after finalized text: `2s`
+- a fixed source language is preserved; `auto` enables per-segment language detection
+- deterministic decoding and a more permissive no-speech threshold
 
 When the extension sends `content_mode=live`, the server uses a speech-first hybrid profile for streams that alternate between talking and singing:
 
-- VAD: enabled for ordinary speech; when the speech pass is empty, one song-aware, no-VAD lyrics pass checks for sung vocals
-- the lyrics fallback releases a forced source-language hint so mixed-language songs can be detected
-- beam size: `2` by default
+- VAD: enabled with a lower speech threshold and boundary padding; when the speech pass is empty, one song-aware, no-VAD lyrics pass checks for sung vocals
+- the lyrics fallback preserves a fixed source language and uses automatic detection only when the request language is `auto`
+- beam size: `3` by default
 - stream window: `8s`
 - stream decode interval: `1.3s`
 - minimum audio before decode: `2.1s`
-- overlap after finalized text: `1s`
+- overlap after finalized text: `1.5s`
 
-Override with environment variables such as `YT_TRANSLATOR_STT_MODEL`, `YT_TRANSLATOR_STT_DEVICE`, `YT_TRANSLATOR_STT_COMPUTE_TYPE`, `YT_TRANSLATOR_STT_STREAM_WINDOW_SECONDS`, or `YT_TRANSLATOR_STT_STREAM_DECODE_INTERVAL_SECONDS`.
+When `base` or `small` is selected, the server uses a model-specific profile:
+
+- beam size: `5` for live/lyrics and `3` for ordinary speech
+- automatic language detection checks more audio segments
+- `small` keeps longer stream context (`10s`/`15s` for live/lyrics) to improve recognition stability
+- `base` uses a faster testing profile (`7.5s`/`10s` for live/lyrics) and a less aggressive compact-model confidence filter
+
+The `medium` timings remain unchanged. Use `base` for responsiveness experiments, `small` for the default balance, and `medium` when accuracy matters more than GPU load.
+
+Streaming results are finalized after a repeated decode or the profile's stabilization interval, so the first short partial does not immediately discard context.
+
+Initial prompts are disabled by default because short instrumental sections can copy prompt text into the transcript. Mode-specific prompts remain available through `YT_TRANSLATOR_STT_LYRICS_INITIAL_PROMPT` and `YT_TRANSLATOR_STT_LIVE_INITIAL_PROMPT`.
+
+Override with environment variables such as `YT_TRANSLATOR_STT_MODEL`, `YT_TRANSLATOR_STT_DEVICE`, `YT_TRANSLATOR_STT_COMPUTE_TYPE`, `YT_TRANSLATOR_STT_TEMPERATURE`, `YT_TRANSLATOR_STT_LIVE_VAD_THRESHOLD`, `YT_TRANSLATOR_STT_STREAM_WINDOW_SECONDS`, or `YT_TRANSLATOR_STT_STREAM_DECODE_INTERVAL_SECONDS`.

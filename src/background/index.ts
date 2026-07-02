@@ -1,7 +1,7 @@
 import { loadSettings, loadSettingsSnapshot, patchSettings, toContentSettings } from "../shared/storage";
 import type { CaptionSegment, PageCaptionSnapshot, PageCaptionTrack, TranslatorSettings } from "../shared/types";
 import type { CaptionTranslationEntry, MessageResponse, RuntimeMessage } from "../shared/messages";
-import { getErrorMessage } from "../shared/messages";
+import { BLOCKED_HALLUCINATION_ERROR, getErrorMessage } from "../shared/messages";
 import { TRANSLATION_PROMPT_VERSION } from "../shared/translationVersion";
 import { assertTranscriptionReady, assertTranslationReady, transcribeAudio, translateSegment, translateSegments } from "./providers";
 import {
@@ -10,6 +10,15 @@ import {
   putCachedCaptionTranslations,
   type CaptionCacheContext
 } from "./captionCache";
+import {
+  assistOfficialCaptionSegment,
+  assistLyricsSegment,
+  createLyricsAssistSession,
+  searchLyricsCandidates,
+  setLyricsCandidates,
+  type LyricsAssistSession,
+  type LyricsMediaContext
+} from "./lyricsAssist";
 
 const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 const AUDIO_FAILURE_COOLDOWN_MS = 12_000;
@@ -21,7 +30,9 @@ const LM_STUDIO_PRETRANSLATE_BATCH_SIZE = 1;
 const HOT_PRETRANSLATE_BATCH_SIZE = 1;
 const LM_STUDIO_HOT_PRETRANSLATE_BATCH_SIZE = 1;
 const HOT_PRETRANSLATE_FUTURE_WINDOW_MS = 75_000;
+const LOCAL_PRETRANSLATE_FUTURE_WINDOW_MS = 20_000;
 const HOT_PRETRANSLATE_PAST_WINDOW_MS = 2_500;
+const LOCAL_PRETRANSLATE_REST_MS = 500;
 const PRETRANSLATE_PRIORITY_PAST_WINDOW_MS = 10_000;
 const PRETRANSLATE_PRIORITY_FUTURE_WINDOW_MS = 180_000;
 const PRETRANSLATE_RECENT_PAST_WINDOW_MS = 60_000;
@@ -33,18 +44,31 @@ const STREAM_PARTIAL_TRANSLATION_MIN_CHARACTERS = 5;
 
 let creatingOffscreen: Promise<void> | undefined;
 let activeAudioTabId: number | undefined;
+let activeAudioVideoId: string | undefined;
 let lastBroadcastSettingsRevision = -1;
-let startingAudioCapture: { tabId: number; promise: Promise<MessageResponse<{ tabId: number; mode?: string }>> } | undefined;
+let startingAudioCapture:
+  | { tabId: number; videoId?: string; promise: Promise<MessageResponse<{ tabId: number; mode?: string }>> }
+  | undefined;
+let audioLifecycleQueue: Promise<void> = Promise.resolve();
 const translationCache = new Map<string, string>();
 const translationInFlight = new Map<string, Promise<MessageResponse<{ translatedText: string; provider: string }>>>();
-const audioQueues = new Map<number, { processing: boolean; pending?: Extract<RuntimeMessage, { type: "AUDIO_CHUNK" }> }>();
-const audioFailureCooldowns = new Map<number, { until: number; error: string }>();
+type AudioChunkMessage = Extract<RuntimeMessage, { type: "AUDIO_CHUNK" }>;
+type AudioQueueState = { videoId: string; processing: boolean; pending?: AudioChunkMessage };
+const audioQueues = new Map<number, AudioQueueState>();
+const audioFailureCooldowns = new Map<number, { until: number; error: string; videoId?: string }>();
 const audioNoSpeechNotices = new Map<number, number>();
 const audioLastProcessedAt = new Map<number, number>();
 const lastFinalTranscriptByTab = new Map<number, { text: string; at: number }>();
 const lastPartialTranslationByTab = new Map<number, { text: string; at: number }>();
 const streamTranslationGenerationByTab = new Map<number, number>();
 const audioContextByTab = new Map<number, string[]>();
+const lyricsAssistByTab = new Map<number, LyricsAssistSession>();
+type CaptionLyricsAssistState = {
+  videoId: string;
+  session: LyricsAssistSession;
+  ready: Promise<void>;
+};
+const captionLyricsAssistByTab = new Map<number, CaptionLyricsAssistState>();
 
 void chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" }).catch((error) => {
   console.debug("Could not restrict local storage to trusted extension contexts", error);
@@ -62,6 +86,7 @@ const PROBABLE_AUDIO_HALLUCINATION_KEYS = new Set([
   "youyouyouyou",
   "thankyou",
   "thanks",
+  "thankyouverymuch",
   "pleasedonottrythisathome",
   "pleasedonotreuploadthisvideo",
   "thankyouforwatching",
@@ -98,6 +123,9 @@ const PROBABLE_AUDIO_HALLUCINATION_KEYS = new Set([
   "字幕提供",
   "字幕視聴",
   "字幕をご覧いただきありがとうございます",
+  "字幕をご覧いただきありがとうございました",
+  "字幕をご覧いただきましてありがとうございます",
+  "字幕をご覧いただきましてありがとうございました",
   "中文字幕",
   "中文字幕中文字幕",
   "中文字幕中文字幕中文字幕",
@@ -278,10 +306,11 @@ const TRANSLATION_REFUSAL_KEYS = new Set([
   "asanai",
   "asanailanguagemodel"
 ]);
-const BLOCKED_HALLUCINATION_ERROR = "환각 의심 번역 결과를 차단했습니다.";
+const PRESERVED_ENGLISH_LYRIC_HOOKS = new Set(["oh", "yeah", "baby", "la", "wow", "na", "ah", "ah-ah"]);
 
 type OffscreenAudioState = {
   activeTabId?: number;
+  activeVideoId?: string;
   recording?: boolean;
   mode?: string;
 };
@@ -380,6 +409,9 @@ async function readPageCaptionSnapshot(tabId: number, videoId: string): Promise<
             const candidateResponse = candidate.getPlayerResponse?.();
             const candidateVideoId = readString((candidateResponse as Record<string, unknown> | undefined)?.videoDetails, "videoId");
             const candidateDataVideoId = readString(candidate.getVideoData?.(), "video_id");
+            if (candidateVideoId && candidateVideoId !== expectedVideoId) {
+              continue;
+            }
             if (candidateVideoId === expectedVideoId || candidateDataVideoId === expectedVideoId) {
               player = candidate;
               playerResponse = candidateResponse;
@@ -448,6 +480,162 @@ async function readPageCaptionSnapshot(tabId: number, videoId: string): Promise<
   }
 }
 
+async function readPageMediaContext(tabId: number, videoId: string): Promise<LyricsMediaContext | undefined> {
+  const scripting = (chrome as typeof chrome & { scripting?: ChromeScriptingApi }).scripting;
+  if (!scripting) {
+    return undefined;
+  }
+  try {
+    const executions = await scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      args: [videoId],
+      func: (expectedVideoId: string) => {
+        type PlayerElement = HTMLElement & {
+          getPlayerResponse?: () => unknown;
+          getVideoData?: () => unknown;
+        };
+        const readString = (value: unknown, key: string): string | undefined => {
+          if (!value || typeof value !== "object") return undefined;
+          const field = (value as Record<string, unknown>)[key];
+          return typeof field === "string" && field.trim() ? field.trim() : undefined;
+        };
+        const url = new URL(location.href);
+        const urlVideoId = url.searchParams.get("v") ?? location.pathname.match(/\/shorts\/([^/?]+)/)?.[1];
+        if (urlVideoId !== expectedVideoId) return null;
+
+        const players = [...document.querySelectorAll<PlayerElement>("#movie_player, .html5-video-player")];
+        let playerResponse: Record<string, unknown> | undefined;
+        for (const player of players) {
+          try {
+            const response = player.getPlayerResponse?.();
+            const details = (response as Record<string, unknown> | undefined)?.videoDetails;
+            const responseVideoId = readString(details, "videoId") ?? readString(player.getVideoData?.(), "video_id");
+            if (responseVideoId === expectedVideoId) {
+              playerResponse = response as Record<string, unknown>;
+              break;
+            }
+          } catch {
+            continue;
+          }
+        }
+        const details = playerResponse?.videoDetails as Record<string, unknown> | undefined;
+        const microformat = (playerResponse?.microformat as Record<string, unknown> | undefined)
+          ?.playerMicroformatRenderer as Record<string, unknown> | undefined;
+        const lengthSeconds = Number(readString(details, "lengthSeconds"));
+        return {
+          videoId: expectedVideoId,
+          title:
+            readString(details, "title") ??
+            document.querySelector<HTMLMetaElement>('meta[property="og:title"]')?.content ??
+            document.title.replace(/\s*-\s*YouTube\s*$/i, ""),
+          author: readString(details, "author") ?? "",
+          description: (readString(details, "shortDescription") ?? readString(microformat, "description") ?? "").slice(0, 12_000),
+          durationSeconds: Number.isFinite(lengthSeconds) && lengthSeconds > 0 ? lengthSeconds : undefined,
+          isLive: Boolean(details?.isLiveContent ?? microformat?.liveBroadcastDetails)
+        };
+      }
+    });
+    const value = executions[0]?.result;
+    if (!value || typeof value !== "object") {
+      return undefined;
+    }
+    const source = value as Record<string, unknown>;
+    if (source.videoId !== videoId || typeof source.title !== "string") {
+      return undefined;
+    }
+    return {
+      videoId,
+      title: source.title,
+      author: typeof source.author === "string" ? source.author : "",
+      description: typeof source.description === "string" ? source.description : "",
+      durationSeconds: typeof source.durationSeconds === "number" ? source.durationSeconds : undefined,
+      isLive: Boolean(source.isLive)
+    };
+  } catch (error) {
+    console.debug("YouTube media metadata unavailable for lyrics assist", error);
+    return undefined;
+  }
+}
+
+async function prepareLyricsAssist(tabId: number, videoId: string, settings: TranslatorSettings): Promise<void> {
+  if (!settings.lyricsAssistEnabled || settings.contentMode === "spoken") {
+    lyricsAssistByTab.delete(tabId);
+    return;
+  }
+  const session = createLyricsAssistSession(videoId);
+  lyricsAssistByTab.set(tabId, session);
+  const media = await readPageMediaContext(tabId, videoId);
+  if (!media || lyricsAssistByTab.get(tabId) !== session || !isActiveAudioSession(tabId, videoId)) {
+    return;
+  }
+  const candidates = await searchLyricsCandidates(media);
+  if (lyricsAssistByTab.get(tabId) === session && isActiveAudioSession(tabId, videoId)) {
+    setLyricsCandidates(session, candidates);
+  }
+}
+
+function startCaptionLyricsAssist(
+  tabId: number,
+  videoId: string,
+  settings: TranslatorSettings
+): CaptionLyricsAssistState | undefined {
+  if (!settings.lyricsAssistEnabled || settings.contentMode === "spoken") {
+    captionLyricsAssistByTab.delete(tabId);
+    return undefined;
+  }
+
+  const existing = captionLyricsAssistByTab.get(tabId);
+  if (existing?.videoId === videoId) {
+    return existing;
+  }
+
+  const session = createLyricsAssistSession(videoId);
+  const state: CaptionLyricsAssistState = {
+    videoId,
+    session,
+    ready: Promise.resolve()
+  };
+  captionLyricsAssistByTab.set(tabId, state);
+  state.ready = (async () => {
+    const media = await readPageMediaContext(tabId, videoId);
+    if (!media || captionLyricsAssistByTab.get(tabId) !== state) {
+      return;
+    }
+    const candidates = await searchLyricsCandidates(media);
+    if (captionLyricsAssistByTab.get(tabId) === state) {
+      setLyricsCandidates(session, candidates);
+    }
+  })();
+  return state;
+}
+
+async function captionLyricsAssistSession(
+  tabId: number,
+  videoId: string,
+  settings: TranslatorSettings
+): Promise<LyricsAssistSession | undefined> {
+  const state = startCaptionLyricsAssist(tabId, videoId, settings);
+  if (!state) {
+    return undefined;
+  }
+  await Promise.race([
+    state.ready,
+    new Promise<void>((resolve) => globalThis.setTimeout(resolve, 900))
+  ]);
+  return captionLyricsAssistByTab.get(tabId) === state ? state.session : undefined;
+}
+
+async function addCaptionLyricsAssist(
+  tabId: number,
+  videoId: string,
+  settings: TranslatorSettings,
+  segments: CaptionSegment[]
+): Promise<CaptionSegment[]> {
+  const session = await captionLyricsAssistSession(tabId, videoId, settings);
+  return session ? segments.map((segment) => assistOfficialCaptionSegment(session, segment)) : segments;
+}
+
 async function ensureOffscreenDocument(): Promise<void> {
   const offscreenUrl = chrome.runtime.getURL(OFFSCREEN_DOCUMENT_PATH);
   const existingContexts = await chrome.runtime.getContexts({
@@ -491,7 +679,8 @@ async function getOffscreenAudioState(): Promise<OffscreenAudioState | undefined
 
   try {
     const response = await chrome.runtime.sendMessage<MessageResponse<OffscreenAudioState>>({
-      type: "GET_OFFSCREEN_AUDIO_STATE"
+      type: "GET_OFFSCREEN_AUDIO_STATE",
+      target: "offscreen"
     });
     return response?.ok ? response : undefined;
   } catch {
@@ -512,14 +701,45 @@ function isSupportedYouTubeUrl(url?: string): boolean {
   }
 }
 
-async function isContentScriptReady(tabId: number): Promise<boolean> {
+function youtubeVideoIdFromUrl(url?: string): string | undefined {
+  if (!url) {
+    return undefined;
+  }
   try {
-    const response = await chrome.tabs.sendMessage<MessageResponse>(tabId, {
-      type: "GET_TAB_STATUS"
-    });
-    return Boolean(response?.ok);
+    const parsed = new URL(url);
+    if (!isSupportedYouTubeUrl(url)) {
+      return undefined;
+    }
+    return parsed.searchParams.get("v") ?? parsed.pathname.match(/^\/shorts\/([^/?]+)/)?.[1];
   } catch {
-    return false;
+    return undefined;
+  }
+}
+
+async function updateActionAvailability(tabId: number, url?: string): Promise<void> {
+  const tabUrl = url ?? (await getTabUrl(tabId));
+  const isYouTube = isSupportedYouTubeUrl(tabUrl);
+  try {
+    await chrome.action.setTitle({
+      tabId,
+      title: isYouTube ? "YouTube Live Translator" : "YouTube에서만 사용할 수 있습니다"
+    });
+    if (isYouTube) {
+      await chrome.action.enable(tabId);
+    } else {
+      await chrome.action.disable(tabId);
+    }
+  } catch (error) {
+    console.debug("Could not update extension action availability", error);
+  }
+}
+
+async function initializeActionAvailability(): Promise<void> {
+  try {
+    const tabs = await chrome.tabs.query({});
+    await Promise.all(tabs.flatMap((tab) => (tab.id ? [updateActionAvailability(tab.id, tab.url)] : [])));
+  } catch (error) {
+    console.debug("Could not initialize extension action availability", error);
   }
 }
 
@@ -538,33 +758,6 @@ function getTabUrl(tabId: number): Promise<string | undefined> {
       resolve(tab.url);
     });
   });
-}
-
-async function ensureContentScript(tabId: number): Promise<boolean> {
-  if (await isContentScriptReady(tabId)) {
-    return true;
-  }
-
-  const tabUrl = await getTabUrl(tabId);
-  if (tabUrl && !isSupportedYouTubeUrl(tabUrl)) {
-    return false;
-  }
-
-  try {
-    const scripting = (chrome as typeof chrome & { scripting?: ChromeScriptingApi }).scripting;
-    if (!scripting) {
-      return false;
-    }
-    await scripting.executeScript({
-      target: { tabId },
-      files: ["content.js"]
-    });
-  } catch (error) {
-    console.debug("Content script injection failed", error);
-    return false;
-  }
-
-  return isContentScriptReady(tabId);
 }
 
 async function ownsLiveAudioCapture(tabId: number): Promise<boolean> {
@@ -618,6 +811,12 @@ function isProbableAudioHallucination(text: string): boolean {
   if (key.includes("시청") && key.includes("감사")) {
     return true;
   }
+  if (
+    (key.includes("자막") && key.includes("감사") && (key.includes("봐주") || key.includes("보아주"))) ||
+    (key.includes("字幕") && key.includes("ご覧いただ") && key.includes("ありがとう"))
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -659,6 +858,12 @@ function isProbableGeneratedBoilerplate(text: string): boolean {
 }
 
 function isProbableCreditHallucination(key: string): boolean {
+  if (
+    key.length <= 96 &&
+    /^(?:transcription|translation|transcript|caption(?:ing|s)?|subtitles?)(?:provided|created|edited)?by[\p{L}\p{N}]+$/u.test(key)
+  ) {
+    return true;
+  }
   if (
     PROBABLE_AUDIO_CREDIT_PARTS.some((part) => key.includes(part)) &&
     ["by", "의해", "완료", "제작", "기록", "번역", "による", "作成", "翻訳", "制作"].some((token) => key.includes(token))
@@ -741,6 +946,19 @@ function isIntentionalLyricRefrain(text: string): boolean {
     const token = tokens[0];
     return token !== undefined && [...token].length <= 12;
   }
+  const latinTokens = normalized.match(/[A-Za-z][A-Za-z'-]*/g) ?? [];
+  if (latinTokens.length >= 2 && latinTokens.length <= 12) {
+    const normalizedLatinTokens = latinTokens.map((token) => token.toLowerCase());
+    if (
+      normalizedLatinTokens.some(
+        (token) =>
+          token.length <= 16 &&
+          normalizedLatinTokens.filter((candidate) => candidate === token).length >= 2
+      )
+    ) {
+      return true;
+    }
+  }
 
   const key = speechKey(normalized);
   for (let unitLength = 1; unitLength <= Math.min(8, Math.floor(key.length / 2)); unitLength += 1) {
@@ -750,6 +968,26 @@ function isIntentionalLyricRefrain(text: string): boolean {
     const repeats = key.length / unitLength;
     const unit = key.slice(0, unitLength);
     if (repeats >= 2 && repeats <= 4 && unit.length > 0 && unit.repeat(repeats) === key) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function latinWordCounts(text: string): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const token of text.match(/[A-Za-z][A-Za-z'-]*/g) ?? []) {
+    const normalized = token.toLowerCase();
+    counts.set(normalized, (counts.get(normalized) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function isMissingRequiredEnglishLyricHook(sourceText: string, translatedText: string): boolean {
+  const sourceCounts = latinWordCounts(sourceText);
+  const translatedCounts = latinWordCounts(translatedText);
+  for (const [token, count] of sourceCounts) {
+    if ((PRESERVED_ENGLISH_LYRIC_HOOKS.has(token) || count >= 2) && (translatedCounts.get(token) ?? 0) < count) {
       return true;
     }
   }
@@ -767,11 +1005,21 @@ function isModelRefusalOrMetaText(text: string): boolean {
   return /^(번역|자막|translation|subtitle)\s*[:：-]?\s*$/i.test(text.trim());
 }
 
+function hasCorruptedSubtitleText(text: string): boolean {
+  if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFD]/u.test(text)) {
+    return true;
+  }
+  const placeholderCount = text.match(/(?:^|[\s　])\?(?=[\s　]|$)/gu)?.length ?? 0;
+  const wordCount = text.match(/[\p{L}\p{N}]+/gu)?.length ?? 0;
+  return placeholderCount >= 3 && placeholderCount * 3 >= Math.max(1, wordCount);
+}
+
 function sanitizeAudioTranscript(text: string, preserveLyricRefrain = false): string {
   const normalized = normalizeSubtitleLines(text);
   const hasAllowedLyricRefrain = preserveLyricRefrain && isIntentionalLyricRefrain(normalized);
   if (
     !normalized ||
+    hasCorruptedSubtitleText(normalized) ||
     isProbableGeneratedBoilerplate(normalized) ||
     (hasExcessiveTextRepetition(normalized) && !hasAllowedLyricRefrain) ||
     isModelRefusalOrMetaText(normalized)
@@ -789,6 +1037,40 @@ function normalizeSubtitleLines(text: string): string {
     .join("\n");
 }
 
+function edgeMarkers(text: string): { leading: string; trailing: string } {
+  const trimmed = text.trim();
+  const leading = (trimmed.match(/^[\p{S}\p{P}]+/u)?.[0] ?? "").slice(0, 16);
+  const trailing = (trimmed.match(/[\p{S}\p{P}]+$/u)?.[0] ?? "").slice(-16);
+  return { leading, trailing };
+}
+
+function isSentenceTerminalOnly(text: string): boolean {
+  return /^[.!?。！？…]+$/u.test(text);
+}
+
+function hasEquivalentSentenceTerminal(text: string): boolean {
+  return /[.!?。！？…]$/u.test(text.trim());
+}
+
+function restoreSourceEdgeMarkers(sourceText: string, translatedText: string): string {
+  const source = edgeMarkers(sourceText);
+  if (!source.leading && !source.trailing) {
+    return translatedText;
+  }
+
+  let restored = translatedText.trim();
+  if (source.leading) {
+    restored = `${source.leading}${restored.replace(/^[\p{S}\p{P}]+/u, "").trimStart()}`;
+  }
+  if (
+    source.trailing &&
+    !(isSentenceTerminalOnly(source.trailing) && hasEquivalentSentenceTerminal(restored))
+  ) {
+    restored = `${restored.replace(/[\p{S}\p{P}]+$/u, "").trimEnd()}${source.trailing}`;
+  }
+  return restored;
+}
+
 function isUnsupportedJapanesePregnancyTranslation(sourceText: string, translatedText: string): boolean {
   const source = sourceText.replace(/[\s　]/g, "");
   const describesHavingAChild = /(?:子供|子ども|こども)(?:が|を)?(?:でき|出来)/u.test(source);
@@ -803,11 +1085,100 @@ function isUnsupportedJapaneseAddedAction(sourceText: string, translatedText: st
   return isNeutralRealization && !hasExplicitHeartOpening && /마음(?:을)?\s*열/u.test(translatedText);
 }
 
-function sanitizeTranslatedSubtitle(segment: CaptionSegment, translatedText: string, contentMode: string): string {
-  const normalized = normalizeSubtitleLines(translatedText);
+function isUnsupportedJapaneseTelepathyTranslation(sourceText: string, translatedText: string): boolean {
+  return /テレパシ(?:ー|ィ)?/u.test(sourceText) && !/텔레파시/u.test(translatedText);
+}
+
+function isUnsupportedJapaneseDislikeRelation(sourceText: string, translatedText: string): boolean {
+  return /人が嫌いな/u.test(sourceText.replace(/[\s　]/g, "")) && /사람(?:이|가)\s*싫/u.test(translatedText);
+}
+
+function isUnsupportedJapaneseGoalTranslation(sourceText: string, translatedText: string): boolean {
+  const source = sourceText.replace(/[\s　]/g, "");
+  const sportsContext = /(?:サッカー|フットボール|試合|シュート|得点)/u.test(source);
+  return /ゴール/u.test(source) && !sportsContext && /골(?:까지|로|에|을|이|은|$)/u.test(translatedText);
+}
+
+function isKoreanTargetLanguage(targetLanguage: string): boolean {
+  return /^(?:ko|kor|korean|한국어|kr)$/i.test(targetLanguage.trim());
+}
+
+function polishKoreanSubtitleDiction(text: string, targetLanguage: string): string {
+  if (!isKoreanTargetLanguage(targetLanguage)) {
+    return text;
+  }
+  return text.replace(/(^|[\s"'“‘([{])너가(?=$|[\s"'”’)\]},.!?…])/gu, "$1네가");
+}
+
+function polishJapaneseKoreanMeaning(sourceText: string, translatedText: string, targetLanguage: string): string {
+  if (!isKoreanTargetLanguage(targetLanguage)) {
+    return translatedText;
+  }
+  const source = sourceText.replace(/[\s　]/g, "");
+  if (/ここに居ようとして(?:る|いる)/u.test(source)) {
+    return translatedText
+      .replace(/여기(?:에)?\s*있으려고\s*(?:하고\s*있는|하는)/gu, "여기에 머물려는")
+      .replace(/여기(?:에)?\s*머물려고\s*(?:하고\s*있는|하는)/gu, "여기에 머물려는");
+  }
+  return translatedText;
+}
+
+function translationCorrectionGuidance(
+  segment: CaptionSegment,
+  translatedText: string,
+  settings: Awaited<ReturnType<typeof loadSettings>>
+): string | undefined {
+  const guidance: string[] = [];
+  if (settings.contentMode === "lyrics" && isMissingRequiredEnglishLyricHook(segment.text, translatedText)) {
+    const hooks = [...latinWordCounts(segment.text)]
+      .filter(([token, count]) => PRESERVED_ENGLISH_LYRIC_HOOKS.has(token) || count >= 2)
+      .map(([token, count]) => `${token} ${count}회`);
+    guidance.push(`원문 영어 훅을 번역하거나 한글로 음역하지 말고 그대로 유지한다: ${hooks.join(", ")}.`);
+  }
+  if (isUnsupportedJapaneseTelepathyTranslation(segment.text, translatedText)) {
+    guidance.push("テレパシー와 テレパシ는 반드시 텔레파시로 옮긴다.");
+  }
+  if (isUnsupportedJapanesePregnancyTranslation(segment.text, translatedText)) {
+    guidance.push("子供ができた는 임신했다가 아니라 아이가 생겼다로 옮긴다.");
+  }
+  if (isUnsupportedJapaneseAddedAction(segment.text, translatedText)) {
+    guidance.push("気付けば는 어느새 또는 정신 차려 보니이며, 마음을 열었다는 행동을 추가하지 않는다.");
+  }
+  if (isUnsupportedJapaneseDislikeRelation(segment.text, translatedText)) {
+    guidance.push("人が嫌いな子는 사람이 싫은 아이가 아니라 사람을 싫어하는 아이로 옮긴다.");
+  }
+  if (isUnsupportedJapaneseGoalTranslation(segment.text, translatedText)) {
+    guidance.push("스포츠 문맥이 아닌 ゴール은 골이 아니라 끝이나 목표로 옮긴다.");
+  }
+  return guidance.length > 0 ? guidance.join(" ") : undefined;
+}
+
+function sanitizeTranslatedSubtitle(
+  segment: CaptionSegment,
+  translatedText: string,
+  settings: Awaited<ReturnType<typeof loadSettings>>
+): string {
+  const cleaned = normalizeSubtitleLines(translatedText);
+  if (hasCorruptedSubtitleText(segment.text) || hasCorruptedSubtitleText(cleaned)) {
+    return "";
+  }
+  const normalized = cleaned
+    ? polishJapaneseKoreanMeaning(
+        segment.text,
+        polishKoreanSubtitleDiction(restoreSourceEdgeMarkers(segment.text, cleaned), settings.targetLanguage),
+        settings.targetLanguage
+      )
+    : "";
   const hasAllowedLyricRefrain =
-    contentMode === "lyrics" && isIntentionalLyricRefrain(segment.text) && isIntentionalLyricRefrain(normalized);
+    settings.contentMode === "lyrics" && isIntentionalLyricRefrain(segment.text) && isIntentionalLyricRefrain(normalized);
   if (!normalized || isModelRefusalOrMetaText(normalized) || (hasExcessiveTextRepetition(normalized) && !hasAllowedLyricRefrain)) {
+    return "";
+  }
+  if (settings.contentMode === "lyrics" && isMissingRequiredEnglishLyricHook(segment.text, normalized)) {
+    console.debug("Blocked translation that removed an English lyric hook", {
+      source: segment.text,
+      translated: normalized
+    });
     return "";
   }
   if (isUnsupportedJapanesePregnancyTranslation(segment.text, normalized)) {
@@ -816,6 +1187,18 @@ function sanitizeTranslatedSubtitle(segment: CaptionSegment, translatedText: str
   }
   if (isUnsupportedJapaneseAddedAction(segment.text, normalized)) {
     console.debug("Blocked unsupported Japanese added action", { source: segment.text, translated: normalized });
+    return "";
+  }
+  if (isUnsupportedJapaneseTelepathyTranslation(segment.text, normalized)) {
+    console.debug("Blocked unsupported Japanese telepathy translation", { source: segment.text, translated: normalized });
+    return "";
+  }
+  if (isUnsupportedJapaneseDislikeRelation(segment.text, normalized)) {
+    console.debug("Blocked reversed Japanese dislike relation", { source: segment.text, translated: normalized });
+    return "";
+  }
+  if (isUnsupportedJapaneseGoalTranslation(segment.text, normalized)) {
+    console.debug("Blocked unsupported Japanese goal translation", { source: segment.text, translated: normalized });
     return "";
   }
 
@@ -889,22 +1272,51 @@ function isLiveCapture(info: chrome.tabCapture.CaptureInfo): boolean {
 
 function getCapturedTabs(): Promise<chrome.tabCapture.CaptureInfo[]> {
   return new Promise((resolve) => {
-    chrome.tabCapture.getCapturedTabs((result) => {
-      resolve(result);
-    });
+    try {
+      chrome.tabCapture.getCapturedTabs((result) => {
+        if (chrome.runtime.lastError) {
+          resolve([]);
+          return;
+        }
+        resolve(result);
+      });
+    } catch {
+      resolve([]);
+    }
   });
 }
 
 async function liveCapturedTabIds(): Promise<number[]> {
+  if (!(await chrome.permissions.contains({ permissions: ["tabCapture"] }))) {
+    return [];
+  }
   return (await getCapturedTabs()).filter(isLiveCapture).map((info) => info.tabId);
 }
 
-function getAudioFailureCooldown(tabId: number): { until: number; error: string } | undefined {
+async function ensureTabCapturePermission(canRequest: boolean): Promise<boolean> {
+  if (await chrome.permissions.contains({ permissions: ["tabCapture"] })) {
+    return true;
+  }
+  if (!canRequest) {
+    return false;
+  }
+  try {
+    return await chrome.permissions.request({ permissions: ["tabCapture"] });
+  } catch (error) {
+    console.debug("Could not request tabCapture permission", error);
+    return false;
+  }
+}
+
+function getAudioFailureCooldown(tabId: number, videoId?: string): { until: number; error: string } | undefined {
   const cooldown = audioFailureCooldowns.get(tabId);
   if (!cooldown) {
     return undefined;
   }
 
+  if (videoId && cooldown.videoId && cooldown.videoId !== videoId) {
+    return undefined;
+  }
   if (cooldown.until <= Date.now()) {
     audioFailureCooldowns.delete(tabId);
     return undefined;
@@ -913,10 +1325,11 @@ function getAudioFailureCooldown(tabId: number): { until: number; error: string 
   return cooldown;
 }
 
-function setAudioFailureCooldown(tabId: number, error: string): void {
+function setAudioFailureCooldown(tabId: number, error: string, videoId?: string): void {
   audioFailureCooldowns.set(tabId, {
     until: Date.now() + AUDIO_FAILURE_COOLDOWN_MS,
-    error
+    error,
+    videoId
   });
 }
 
@@ -935,22 +1348,37 @@ function clearAudioQueue(tabId: number): void {
   lastPartialTranslationByTab.delete(tabId);
   streamTranslationGenerationByTab.delete(tabId);
   audioContextByTab.delete(tabId);
+  lyricsAssistByTab.delete(tabId);
 }
 
-async function stopAudioCaptureAfterFatalError(tabId: number, error: string): Promise<void> {
-  setAudioFailureCooldown(tabId, error);
-  await notifyTab(tabId, { type: "AUDIO_CAPTURE_STATUS", state: "error", error });
-  await stopAudioCapture(tabId);
-  setAudioFailureCooldown(tabId, error);
+function isActiveAudioSession(tabId: number, videoId: string): boolean {
+  return tabId === activeAudioTabId && videoId === activeAudioVideoId;
+}
+
+async function stopAudioCaptureAfterFatalError(tabId: number, videoId: string, error: string): Promise<void> {
+  if (!isActiveAudioSession(tabId, videoId)) {
+    return;
+  }
+  setAudioFailureCooldown(tabId, error, videoId);
+  await notifyTab(tabId, { type: "AUDIO_CAPTURE_STATUS", state: "error", error, videoId });
+  await stopAudioCapture(tabId, videoId);
+  setAudioFailureCooldown(tabId, error, videoId);
 }
 
 async function translateAndRespond(segment: CaptionSegment): Promise<MessageResponse<{ translatedText: string; provider: string }>> {
   const settings = await loadSettings();
-  if (!settings.enabled) {
+  const effectiveSettings =
+    segment.detectedContentMode && segment.detectedContentMode !== settings.contentMode
+      ? { ...settings, contentMode: segment.detectedContentMode }
+      : settings;
+  if (!effectiveSettings.enabled) {
     return { ok: false, error: "확장프로그램이 비활성화되어 있습니다." };
   }
+  if (hasCorruptedSubtitleText(segment.text)) {
+    return { ok: false, error: BLOCKED_HALLUCINATION_ERROR };
+  }
 
-  const key = cacheKey(settings, segment);
+  const key = cacheKey(effectiveSettings, segment);
   const cached = getMemoryCachedTranslation(key);
   if (cached) {
     return { ok: true, translatedText: cached, provider: "cache" };
@@ -963,8 +1391,15 @@ async function translateAndRespond(segment: CaptionSegment): Promise<MessageResp
 
   const translationPromise: Promise<MessageResponse<{ translatedText: string; provider: string }>> = (async () => {
     try {
-      const result = await translateSegment(settings, segment);
-      const translatedText = sanitizeTranslatedSubtitle(segment, result.translatedText, settings.contentMode);
+      let result = await translateSegment(effectiveSettings, segment);
+      let translatedText = sanitizeTranslatedSubtitle(segment, result.translatedText, effectiveSettings);
+      if (!translatedText) {
+        const correctionGuidance = translationCorrectionGuidance(segment, result.translatedText, effectiveSettings);
+        if (correctionGuidance) {
+          result = await translateSegment(effectiveSettings, segment, correctionGuidance);
+          translatedText = sanitizeTranslatedSubtitle(segment, result.translatedText, effectiveSettings);
+        }
+      }
       if (!translatedText) {
         return { ok: false as const, error: BLOCKED_HALLUCINATION_ERROR };
       }
@@ -1071,10 +1506,10 @@ function hotPretranslateBatchSize(settings: Awaited<ReturnType<typeof loadSettin
     : HOT_PRETRANSLATE_BATCH_SIZE;
 }
 
-function isHotPretranslateSegment(segment: CaptionSegment, currentTimeMs: number): boolean {
+function isHotPretranslateSegment(segment: CaptionSegment, currentTimeMs: number, futureWindowMs: number): boolean {
   return (
     segment.endMs >= currentTimeMs - HOT_PRETRANSLATE_PAST_WINDOW_MS &&
-    segment.startMs <= currentTimeMs + HOT_PRETRANSLATE_FUTURE_WINDOW_MS
+    segment.startMs <= currentTimeMs + futureWindowMs
   );
 }
 
@@ -1133,12 +1568,14 @@ async function handlePretranslateCaptions(
   }
 
   const settings = await loadSettings();
+  const segments = await addCaptionLyricsAssist(tabId, message.videoId, settings, message.segments);
+  const assistedMessage = segments === message.segments ? message : { ...message, segments };
   const context = createCaptionCacheContext(settings, message.videoId, message.captionHash, message.trackLanguage);
-  const cachedMap = await getCachedCaptionTranslations(context, message.segments);
-  const cachedEntries = entriesFromCache(message.segments, cachedMap);
+  const cachedMap = await getCachedCaptionTranslations(context, segments);
+  const cachedEntries = entriesFromCache(segments, cachedMap);
 
-  if (!settings.enabled || !settings.pretranslateEnabled || message.segments.length === 0) {
-    return { ok: true, translations: cachedEntries, total: message.segments.length, cached: cachedEntries.length };
+  if (!settings.enabled || !settings.pretranslateEnabled || segments.length === 0) {
+    return { ok: true, translations: cachedEntries, total: segments.length, cached: cachedEntries.length };
   }
 
   try {
@@ -1151,14 +1588,14 @@ async function handlePretranslateCaptions(
   const existingJob = pretranslateJobs.get(jobKey);
   if (existingJob) {
     existingJob.currentTimeMs = message.currentTimeMs;
-    return { ok: true, translations: cachedEntries, total: message.segments.length, cached: cachedEntries.length };
+    return { ok: true, translations: cachedEntries, total: segments.length, cached: cachedEntries.length };
   }
 
   cancelTabPretranslationJobs(tabId, jobKey);
   const job: PretranslateJob = { cancelled: false, currentTimeMs: message.currentTimeMs };
   pretranslateJobs.set(jobKey, job);
 
-  void runPretranslationJob(tabId, jobKey, job, context, settings, message, cachedMap).catch(async (error) => {
+  void runPretranslationJob(tabId, jobKey, job, context, settings, assistedMessage, cachedMap).catch(async (error) => {
     if (pretranslateJobs.get(jobKey) === job) {
       pretranslateJobs.delete(jobKey);
     }
@@ -1167,13 +1604,13 @@ async function handlePretranslateCaptions(
       videoId: message.videoId,
       captionHash: message.captionHash,
       translated: cachedMap.size,
-      total: message.segments.length,
+      total: segments.length,
       translationConfigRevision: message.translationConfigRevision,
       statusText: `선번역 실패: ${getErrorMessage(error)}`
     });
   });
 
-  return { ok: true, translations: cachedEntries, total: message.segments.length, cached: cachedEntries.length };
+  return { ok: true, translations: cachedEntries, total: segments.length, cached: cachedEntries.length };
 }
 
 async function runPretranslationJob(
@@ -1187,6 +1624,10 @@ async function runPretranslationJob(
 ): Promise<void> {
   let translated = cachedMap.size;
   const skippedIds = new Set<string>();
+  const usesLocalTranslation = settings.translationProvider === "lmStudio" || settings.translationProvider === "ollama";
+  const hotFutureWindowMs = usesLocalTranslation
+    ? LOCAL_PRETRANSLATE_FUTURE_WINDOW_MS
+    : HOT_PRETRANSLATE_FUTURE_WINDOW_MS;
 
   await notifyTab(tabId, {
     type: "PRETRANSLATE_PROGRESS",
@@ -1204,7 +1645,10 @@ async function runPretranslationJob(
       break;
     }
 
-    const hotMissing = missing.filter((segment) => isHotPretranslateSegment(segment, job.currentTimeMs));
+    const hotMissing = missing.filter((segment) => isHotPretranslateSegment(segment, job.currentTimeMs, hotFutureWindowMs));
+    if (usesLocalTranslation && hotMissing.length === 0) {
+      break;
+    }
     const source = hotMissing.length > 0 ? hotMissing : missing;
     const batchSize = hotMissing.length > 0 ? hotPretranslateBatchSize(settings) : pretranslateBatchSize(settings);
     const batch = addCaptionContext(source.slice(0, batchSize), message.segments, settings);
@@ -1220,7 +1664,7 @@ async function runPretranslationJob(
         if (!segment) {
           return undefined;
         }
-        const translatedText = sanitizeTranslatedSubtitle(segment, entry.translatedText, settings.contentMode);
+        const translatedText = sanitizeTranslatedSubtitle(segment, entry.translatedText, settings);
         return translatedText ? { ...entry, translatedText } : undefined;
       })
       .filter((entry): entry is CaptionTranslationEntry => Boolean(entry));
@@ -1256,6 +1700,9 @@ async function runPretranslationJob(
       translationConfigRevision: message.translationConfigRevision,
       statusText: translated >= message.segments.length ? "전체 자막 선번역 완료" : `자막 선번역 중 ${translated}/${message.segments.length}`
     });
+    if (usesLocalTranslation && !job.cancelled) {
+      await new Promise<void>((resolve) => globalThis.setTimeout(resolve, LOCAL_PRETRANSLATE_REST_MS));
+    }
   }
 
   if (pretranslateJobs.get(jobKey) === job) {
@@ -1272,6 +1719,9 @@ async function translatePretranslationBatch(
     // request as the visible overlay instead of making it compete with a JSON batch.
     const response = await translateAndRespond(batch[0]);
     if (!response.ok) {
+      if (isBlockedHallucinationError(response.error)) {
+        return { translations: [], provider: settings.translationProvider };
+      }
       throw new Error(response.error);
     }
     return {
@@ -1288,6 +1738,9 @@ async function translatePretranslationBatch(
       // spend two turns translating the same subtitle line.
       const response = await translateAndRespond(segment);
       if (!response.ok) {
+        if (isBlockedHallucinationError(response.error)) {
+          continue;
+        }
         throw new Error(response.error);
       }
       translations.push({ id: segment.id, translatedText: response.translatedText });
@@ -1298,37 +1751,155 @@ async function translatePretranslationBatch(
   return translateSegments(settings, batch);
 }
 
-async function startAudioCaptureInternal(senderTabId?: number, requestedTabId?: number): Promise<MessageResponse<{ tabId: number; mode?: string }>> {
+function audioTransportConfig(settings: TranslatorSettings): {
+  audioChunkMs: number;
+  useStreaming: boolean;
+  streamingSttEndpoint: string;
+  streamingSttModel: string;
+  sourceLanguage: string;
+  contentMode: string;
+  speakerTurnDetection: boolean;
+} {
+  const useStreaming = settings.sttProvider === "whisper" && settings.streamingSttEnabled;
+  const audioChunkMs =
+    settings.contentMode === "lyrics"
+      ? Math.max(settings.audioChunkMs, 14_000)
+      : settings.contentMode === "live"
+        ? Math.max(settings.audioChunkMs, 10_000)
+        : settings.audioChunkMs;
+  return {
+    audioChunkMs: useStreaming ? audioChunkMs : Math.max(audioChunkMs, MIN_STABLE_AUDIO_CHUNK_MS),
+    useStreaming,
+    streamingSttEndpoint: settings.streamingSttEndpoint,
+    streamingSttModel: settings.whisper.model,
+    sourceLanguage: settings.sourceLanguage,
+    contentMode: settings.contentMode,
+    speakerTurnDetection: settings.speakerTurnDetection
+  };
+}
+
+async function reconfigureAudioCaptureInternal(
+  tabId: number,
+  videoId: string,
+  expectedVideoId?: string,
+  startIfMissing = false
+): Promise<MessageResponse<{ tabId: number; mode?: string }>> {
+  const state = await getOffscreenAudioState();
+  if (
+    !state?.recording ||
+    state.activeTabId !== tabId ||
+    (expectedVideoId && state.activeVideoId !== expectedVideoId)
+  ) {
+    if (startIfMissing) {
+      return startAudioCaptureInternal(undefined, tabId, videoId);
+    }
+    return { ok: false, error: "재구성할 활성 오디오 캡처 세션이 없습니다." };
+  }
+
+  const settings = await loadSettings();
+  try {
+    await assertTranscriptionReady(settings);
+    assertTranslationReady(settings);
+  } catch (error) {
+    return { ok: false, error: getErrorMessage(error) };
+  }
+
+  const response = await chrome.runtime.sendMessage<MessageResponse<{ mode?: string }>>({
+    type: "RECONFIGURE_AUDIO_CAPTURE",
+    target: "offscreen",
+    tabId,
+    videoId,
+    expectedVideoId,
+    ...audioTransportConfig(settings)
+  });
+  if (!response?.ok) {
+    return { ok: false, error: response?.error ?? "오디오 캡처 설정을 갱신하지 못했습니다." };
+  }
+
+  activeAudioTabId = tabId;
+  activeAudioVideoId = videoId;
+  clearAudioQueue(tabId);
+  void prepareLyricsAssist(tabId, videoId, settings);
+  await notifyTab(tabId, {
+    type: "AUDIO_CAPTURE_STATUS",
+    state: "recording",
+    videoId,
+    statusText: "음성 캡처 유지 · STT 설정 갱신됨"
+  });
+  return { ok: true, tabId, mode: response.mode };
+}
+
+async function reuseAudioCapture(
+  tabId: number,
+  videoId: string,
+  state: OffscreenAudioState
+): Promise<MessageResponse<{ tabId: number; mode?: string }>> {
+  activeAudioTabId = tabId;
+  activeAudioVideoId = videoId;
+  audioFailureCooldowns.delete(tabId);
+  await notifyTab(tabId, {
+    type: "AUDIO_CAPTURE_STATUS",
+    state: "recording",
+    videoId,
+    statusText: "기존 음성 캡처와 STT 연결 유지"
+  });
+  return { ok: true, tabId, mode: state.mode };
+}
+
+async function startAudioCaptureInternal(
+  senderTabId?: number,
+  requestedTabId?: number,
+  requestedVideoId?: string,
+  canRequestTabCapturePermission = false
+): Promise<MessageResponse<{ tabId: number; mode?: string }>> {
   const tabId = requestedTabId ?? senderTabId;
   if (!tabId) {
     return { ok: false, error: "오디오를 캡처할 YouTube 탭을 찾지 못했습니다." };
   }
 
-  if (!(await ensureContentScript(tabId))) {
+  const tabUrl = await getTabUrl(tabId);
+  if (!isSupportedYouTubeUrl(tabUrl)) {
     return { ok: false, error: "YouTube 영상 탭에서만 음성 자막을 시작할 수 있습니다." };
   }
+  const videoId = requestedVideoId ?? youtubeVideoIdFromUrl(tabUrl);
+  if (!videoId) {
+    return { ok: false, error: "재생 중인 YouTube 영상 ID를 확인하지 못했습니다." };
+  }
 
-  const recentFailure = getAudioFailureCooldown(tabId);
+  if (!(await ensureTabCapturePermission(canRequestTabCapturePermission))) {
+    return {
+      ok: false,
+      error: "음성 캡처 권한이 없습니다. YouTube 탭에서 확장 팝업의 음성 시작 버튼을 눌러 권한을 허용하세요."
+    };
+  }
+
+  const recentFailure = getAudioFailureCooldown(tabId, videoId);
   if (recentFailure) {
     const seconds = Math.max(1, Math.ceil((recentFailure.until - Date.now()) / 1000));
     return { ok: false, error: `최근 API/STT 오류 때문에 ${seconds}초 후 다시 시도하세요: ${recentFailure.error}` };
   }
 
-  const liveTabIds = await liveCapturedTabIds();
+  let liveTabIds = await liveCapturedTabIds();
   if (liveTabIds.includes(tabId) && (await ownsLiveAudioCapture(tabId))) {
-    activeAudioTabId = tabId;
-    await notifyTab(tabId, { type: "AUDIO_CAPTURE_STATUS", state: "recording" });
     const state = await getOffscreenAudioState();
-    return { ok: true, tabId, mode: state?.mode };
+    if (state?.activeVideoId === videoId) {
+      return reuseAudioCapture(tabId, videoId, state);
+    }
+    if (state?.activeVideoId) {
+      return reconfigureAudioCaptureInternal(tabId, videoId, state.activeVideoId);
+    }
+    await stopAudioCaptureInternal(tabId);
+    liveTabIds = await liveCapturedTabIds();
   }
 
   if (liveTabIds.includes(tabId)) {
     activeAudioTabId = undefined;
+    activeAudioVideoId = undefined;
     clearAudioQueue(tabId);
   }
 
   if (activeAudioTabId && activeAudioTabId !== tabId) {
-    await stopAudioCapture(activeAudioTabId);
+    await stopAudioCaptureInternal(activeAudioTabId);
   }
 
   const settings = await loadSettings();
@@ -1349,10 +1920,13 @@ async function startAudioCaptureInternal(senderTabId?: number, requestedTabId?: 
     if (/active stream/i.test(message)) {
       const capturedTabs = await getCapturedTabs();
       if (capturedTabs.some((info) => info.tabId === tabId && isLiveCapture(info)) && (await ownsLiveAudioCapture(tabId))) {
-        activeAudioTabId = tabId;
-        await notifyTab(tabId, { type: "AUDIO_CAPTURE_STATUS", state: "recording" });
         const state = await getOffscreenAudioState();
-        return { ok: true, tabId, mode: state?.mode };
+        if (state?.activeVideoId === videoId) {
+          return reuseAudioCapture(tabId, videoId, state);
+        }
+        if (state?.activeVideoId) {
+          return reconfigureAudioCaptureInternal(tabId, videoId, state.activeVideoId);
+        }
       }
       return {
         ok: false,
@@ -1364,62 +1938,70 @@ async function startAudioCaptureInternal(senderTabId?: number, requestedTabId?: 
   }
 
   activeAudioTabId = tabId;
-  const useStreaming = settings.sttProvider === "whisper" && settings.streamingSttEnabled;
-  const lyricsMode = settings.contentMode === "lyrics";
-  const liveMode = settings.contentMode === "live";
-  const audioChunkMs = lyricsMode
-    ? Math.max(settings.audioChunkMs, 14_000)
-    : liveMode
-      ? Math.max(settings.audioChunkMs, 10_000)
-      : settings.audioChunkMs;
+  activeAudioVideoId = videoId;
+  void prepareLyricsAssist(tabId, videoId, settings);
   let offscreenResponse: MessageResponse | undefined;
   try {
     offscreenResponse = await chrome.runtime.sendMessage<MessageResponse>({
       type: "START_AUDIO_CAPTURE",
+      target: "offscreen",
       tabId,
+      videoId,
       streamId,
-      audioChunkMs: useStreaming ? audioChunkMs : Math.max(audioChunkMs, MIN_STABLE_AUDIO_CHUNK_MS),
-      useStreaming,
-      streamingSttEndpoint: settings.streamingSttEndpoint,
-      streamingSttModel: settings.whisper.model,
-      sourceLanguage: settings.sourceLanguage,
-      contentMode: settings.contentMode,
-      speakerTurnDetection: settings.speakerTurnDetection
+      ...audioTransportConfig(settings)
     });
   } catch (error) {
     activeAudioTabId = undefined;
+    activeAudioVideoId = undefined;
     clearAudioQueue(tabId);
-    await chrome.runtime.sendMessage({ type: "STOP_AUDIO_CAPTURE", tabId }).catch(() => undefined);
+    await chrome.runtime
+      .sendMessage({ type: "STOP_AUDIO_CAPTURE", target: "offscreen", tabId, videoId })
+      .catch(() => undefined);
     throw error;
   }
   if (!offscreenResponse?.ok) {
     activeAudioTabId = undefined;
+    activeAudioVideoId = undefined;
     clearAudioQueue(tabId);
-    await chrome.runtime.sendMessage({ type: "STOP_AUDIO_CAPTURE", tabId }).catch(() => undefined);
+    await chrome.runtime
+      .sendMessage({ type: "STOP_AUDIO_CAPTURE", target: "offscreen", tabId, videoId })
+      .catch(() => undefined);
     throw new Error(offscreenResponse?.error ?? "오프스크린 오디오 캡처를 시작하지 못했습니다.");
   }
 
-  await notifyTab(tabId, { type: "AUDIO_CAPTURE_STATUS", state: "recording" });
   const state = await getOffscreenAudioState();
   return { ok: true, tabId, mode: state?.mode };
 }
 
-async function startAudioCapture(senderTabId?: number, requestedTabId?: number): Promise<MessageResponse<{ tabId: number; mode?: string }>> {
+function enqueueAudioLifecycle<T>(operation: () => Promise<T>): Promise<T> {
+  const result = audioLifecycleQueue.then(operation, operation);
+  audioLifecycleQueue = result.then(
+    () => undefined,
+    () => undefined
+  );
+  return result;
+}
+
+async function startAudioCapture(
+  senderTabId?: number,
+  requestedTabId?: number,
+  requestedVideoId?: string,
+  canRequestTabCapturePermission = false
+): Promise<MessageResponse<{ tabId: number; mode?: string }>> {
   const tabId = requestedTabId ?? senderTabId;
   if (!tabId) {
     return { ok: false, error: "오디오를 캡처할 YouTube 탭을 찾지 못했습니다." };
   }
+  const videoId = requestedVideoId ?? youtubeVideoIdFromUrl(await getTabUrl(tabId));
 
-  if (startingAudioCapture?.tabId === tabId) {
+  if (startingAudioCapture?.tabId === tabId && startingAudioCapture.videoId === videoId) {
     return startingAudioCapture.promise;
   }
 
-  if (startingAudioCapture) {
-    await startingAudioCapture.promise.catch(() => undefined);
-  }
-
-  const promise = startAudioCaptureInternal(undefined, tabId);
-  startingAudioCapture = { tabId, promise };
+  const promise = enqueueAudioLifecycle(() =>
+    startAudioCaptureInternal(undefined, tabId, videoId, canRequestTabCapturePermission)
+  );
+  startingAudioCapture = { tabId, videoId, promise };
   try {
     return await promise;
   } finally {
@@ -1429,24 +2011,52 @@ async function startAudioCapture(senderTabId?: number, requestedTabId?: number):
   }
 }
 
-async function stopAudioCapture(tabId?: number): Promise<MessageResponse> {
+function reconfigureAudioCapture(
+  tabId: number | undefined,
+  videoId: string,
+  expectedVideoId?: string,
+  startIfMissing = false
+): Promise<MessageResponse<{ tabId: number; mode?: string }>> {
+  if (!tabId) {
+    return Promise.resolve({ ok: false, error: "오디오를 캡처 중인 YouTube 탭을 찾지 못했습니다." });
+  }
+  return enqueueAudioLifecycle(() =>
+    reconfigureAudioCaptureInternal(tabId, videoId, expectedVideoId, startIfMissing)
+  );
+}
+
+async function stopAudioCaptureInternal(tabId?: number, expectedVideoId?: string): Promise<MessageResponse> {
   const liveTabIds = await liveCapturedTabIds();
   const targetTabId = tabId ?? activeAudioTabId ?? liveTabIds[0];
-
-  if (tabId && liveTabIds.length > 0 && !liveTabIds.includes(tabId)) {
-    await notifyTab(tabId, { type: "AUDIO_CAPTURE_STATUS", state: "idle" });
+  const offscreenState = await getOffscreenAudioState();
+  const stoppedVideoId = offscreenState?.activeTabId === targetTabId ? offscreenState.activeVideoId : activeAudioVideoId;
+  if (expectedVideoId && stoppedVideoId !== expectedVideoId) {
     return { ok: true };
   }
 
-  if (await hasOffscreenDocument()) {
-    await chrome.runtime.sendMessage({ type: "STOP_AUDIO_CAPTURE", tabId: targetTabId }).catch(() => undefined);
+  if (tabId && liveTabIds.length > 0 && !liveTabIds.includes(tabId)) {
+    await notifyTab(tabId, { type: "AUDIO_CAPTURE_STATUS", state: "idle", videoId: stoppedVideoId });
+    return { ok: true };
   }
 
-  if (targetTabId) {
-    await notifyTab(targetTabId, { type: "AUDIO_CAPTURE_STATUS", state: "idle" });
+  const offscreenAvailable = await hasOffscreenDocument();
+  if (offscreenAvailable) {
+    await chrome.runtime
+      .sendMessage({
+        type: "STOP_AUDIO_CAPTURE",
+        target: "offscreen",
+        tabId: targetTabId,
+        videoId: stoppedVideoId
+      })
+      .catch(() => undefined);
+  }
+
+  if (targetTabId && !offscreenAvailable) {
+    await notifyTab(targetTabId, { type: "AUDIO_CAPTURE_STATUS", state: "idle", videoId: stoppedVideoId });
   }
   if (!tabId || tabId === activeAudioTabId || (targetTabId && liveTabIds.includes(targetTabId))) {
     activeAudioTabId = undefined;
+    activeAudioVideoId = undefined;
   }
   if (targetTabId) {
     clearAudioQueue(targetTabId);
@@ -1458,20 +2068,15 @@ async function stopAudioCapture(tabId?: number): Promise<MessageResponse> {
   return { ok: true };
 }
 
+function stopAudioCapture(tabId?: number, expectedVideoId?: string): Promise<MessageResponse> {
+  return enqueueAudioLifecycle(() => stopAudioCaptureInternal(tabId, expectedVideoId));
+}
+
 async function notifyTab(tabId: number, message: RuntimeMessage): Promise<void> {
   try {
     await chrome.tabs.sendMessage(tabId, message);
   } catch (error) {
-    if (await ensureContentScript(tabId)) {
-      try {
-        await chrome.tabs.sendMessage(tabId, message);
-        return;
-      } catch (retryError) {
-        console.debug("Tab notification retry failed", retryError);
-      }
-    } else {
-      console.debug("Tab notification failed", error);
-    }
+    console.debug("Tab notification failed", error);
   }
 }
 
@@ -1483,7 +2088,8 @@ async function broadcastContentSettings(settings: TranslatorSettings, revision: 
   const tabs = await chrome.tabs.query({ url: ["*://www.youtube.com/*", "*://m.youtube.com/*"] });
   const message: RuntimeMessage = {
     type: "SETTINGS_UPDATED",
-    settings: toContentSettings(settings, translationConfigRevision)
+    settings: toContentSettings(settings, translationConfigRevision),
+    revision
   };
   await Promise.all(tabs.flatMap((tab) => (tab.id ? [notifyTab(tab.id, message)] : [])));
 }
@@ -1491,6 +2097,13 @@ async function broadcastContentSettings(settings: TranslatorSettings, revision: 
 async function saveSettingsPatch(patch: Partial<TranslatorSettings>) {
   const snapshot = await patchSettings(patch);
   await broadcastContentSettings(snapshot.settings, snapshot.revision, snapshot.translationConfigRevision);
+  if (
+    activeAudioTabId &&
+    activeAudioVideoId &&
+    ("lyricsAssistEnabled" in patch || "contentMode" in patch)
+  ) {
+    void prepareLyricsAssist(activeAudioTabId, activeAudioVideoId, snapshot.settings);
+  }
   if (!snapshot.settings.enabled || snapshot.settings.inputMode === "captions") {
     await stopAudioCapture();
   }
@@ -1509,6 +2122,18 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     .catch((error) => console.debug("Could not broadcast stored settings", error));
 });
 
+chrome.tabs.onActivated.addListener((activeInfo) => {
+  void updateActionAvailability(activeInfo.tabId);
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.url) {
+    void updateActionAvailability(tabId, changeInfo.url);
+  }
+});
+
+void initializeActionAvailability();
+
 function segmentWithAudioContext(tabId: number, segment: CaptionSegment): CaptionSegment {
   const context = audioContextByTab.get(tabId) ?? [];
   return context.length > 0 ? { ...segment, contextText: context.join("\n") } : segment;
@@ -1523,8 +2148,11 @@ function rememberAudioContext(tabId: number, text: string): void {
   audioContextByTab.set(tabId, context);
 }
 
-async function handleAudioChunk(message: Extract<RuntimeMessage, { type: "AUDIO_CHUNK" }>): Promise<MessageResponse> {
-  if (getAudioFailureCooldown(message.tabId)) {
+async function handleAudioChunk(message: AudioChunkMessage): Promise<MessageResponse> {
+  if (message.tabId !== activeAudioTabId || message.videoId !== activeAudioVideoId) {
+    return { ok: true };
+  }
+  if (getAudioFailureCooldown(message.tabId, message.videoId)) {
     return { ok: true };
   }
 
@@ -1534,7 +2162,11 @@ async function handleAudioChunk(message: Extract<RuntimeMessage, { type: "AUDIO_
     return { ok: true };
   }
 
-  const queue = audioQueues.get(message.tabId) ?? { processing: false };
+  const existingQueue = audioQueues.get(message.tabId);
+  const queue =
+    existingQueue?.videoId === message.videoId
+      ? existingQueue
+      : { videoId: message.videoId, processing: false };
   if (queue.processing) {
     queue.pending = message;
     audioQueues.set(message.tabId, queue);
@@ -1544,51 +2176,52 @@ async function handleAudioChunk(message: Extract<RuntimeMessage, { type: "AUDIO_
   queue.processing = true;
   audioQueues.set(message.tabId, queue);
 
-  void processQueuedAudio(message.tabId, message).catch(async (error) => {
-    audioQueues.delete(message.tabId);
-    await notifyTab(message.tabId, { type: "TRANSLATION_ERROR", error: getErrorMessage(error) });
+  void processQueuedAudio(message.tabId, message, queue).catch(async (error) => {
+    if (audioQueues.get(message.tabId) === queue) {
+      audioQueues.delete(message.tabId);
+    }
+    if (!isActiveAudioSession(message.tabId, message.videoId)) {
+      return;
+    }
+    await notifyTab(message.tabId, {
+      type: "TRANSLATION_ERROR",
+      error: getErrorMessage(error),
+      videoId: message.videoId
+    });
   });
   return { ok: true };
 }
 
 async function processQueuedAudio(
   tabId: number,
-  initialMessage: Extract<RuntimeMessage, { type: "AUDIO_CHUNK" }>
+  initialMessage: AudioChunkMessage,
+  ownedQueue: AudioQueueState
 ): Promise<void> {
   try {
-    let message: Extract<RuntimeMessage, { type: "AUDIO_CHUNK" }> | undefined = initialMessage;
+    let message: AudioChunkMessage | undefined = initialMessage;
     while (message) {
       await processAudioChunk(message);
-      if (getAudioFailureCooldown(tabId)) {
-        const queue = audioQueues.get(tabId);
-        if (queue) {
-          queue.pending = undefined;
-          queue.processing = false;
-          audioQueues.set(tabId, queue);
-        }
+      if (audioQueues.get(tabId) !== ownedQueue) {
         return;
       }
-      const queue = audioQueues.get(tabId);
-      message = queue?.pending;
-      if (queue) {
-        queue.pending = undefined;
-        queue.processing = Boolean(message);
-        audioQueues.set(tabId, queue);
+      if (getAudioFailureCooldown(tabId, message.videoId)) {
+        ownedQueue.pending = undefined;
+        ownedQueue.processing = false;
+        return;
       }
+      message = ownedQueue.pending;
+      ownedQueue.pending = undefined;
+      ownedQueue.processing = Boolean(message);
     }
 
-    const queue = audioQueues.get(tabId);
-    if (queue) {
-      queue.processing = false;
-      queue.pending = undefined;
-      audioQueues.set(tabId, queue);
+    if (audioQueues.get(tabId) === ownedQueue) {
+      ownedQueue.processing = false;
+      ownedQueue.pending = undefined;
     }
   } catch (error) {
-    const queue = audioQueues.get(tabId);
-    if (queue) {
-      queue.processing = false;
-      queue.pending = undefined;
-      audioQueues.set(tabId, queue);
+    if (audioQueues.get(tabId) === ownedQueue) {
+      ownedQueue.processing = false;
+      ownedQueue.pending = undefined;
     }
     throw error;
   }
@@ -1596,7 +2229,7 @@ async function processQueuedAudio(
 
 async function processAudioChunk(message: Extract<RuntimeMessage, { type: "AUDIO_CHUNK" }>): Promise<void> {
   const settings = await loadSettings();
-  if (!settings.enabled) {
+  if (!settings.enabled || message.tabId !== activeAudioTabId || message.videoId !== activeAudioVideoId) {
     return;
   }
 
@@ -1605,16 +2238,27 @@ async function processAudioChunk(message: Extract<RuntimeMessage, { type: "AUDIO
     audioLastProcessedAt.set(message.tabId, Date.now());
     transcript = sanitizeAudioTranscript(
       await transcribeAudio(settings, base64ToArrayBuffer(message.audioBase64), message.mimeType),
-      settings.contentMode === "lyrics"
+      settings.contentMode === "lyrics" ||
+        (settings.lyricsAssistEnabled && settings.contentMode !== "spoken")
     );
     audioFailureCooldowns.delete(message.tabId);
   } catch (error) {
-    const errorMessage = getErrorMessage(error);
-    setAudioFailureCooldown(message.tabId, errorMessage);
-    await notifyTab(message.tabId, { type: "TRANSLATION_ERROR", error: `STT 오류: ${errorMessage}` });
-    if (shouldStopCaptureAfterApiError(errorMessage)) {
-      await stopAudioCaptureAfterFatalError(message.tabId, errorMessage);
+    if (!isActiveAudioSession(message.tabId, message.videoId)) {
+      return;
     }
+    const errorMessage = getErrorMessage(error);
+    setAudioFailureCooldown(message.tabId, errorMessage, message.videoId);
+    await notifyTab(message.tabId, {
+      type: "TRANSLATION_ERROR",
+      error: `STT 오류: ${errorMessage}`,
+      videoId: message.videoId
+    });
+    if (shouldStopCaptureAfterApiError(errorMessage)) {
+      await stopAudioCaptureAfterFatalError(message.tabId, message.videoId, errorMessage);
+    }
+    return;
+  }
+  if (message.tabId !== activeAudioTabId || message.videoId !== activeAudioVideoId) {
     return;
   }
 
@@ -1625,6 +2269,7 @@ async function processAudioChunk(message: Extract<RuntimeMessage, { type: "AUDIO
       await notifyTab(message.tabId, {
         type: "AUDIO_CAPTURE_STATUS",
         state: "recording",
+        videoId: message.videoId,
         statusText: "음성 캡처 중... 인식된 말소리를 기다리는 중"
       });
     }
@@ -1633,51 +2278,66 @@ async function processAudioChunk(message: Extract<RuntimeMessage, { type: "AUDIO
   audioNoSpeechNotices.delete(message.tabId);
 
   const now = Date.now();
-  const segment: CaptionSegment = {
+  const rawSegment: CaptionSegment = {
     id: `audio-${now}`,
     source: "audioStt",
     startMs: now,
     endMs: now + Math.max(settings.audioChunkMs, 2200),
     text: transcript
   };
+  const segment = assistLyricsSegment(lyricsAssistByTab.get(message.tabId), rawSegment, settings.contentMode, true);
 
-  await notifyTab(message.tabId, { type: "AUDIO_TRANSCRIPT", tabId: message.tabId, segment });
+  await notifyTab(message.tabId, { type: "AUDIO_TRANSCRIPT", tabId: message.tabId, videoId: message.videoId, segment });
 
   const translation = await translateAndRespond(segmentWithAudioContext(message.tabId, segment));
+  if (!isActiveAudioSession(message.tabId, message.videoId)) {
+    return;
+  }
   if (translation.ok) {
     rememberAudioContext(message.tabId, segment.text);
     await notifyTab(message.tabId, {
       type: "TRANSLATION_READY",
       segment,
       translatedText: translation.translatedText,
-      provider: translation.provider
+      provider: translation.provider,
+      videoId: message.videoId
     });
   } else {
     if (isBlockedHallucinationError(translation.error)) {
       return;
     }
-    await notifyTab(message.tabId, { type: "TRANSLATION_ERROR", segment, error: translation.error });
+    await notifyTab(message.tabId, { type: "TRANSLATION_ERROR", segment, error: translation.error, videoId: message.videoId });
     if (shouldStopCaptureAfterApiError(translation.error)) {
-      await stopAudioCaptureAfterFatalError(message.tabId, translation.error);
+      await stopAudioCaptureAfterFatalError(message.tabId, message.videoId, translation.error);
     }
   }
 }
 
 async function processStreamTranscript(message: Extract<RuntimeMessage, { type: "STREAM_STT_TRANSCRIPT" }>): Promise<void> {
   const settings = await loadSettings();
-  if (!settings.enabled) {
+  if (!settings.enabled || message.tabId !== activeAudioTabId || message.videoId !== activeAudioVideoId) {
     return;
   }
-  const sanitizedText = sanitizeAudioTranscript(message.segment.text, settings.contentMode === "lyrics");
+  const sanitizedText = sanitizeAudioTranscript(
+    message.segment.text,
+    settings.contentMode === "lyrics" ||
+      (settings.lyricsAssistEnabled && settings.contentMode !== "spoken")
+  );
   if (!sanitizedText) {
     return;
   }
-  const segment = sanitizedText === message.segment.text ? message.segment : { ...message.segment, text: sanitizedText };
+  const rawSegment = sanitizedText === message.segment.text ? message.segment : { ...message.segment, text: sanitizedText };
+  const segment = assistLyricsSegment(
+    lyricsAssistByTab.get(message.tabId),
+    rawSegment,
+    settings.contentMode,
+    message.isFinal
+  );
 
   if (!message.isFinal) {
     await notifyTab(message.tabId, { ...message, segment });
-    if (shouldTranslateStreamPartial(message.tabId, segment)) {
-      void translateStreamSegment(message.tabId, segment, false);
+    if (settings.translationProvider === "openai" && shouldTranslateStreamPartial(message.tabId, segment)) {
+      void translateStreamSegment(message.tabId, message.videoId, segment, false);
     }
     return;
   }
@@ -1688,14 +2348,18 @@ async function processStreamTranscript(message: Extract<RuntimeMessage, { type: 
   }
   const previous = lastFinalTranscriptByTab.get(message.tabId);
   const now = Date.now();
-  if (previous?.text === normalized && now - previous.at < DUPLICATE_FINAL_TRANSCRIPT_WINDOW_MS) {
+  if (
+    segment.detectedContentMode !== "lyrics" &&
+    previous?.text === normalized &&
+    now - previous.at < DUPLICATE_FINAL_TRANSCRIPT_WINDOW_MS
+  ) {
     return;
   }
   lastFinalTranscriptByTab.set(message.tabId, { text: normalized, at: now });
 
-  await notifyTab(message.tabId, { type: "AUDIO_TRANSCRIPT", tabId: message.tabId, segment });
+  await notifyTab(message.tabId, { type: "AUDIO_TRANSCRIPT", tabId: message.tabId, videoId: message.videoId, segment });
 
-  await translateStreamSegment(message.tabId, segment, true);
+  await translateStreamSegment(message.tabId, message.videoId, segment, true);
 }
 
 function shouldTranslateStreamPartial(tabId: number, segment: CaptionSegment): boolean {
@@ -1714,12 +2378,16 @@ function shouldTranslateStreamPartial(tabId: number, segment: CaptionSegment): b
   return true;
 }
 
-async function translateStreamSegment(tabId: number, segment: CaptionSegment, isFinal: boolean): Promise<void> {
+async function translateStreamSegment(tabId: number, videoId: string, segment: CaptionSegment, isFinal: boolean): Promise<void> {
   const generation = (streamTranslationGenerationByTab.get(tabId) ?? 0) + 1;
   streamTranslationGenerationByTab.set(tabId, generation);
 
   const translation = await translateAndRespond(segmentWithAudioContext(tabId, segment));
-  if (streamTranslationGenerationByTab.get(tabId) !== generation) {
+  if (
+    streamTranslationGenerationByTab.get(tabId) !== generation ||
+    tabId !== activeAudioTabId ||
+    videoId !== activeAudioVideoId
+  ) {
     return;
   }
   if (translation.ok) {
@@ -1730,16 +2398,17 @@ async function translateStreamSegment(tabId: number, segment: CaptionSegment, is
       type: "TRANSLATION_READY",
       segment,
       translatedText: translation.translatedText,
-      provider: isFinal ? translation.provider : `${translation.provider} (partial)`
+      provider: isFinal ? translation.provider : `${translation.provider} (partial)`,
+      videoId
     });
   } else {
     if (isBlockedHallucinationError(translation.error)) {
       return;
     }
     if (isFinal) {
-      await notifyTab(tabId, { type: "TRANSLATION_ERROR", segment, error: translation.error });
+      await notifyTab(tabId, { type: "TRANSLATION_ERROR", segment, error: translation.error, videoId });
       if (shouldStopCaptureAfterApiError(translation.error)) {
-        await stopAudioCaptureAfterFatalError(tabId, translation.error);
+        await stopAudioCaptureAfterFatalError(tabId, videoId, translation.error);
       }
     }
   }
@@ -1756,12 +2425,19 @@ function base64ToArrayBuffer(base64: string): ArrayBuffer {
 
 chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
   const message = rawMessage as RuntimeMessage & { streamId?: string };
+  if ("target" in message && message.target === "offscreen") {
+    return false;
+  }
 
   void (async () => {
     try {
       if (message.type === "GET_SETTINGS") {
         const snapshot = await loadSettingsSnapshot();
-        sendResponse({ ok: true, settings: toContentSettings(snapshot.settings, snapshot.translationConfigRevision) });
+        sendResponse({
+          ok: true,
+          settings: toContentSettings(snapshot.settings, snapshot.translationConfigRevision),
+          revision: snapshot.revision
+        });
         return;
       }
 
@@ -1774,8 +2450,26 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
         return;
       }
 
+      if (message.type === "PREPARE_CAPTION_LYRICS_ASSIST") {
+        if (!sender.tab?.id) {
+          sendResponse({ ok: false, error: "YouTube 탭을 찾지 못했습니다." });
+          return;
+        }
+        const settings = await loadSettings();
+        startCaptionLyricsAssist(sender.tab.id, message.videoId, settings);
+        sendResponse({ ok: true });
+        return;
+      }
+
       if (message.type === "CAPTION_SEGMENT") {
-        sendResponse(await translateAndRespond(message.segment));
+        const tabId = sender.tab?.id;
+        const videoId = youtubeVideoIdFromUrl(sender.tab?.url);
+        const settings = await loadSettings();
+        const [segment] =
+          tabId && videoId
+            ? await addCaptionLyricsAssist(tabId, videoId, settings, [message.segment])
+            : [message.segment];
+        sendResponse(await translateAndRespond(segment));
         return;
       }
 
@@ -1785,12 +2479,47 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
       }
 
       if (message.type === "START_AUDIO_CAPTURE") {
-        sendResponse(await startAudioCapture(sender.tab?.id, message.tabId));
+        sendResponse(
+          await startAudioCapture(
+            sender.tab?.id,
+            message.tabId,
+            message.videoId,
+            Boolean(message.ensureTabCapturePermission)
+          )
+        );
+        return;
+      }
+
+      if (message.type === "RECONFIGURE_AUDIO_CAPTURE") {
+        sendResponse(
+          await reconfigureAudioCapture(
+            message.tabId ?? sender.tab?.id,
+            message.videoId,
+            message.expectedVideoId,
+            Boolean(message.startIfMissing)
+          )
+        );
+        return;
+      }
+
+      if (message.type === "RESET_AUDIO_CAPTURE_BUFFER") {
+        const tabId = message.tabId ?? sender.tab?.id;
+        if (!tabId || tabId !== activeAudioTabId || message.videoId !== activeAudioVideoId) {
+          sendResponse({ ok: true });
+          return;
+        }
+        const response = await chrome.runtime.sendMessage<MessageResponse>({
+          type: "RESET_AUDIO_CAPTURE_BUFFER",
+          target: "offscreen",
+          tabId,
+          videoId: message.videoId
+        });
+        sendResponse(response ?? { ok: true });
         return;
       }
 
       if (message.type === "STOP_AUDIO_CAPTURE") {
-        sendResponse(await stopAudioCapture(message.tabId));
+        sendResponse(await stopAudioCapture(message.tabId ?? sender.tab?.id, message.videoId));
         return;
       }
 
@@ -1807,16 +2536,20 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
 
       if (message.type === "AUDIO_CAPTURE_STATUS") {
         const targetTabId = message.tabId ?? activeAudioTabId;
-        if (targetTabId) {
-          await notifyTab(targetTabId, message);
+        if (
+          !targetTabId ||
+          !message.videoId ||
+          targetTabId !== activeAudioTabId ||
+          message.videoId !== activeAudioVideoId
+        ) {
+          sendResponse({ ok: true });
+          return;
         }
+        await notifyTab(targetTabId, message);
         if (message.state === "idle" || message.state === "error") {
-          if (!targetTabId || targetTabId === activeAudioTabId) {
-            activeAudioTabId = undefined;
-          }
-          if (targetTabId) {
-            clearAudioQueue(targetTabId);
-          }
+          activeAudioTabId = undefined;
+          activeAudioVideoId = undefined;
+          clearAudioQueue(targetTabId);
         }
         sendResponse({ ok: true });
         return;
@@ -1824,9 +2557,6 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
 
       if (message.type === "MINI_CONTROL_UPDATE") {
         const snapshot = await saveSettingsPatch(message.patch);
-        if ((!snapshot.settings.enabled || snapshot.settings.inputMode === "captions") && sender.tab?.id) {
-          await stopAudioCapture(sender.tab.id);
-        }
         sendResponse({
           ok: true,
           settings: toContentSettings(snapshot.settings, snapshot.translationConfigRevision),

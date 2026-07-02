@@ -36,6 +36,7 @@ const MERGE_MAX_LYRICS_TEXT_LENGTH = 90;
 // Official caption timings arrive ahead of the rendered YouTube caption frame.
 // A small lead keeps the translated line aligned without waiting for the DOM.
 const TIMED_TEXT_DISPLAY_LEAD_MS = 1100;
+const TIMED_TEXT_DISPLAY_TRAILING_GRACE_MS = 900;
 
 function getVideoId(): string | undefined {
   const url = new URL(location.href);
@@ -370,12 +371,23 @@ function chooseTrack(tracks: CaptionTrack[], settings: ContentSettings, selectio
   );
 }
 
-export function getSelectedOfficialCaptionTrackKey(settings: ContentSettings): string | undefined {
+export function getSelectedOfficialCaptionTrackKey(
+  settings: ContentSettings,
+  pageSnapshot?: PageCaptionSnapshot
+): string | undefined {
   const videoId = getVideoId();
   if (!videoId) {
     return undefined;
   }
-  const track = chooseTrack(getCaptionTracks(videoId), settings);
+  const snapshot = pageSnapshot?.videoId === videoId ? pageSnapshot : undefined;
+  const tracks = (snapshot?.tracks ?? getCaptionTracks(videoId)).filter((track) => captionTrackMatchesVideo(track, videoId));
+  const track = chooseTrack(
+    tracks,
+    settings,
+    snapshot
+      ? { selectedTrack: snapshot.selectedTrack, autoTranslationActive: snapshot.autoTranslationActive }
+      : currentCaptionSelection()
+  );
   return track ? captionTrackKey(track) : undefined;
 }
 
@@ -613,33 +625,51 @@ export async function fetchTimedTextSegments(settings: ContentSettings): Promise
   return (await fetchTimedTextSegmentsWithMetadata(settings))?.segments ?? [];
 }
 
+let timedTextCursorIndex = 0;
+
+export function resetTimedTextCursor(): void {
+  timedTextCursorIndex = 0;
+}
+
 export function getCurrentTimedTextSegment(segments: TimedTextSegment[], settings: ContentSettings): TimedTextSegment | undefined {
   const video = findVideoElement();
   if (!video) {
     return undefined;
   }
 
-  const currentMs = video.currentTime * 1000 + settings.latencyOffsetMs + TIMED_TEXT_DISPLAY_LEAD_MS;
-  let low = 0;
-  let high = segments.length - 1;
-  let match: TimedTextSegment | undefined;
+  const currentMs = video.currentTime * 1000 + settings.latencyOffsetMs;
+  let activeMatch: TimedTextSegment | undefined;
+  let leadMatch: TimedTextSegment | undefined;
+  let trailingMatch: TimedTextSegment | undefined;
 
-  // Segments are ordered by start time. Continue left after a match so overlapping
-  // cues preserve the same first-match behavior as Array.prototype.find().
-  while (low <= high) {
-    const middle = Math.floor((low + high) / 2);
-    const segment = segments[middle];
-    if (currentMs < segment.startMs) {
-      high = middle - 1;
-    } else if (currentMs > segment.endMs) {
-      low = middle + 1;
-    } else {
-      match = segment;
-      high = middle - 1;
+  let startIndex = timedTextCursorIndex;
+  if (
+    startIndex >= segments.length ||
+    (startIndex > 0 && currentMs < segments[startIndex].startMs - TIMED_TEXT_DISPLAY_LEAD_MS)
+  ) {
+    startIndex = 0;
+    timedTextCursorIndex = 0;
+  }
+
+  for (let i = startIndex; i < segments.length; i++) {
+    const segment = segments[i];
+    if (currentMs < segment.startMs - TIMED_TEXT_DISPLAY_LEAD_MS) {
+      break;
+    }
+    if (currentMs > segment.endMs + TIMED_TEXT_DISPLAY_TRAILING_GRACE_MS) {
+      timedTextCursorIndex = i;
+      continue;
+    }
+    if (currentMs >= segment.startMs && currentMs <= segment.endMs) {
+      activeMatch = segment;
+    } else if (currentMs < segment.startMs && !leadMatch) {
+      leadMatch = segment;
+    } else if (!trailingMatch || segment.endMs > trailingMatch.endMs) {
+      trailingMatch = segment;
     }
   }
 
-  return match;
+  return activeMatch ?? leadMatch ?? trailingMatch;
 }
 
 export function readVisibleCaptionSegment(): CaptionSegment | undefined {
@@ -652,10 +682,18 @@ export function readVisibleCaptionSegment(): CaptionSegment | undefined {
     return undefined;
   }
 
-  const text = [...captionContainer.querySelectorAll<HTMLElement>(".ytp-caption-segment")]
-    .map((segment) => segment.innerText.trim())
-    .filter(Boolean)
-    .join(" ")
+  const segmentElements = [...captionContainer.querySelectorAll<HTMLElement>(".ytp-caption-segment")];
+  const fallbackLineElements =
+    segmentElements.length === 0 ? [...captionContainer.querySelectorAll<HTMLElement>(".caption-visual-line")] : [];
+  const captionElements = segmentElements.length > 0 ? segmentElements : fallbackLineElements;
+  const rawText =
+    captionElements.length > 0
+      ? captionElements
+          .map((segment) => (segment.textContent ?? "").trim())
+          .filter(Boolean)
+          .join(" ")
+      : captionContainer.textContent ?? "";
+  const text = rawText
     .replace(/\s+/g, " ")
     .trim();
 

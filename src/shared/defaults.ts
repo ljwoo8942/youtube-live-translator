@@ -8,6 +8,8 @@ export const DEFAULT_SETTINGS: TranslatorSettings = {
   contentMode: "auto",
   pretranslateEnabled: true,
   miniControlsEnabled: true,
+  miniControlsCollapsed: false,
+  lyricsAssistEnabled: true,
   streamingSttEnabled: true,
   streamingSttEndpoint: "ws://127.0.0.1:8765/v1/audio/stream",
   speakerTurnDetection: true,

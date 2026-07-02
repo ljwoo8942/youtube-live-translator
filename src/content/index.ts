@@ -1,6 +1,6 @@
 import type { CaptionSegment, ContentSettings, MiniControlSettingsPatch, PageCaptionSnapshot } from "../shared/types";
 import type { CaptionTranslationEntry, MessageResponse, RuntimeMessage } from "../shared/messages";
-import { TranslatorOverlay, findVideoElement } from "./overlay";
+import { TranslatorOverlay, findPlayerElement, findVideoElement } from "./overlay";
 import {
   fetchTimedTextSegments,
   fetchTimedTextSegmentsWithMetadata,
@@ -10,24 +10,33 @@ import {
   hashCaptionSegments,
   isYouTubeAutoTranslationActive,
   isYouTubeWatchPage,
-  readVisibleCaptionSegment
+  readVisibleCaptionSegment,
+  resetTimedTextCursor
 } from "./youtubeCaptions";
-
 const SETTINGS_KEY = "translatorSettings";
+const BLOCKED_HALLUCINATION_ERROR = "환각 의심 번역 결과를 차단했습니다.";
+const CONTENT_SCRIPT_VERSION = 25;
 const CONTENT_BOOTSTRAP_FLAG = "__yt_live_translator_content_bootstrapped__";
 const overlay = new TranslatorOverlay();
 const AUDIO_FALLBACK_INITIAL_WAIT_MS = 2200;
+const AUDIO_FALLBACK_NO_CAPTION_WAIT_MS = 250;
 const AUDIO_FALLBACK_STALE_CAPTION_MS = 4200;
 const TIMED_TEXT_RETRY_MS = 3000;
 const TIMED_TEXT_SELECTION_CHECK_MS = 250;
 const PRETRANSLATE_RETRY_COOLDOWN_MS = 15_000;
 const PRETRANSLATE_PRIORITY_BUCKET_MS = 5_000;
 const OVERLAY_REFRESH_DELAY_MS = 100;
+const FULLSCREEN_AUDIO_RESUME_DELAY_MS = 180;
+const FULLSCREEN_AUDIO_FALLBACK_MS = 1500;
+const MANUAL_AUDIO_START_PENDING_MS = 3500;
 const OFFICIAL_CAPTION_DOM_READ_DELAY_MS = 30;
 const OFFICIAL_TIMED_TEXT_GRACE_MS = 650;
 const VIDEO_SESSION_CAPTION_RETRY_DELAYS_MS = [0, 450, 1800, 4200, 8000];
+const CAPTION_TRANSLATION_RETRY_MS = 3000;
+const OVERLAY_HOST_SELECTOR = "#yt-live-translator-overlay";
 
 let settings: ContentSettings;
+let settingsRevision = -1;
 let timedTextSegments: Awaited<ReturnType<typeof fetchTimedTextSegments>> = [];
 let timedTextVideoId = "";
 let timedTextCaptionHash = "";
@@ -43,29 +52,37 @@ let lastSentKey = "";
 let lastCaptionSeenAt = 0;
 let audioCaptureRequested = false;
 let audioStopRequested = false;
+let audioCaptureSuppressed = false;
 let timedTextLoadToken = 0;
 let timedTextLoading = false;
 let timedTextLoadStartedAt = 0;
 let lastTimedTextAttemptAt = 0;
+let lastTimedTextNoSourceAt = 0;
 let lastTimedTextSelectionCheckAt = 0;
 let tickInProgress = false;
 let stoppingAudioCapture = false;
 let audioStartBlockedUntil = 0;
+let manualAudioStartPendingUntil = 0;
 let overlayRefreshTimer: number | undefined;
 let officialCaptionDomReadTimer: number | undefined;
+let fullscreenAudioResumeTimer: number | undefined;
+let resumeAudioAfterFullscreenIntentRequested = false;
 let captionTrackRefreshTimers: number[] = [];
 let videoSessionCaptionLoadTimers: number[] = [];
 let pendingTimedTextTrackKey = "";
 let lastVisibleOfficialCaptionKey = "";
 let pageCaptionSnapshot: PageCaptionSnapshot | undefined;
 let observedVideoElement: HTMLVideoElement | null = null;
+let captionRequestsInFlight = new Set<string>();
+let blockedCaptionRequestKeys = new Set<string>();
+let captionRequestRetryAfter = new Map<string, number>();
 
-async function loadContentSettings(): Promise<ContentSettings> {
-  const response = await chrome.runtime.sendMessage<MessageResponse<{ settings: ContentSettings }>>({
+async function loadContentSettings(): Promise<{ settings: ContentSettings; revision: number }> {
+  const response = await chrome.runtime.sendMessage<MessageResponse<{ settings: ContentSettings; revision: number }>>({
     type: "GET_SETTINGS"
   });
   if (response?.ok) {
-    return response.settings;
+    return { settings: response.settings, revision: response.revision };
   }
   throw new Error(response?.error ?? "설정을 읽지 못했습니다. 확장프로그램을 새로고침해 주세요.");
 }
@@ -74,8 +91,20 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isBlockedTranslationError(error?: string): boolean {
+  return Boolean(error && (error === BLOCKED_HALLUCINATION_ERROR || error.includes(BLOCKED_HALLUCINATION_ERROR)));
+}
+
 function segmentKey(text: string): string {
   return text.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function captionRequestKey(segment: CaptionSegment): string {
+  return `${activeVideoId}:${segment.source}:${segment.id}:${segmentKey(segment.text)}`;
+}
+
+function translatedSegmentDisplayKey(segment: CaptionSegment, translatedText: string): string {
+  return `translated:${segment.id}:${segmentKey(translatedText)}`;
 }
 
 function compactStatusText(text: string): string {
@@ -137,6 +166,7 @@ function resetTimedTextState(): void {
   pretranslateRetryBlockedUntil = 0;
   lastVisibleOfficialCaptionKey = "";
   pageCaptionSnapshot = undefined;
+  resetTimedTextCursor();
 }
 
 async function requestPageCaptionSnapshot(videoId: string): Promise<PageCaptionSnapshot | undefined> {
@@ -150,6 +180,15 @@ async function requestPageCaptionSnapshot(videoId: string): Promise<PageCaptionS
     console.debug("Page caption snapshot request failed", error);
     return undefined;
   }
+}
+
+function prepareCaptionLyricsAssist(videoId: string): void {
+  if (!videoId || !settings.lyricsAssistEnabled || settings.inputMode === "audio") {
+    return;
+  }
+  void chrome.runtime
+    .sendMessage({ type: "PREPARE_CAPTION_LYRICS_ASSIST", videoId })
+    .catch((error) => console.debug("Caption lyrics assist preparation failed", error));
 }
 
 function currentWatchVideoId(): string {
@@ -200,20 +239,33 @@ async function cancelPretranslation(keepVideoId?: string): Promise<void> {
 }
 
 function beginVideoSession(videoId: string): void {
+  const previousVideoId = activeVideoId;
   void cancelPretranslation(videoId);
   activeVideoId = videoId;
   timedTextLoadToken += 1;
+  timedTextLoading = false;
+  timedTextLoadStartedAt = 0;
   lastSentKey = "";
   lastCaptionSeenAt = 0;
+  lastTimedTextNoSourceAt = 0;
   pendingTimedTextTrackKey = "";
   lastTimedTextSelectionCheckAt = 0;
   audioStartBlockedUntil = 0;
+  manualAudioStartPendingUntil = 0;
+  audioCaptureSuppressed = false;
+  captionRequestsInFlight = new Set();
+  blockedCaptionRequestKeys = new Set();
+  captionRequestRetryAfter = new Map();
   resetTimedTextState();
   clearCaptionTrackRefreshTimers();
   clearVideoSessionCaptionLoadTimers();
   observedVideoElement = findVideoElement();
   if (audioCaptureRequested) {
-    void stopAudioFallback();
+    if (videoId) {
+      void reconfigureAudioFallback(previousVideoId);
+    } else {
+      void stopAudioFallback(false, previousVideoId);
+    }
   }
   overlay.clear();
   scheduleOverlayRefresh();
@@ -241,6 +293,17 @@ function videoCanProduceAudio(): boolean {
   return true;
 }
 
+function videoPlaybackEnded(): boolean {
+  const video = findVideoElement();
+  if (!video) {
+    return false;
+  }
+  return Boolean(
+    video.ended ||
+      (Number.isFinite(video.duration) && video.duration > 1 && video.duration - video.currentTime < 0.5)
+  );
+}
+
 function shouldAcceptAudioSegment(segment?: CaptionSegment): boolean {
   if (segment?.source !== "audioStt") {
     return true;
@@ -249,8 +312,9 @@ function shouldAcceptAudioSegment(segment?: CaptionSegment): boolean {
   return Boolean(
     settings.enabled &&
       audioCaptureRequested &&
+      !audioStopRequested &&
+      !audioCaptureSuppressed &&
       isYouTubeWatchPage() &&
-      videoCanProduceAudio() &&
       (settings.inputMode === "audio" || timedTextSegments.length === 0)
   );
 }
@@ -269,6 +333,9 @@ function contentModeStatusLabel(): string {
 }
 
 function controlStatusText(): string {
+  if (!settings.enabled) {
+    return "번역 꺼짐";
+  }
   const mode = contentModeStatusLabel();
   const turnMode = settings.speakerTurnDetection && settings.contentMode !== "lyrics" ? " · 발화 분리" : "";
   if (settings.inputMode === "captions") {
@@ -296,7 +363,7 @@ function ensureOverlay(): void {
   overlay.setControlStatus(controlStatusText(), settings);
 }
 
-function scheduleOverlayRefresh(): void {
+function scheduleOverlayRefresh(delayMs = OVERLAY_REFRESH_DELAY_MS): void {
   if (overlayRefreshTimer !== undefined) {
     return;
   }
@@ -305,7 +372,35 @@ function scheduleOverlayRefresh(): void {
     if (settings.enabled) {
       ensureOverlay();
     }
-  }, OVERLAY_REFRESH_DELAY_MS);
+  }, delayMs);
+}
+
+function showAudioStatus(text: string): void {
+  overlay.reconcilePlacement();
+  overlay.showStatus(text, settings);
+}
+
+function setAudioControlStatus(text: string): void {
+  overlay.reconcilePlacement();
+  overlay.setControlStatus(text, settings);
+}
+
+function showAudioTranslation(
+  videoId: string | undefined,
+  segment: CaptionSegment,
+  translatedText: string,
+  provider: string
+): void {
+  if (settings.enabled && (!videoId || videoId === activeVideoId) && shouldAcceptAudioSegment(segment)) {
+    overlay.reconcilePlacement();
+    overlay.showTranslation(segment, translatedText, provider, settings, false);
+  }
+}
+
+function showAudioSegmentError(videoId: string | undefined, segment: CaptionSegment, error: string): void {
+  if (settings.enabled && (!videoId || videoId === activeVideoId) && shouldAcceptAudioSegment(segment)) {
+    overlay.showSegmentError(segment, error, settings, false);
+  }
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -313,12 +408,12 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 async function updateSettingsFromMini(patch: MiniControlSettingsPatch): Promise<void> {
-  const response = await chrome.runtime.sendMessage<MessageResponse<{ settings: ContentSettings }>>({
+  const response = await chrome.runtime.sendMessage<MessageResponse<{ settings: ContentSettings; revision: number }>>({
     type: "MINI_CONTROL_UPDATE",
     patch
   });
   if (response?.ok) {
-    applySettingsUpdate(response.settings);
+    applySettingsUpdate(response.settings, response.revision);
   } else {
     overlay.showError(response?.error ?? "미니 컨트롤 설정 저장에 실패했습니다.", settings);
   }
@@ -332,9 +427,24 @@ async function handleMiniControl(action: string): Promise<void> {
         overlay.setControlStatus("켜짐", settings);
       }
       return;
+    case "collapse":
+      settings = { ...settings, miniControlsCollapsed: !settings.miniControlsCollapsed };
+      overlay.applySettings(settings);
+      await updateSettingsFromMini({ miniControlsCollapsed: settings.miniControlsCollapsed });
+      return;
     case "source":
       await updateSettingsFromMini({
         overlayStyle: { ...settings.overlayStyle, showSourceText: !settings.overlayStyle.showSourceText }
+      });
+      return;
+    case "inputMode":
+      await updateSettingsFromMini({
+        inputMode:
+          settings.inputMode === "captions"
+            ? "captionsThenAudio"
+            : settings.inputMode === "captionsThenAudio"
+              ? "audio"
+              : "captions"
       });
       return;
     case "lyrics":
@@ -366,10 +476,8 @@ async function handleMiniControl(action: string): Promise<void> {
     case "retry":
       await chrome.runtime.sendMessage({ type: "RESET_AUDIO_CAPTURE_COOLDOWN" }).catch(() => undefined);
       audioStartBlockedUntil = 0;
-      if (audioCaptureRequested) {
-        await stopAudioFallback();
-      }
-      await startAudioFallbackIfNeeded();
+      audioCaptureSuppressed = false;
+      await reconfigureAudioFallback(undefined, true);
       return;
     case "options":
       await chrome.runtime.sendMessage({ type: "OPEN_OPTIONS_PAGE" }).catch(() => undefined);
@@ -463,7 +571,7 @@ function showCurrentTimedTextTranslation(provider: string): void {
   if (!translatedText) {
     return;
   }
-  const key = `pretranslated:${current.id}:${segmentKey(translatedText)}`;
+  const key = translatedSegmentDisplayKey(current, translatedText);
   if (key === lastSentKey) {
     return;
   }
@@ -475,7 +583,7 @@ function renderTimedTextSegment(segment: CaptionSegment): void {
   lastCaptionSeenAt = Date.now();
   const translatedText = timedTextTranslations.get(segment.id);
   if (translatedText) {
-    const key = `pretranslated:${segment.id}:${segmentKey(translatedText)}`;
+    const key = translatedSegmentDisplayKey(segment, translatedText);
     if (key !== lastSentKey) {
       lastSentKey = key;
       overlay.showTranslation(segment, translatedText, "pretranslated", settings);
@@ -492,10 +600,10 @@ function readVisibleOfficialCaption(): void {
   }
   // The visible caption DOM is YouTube's translated output when auto-translate
   // is active. Wait for the original official timed-text track instead.
-  if (pageCaptionSnapshot?.autoTranslationActive || isYouTubeAutoTranslationActive()) {
-    return;
-  }
-  if (!getSelectedOfficialCaptionTrackKey(settings)) {
+  if (
+    (pageCaptionSnapshot?.videoId === activeVideoId && pageCaptionSnapshot.autoTranslationActive) ||
+    isYouTubeAutoTranslationActive()
+  ) {
     return;
   }
   if (getCurrentTimedTextSegment(timedTextSegments, settings)) {
@@ -535,21 +643,32 @@ function scheduleVisibleOfficialCaptionRead(delayMs = OFFICIAL_CAPTION_DOM_READ_
   }, delayMs);
 }
 
-async function sendSegment(segment: RuntimeMessage & { type: "CAPTION_SEGMENT" }): Promise<void> {
+async function sendSegment(
+  segment: RuntimeMessage & { type: "CAPTION_SEGMENT" }
+): Promise<"success" | "blocked" | "retry"> {
   const requestVideoId = activeVideoId;
   const response = await chrome.runtime.sendMessage<MessageResponse<{ translatedText: string; provider: string }>>(segment);
   if (requestVideoId !== activeVideoId || requestVideoId !== currentWatchVideoId()) {
-    return;
+    return "blocked";
   }
   if (response?.ok) {
+    if (segment.segment.source === "youtubeTimedText" && timedTextSegmentIndexById.has(segment.segment.id)) {
+      timedTextTranslations.set(segment.segment.id, response.translatedText);
+    }
     if (settings.enabled && shouldDisplayCaptionTranslation(segment.segment)) {
+      lastSentKey = translatedSegmentDisplayKey(segment.segment, response.translatedText);
       overlay.showTranslation(segment.segment, response.translatedText, response.provider, settings);
     }
-    return;
+    return "success";
+  }
+  if (response && !response.ok && isBlockedTranslationError(response.error)) {
+    overlay.clear();
+    return "blocked";
   }
   if (settings.enabled) {
     overlay.showError(response?.error ?? "background에서 번역 응답을 받지 못했습니다. 확장 프로그램을 새로고침해 주세요.", settings);
   }
+  return "retry";
 }
 
 async function processCaptionSegment(segment: Parameters<typeof overlay.showTranslation>[0]): Promise<void> {
@@ -559,16 +678,30 @@ async function processCaptionSegment(segment: Parameters<typeof overlay.showTran
   }
 
   lastCaptionSeenAt = Date.now();
-  const key = `${segment.source}:${segmentKey(segment.text)}`;
-  if (key === lastSentKey) {
+  const key = captionRequestKey(segment);
+  if (
+    captionRequestsInFlight.has(key) ||
+    blockedCaptionRequestKeys.has(key) ||
+    (captionRequestRetryAfter.get(key) ?? 0) > Date.now()
+  ) {
     return;
   }
 
-  lastSentKey = key;
+  captionRequestsInFlight.add(key);
   try {
-    await sendSegment({ type: "CAPTION_SEGMENT", segment });
+    const result = await sendSegment({ type: "CAPTION_SEGMENT", segment });
+    if (result === "blocked") {
+      blockedCaptionRequestKeys.add(key);
+    } else if (result === "retry") {
+      captionRequestRetryAfter.set(key, Date.now() + CAPTION_TRANSLATION_RETRY_MS);
+    } else {
+      captionRequestRetryAfter.delete(key);
+    }
   } catch (error) {
+    captionRequestRetryAfter.set(key, Date.now() + CAPTION_TRANSLATION_RETRY_MS);
     overlay.showError(getErrorMessage(error), settings);
+  } finally {
+    captionRequestsInFlight.delete(key);
   }
 }
 
@@ -576,6 +709,7 @@ async function loadTimedText(expectedVideoId = activeVideoId): Promise<void> {
   if (!expectedVideoId || expectedVideoId !== activeVideoId || expectedVideoId !== currentWatchVideoId()) {
     return;
   }
+  prepareCaptionLyricsAssist(expectedVideoId);
   const token = (timedTextLoadToken += 1);
   const pendingTrackKeyBeforeLoad = pendingTimedTextTrackKey;
   lastTimedTextAttemptAt = Date.now();
@@ -603,11 +737,22 @@ async function loadTimedText(expectedVideoId = activeVideoId): Promise<void> {
         return;
       }
       const snapshot = await requestPageCaptionSnapshot(expectedVideoId);
+      if (
+        token !== timedTextLoadToken ||
+        expectedVideoId !== activeVideoId ||
+        expectedVideoId !== currentWatchVideoId() ||
+        (snapshot && snapshot.videoId !== expectedVideoId)
+      ) {
+        return;
+      }
       if (snapshot) {
         pageCaptionSnapshot = snapshot;
       }
       result = await fetchTimedTextSegmentsWithMetadata(settings, snapshot);
       if (result?.segments.length) {
+        break;
+      }
+      if (snapshot && !result?.trackKey && !getSelectedOfficialCaptionTrackKey(settings, snapshot)) {
         break;
       }
     }
@@ -621,19 +766,28 @@ async function loadTimedText(expectedVideoId = activeVideoId): Promise<void> {
       timedTextVideoId = result?.videoId ?? expectedVideoId;
       timedTextTrackLanguage = result?.trackLanguage ?? settings.sourceLanguage;
       timedTextTrackKey = result?.trackKey ?? "";
-      pendingTimedTextTrackKey = timedTextTrackKey || getSelectedOfficialCaptionTrackKey(settings) || "";
+      pendingTimedTextTrackKey =
+        timedTextTrackKey || getSelectedOfficialCaptionTrackKey(settings, pageCaptionSnapshot) || "";
       timedTextCaptionHash = timedTextSegments.length > 0 ? hashCaptionSegments(timedTextSegments) : "";
       timedTextSegmentIndexById = new Map(timedTextSegments.map((segment, index) => [segment.id, index]));
       void requestPretranslation();
 
       if (timedTextSegments.length === 0) {
-        overlay.showStatus(
-          settings.inputMode === "captions"
-            ? "이 영상의 원문 공식 자막을 아직 읽지 못했습니다."
-            : "원문 공식 자막을 아직 읽지 못해 음성 자막을 준비하는 중...",
-          settings
-        );
+        const visibleSegment = readVisibleCaptionSegment();
+        if (visibleSegment) {
+          lastTimedTextNoSourceAt = 0;
+          void processCaptionSegment(visibleSegment);
+        } else {
+          lastTimedTextNoSourceAt = Date.now();
+          overlay.showStatus(
+            settings.inputMode === "captions"
+              ? "이 영상의 원문 공식 자막을 아직 읽지 못했습니다."
+              : "원문 공식 자막을 아직 읽지 못해 음성 자막을 준비하는 중...",
+            settings
+          );
+        }
       } else {
+        lastTimedTextNoSourceAt = 0;
         clearVideoSessionCaptionLoadTimers();
       }
 
@@ -649,6 +803,11 @@ async function loadTimedText(expectedVideoId = activeVideoId): Promise<void> {
   } finally {
     if (token === timedTextLoadToken) {
       timedTextLoading = false;
+      if (lastTimedTextNoSourceAt > 0 && settings.inputMode === "captionsThenAudio") {
+        window.setTimeout(() => {
+          void startAudioFallbackIfNeeded();
+        }, AUDIO_FALLBACK_NO_CAPTION_WAIT_MS);
+      }
     }
   }
 }
@@ -687,6 +846,9 @@ function reloadTimedTextIfSelectedTrackChanged(force = false): void {
   pendingTimedTextTrackKey = selectedTrackKey;
   resetTimedTextState();
   lastSentKey = "";
+  captionRequestsInFlight = new Set();
+  blockedCaptionRequestKeys = new Set();
+  captionRequestRetryAfter = new Map();
   if (audioCaptureRequested && selectedTrackKey) {
     void stopAudioFallback();
   }
@@ -715,7 +877,7 @@ function shouldStartAudioFallback(): boolean {
   if (settings.inputMode === "audio") {
     return true;
   }
-  if (timedTextSegments.length > 0) {
+  if (timedTextLoading || timedTextSegments.length > 0) {
     return false;
   }
 
@@ -723,6 +885,9 @@ function shouldStartAudioFallback(): boolean {
   const lastAttemptAge = lastTimedTextAttemptAt > 0 ? now - lastTimedTextAttemptAt : Number.POSITIVE_INFINITY;
   const missingForMs = lastCaptionSeenAt > 0 ? now - lastCaptionSeenAt : Number.POSITIVE_INFINITY;
 
+  if (lastTimedTextNoSourceAt > 0) {
+    return now - lastTimedTextNoSourceAt >= AUDIO_FALLBACK_NO_CAPTION_WAIT_MS;
+  }
   if (lastCaptionSeenAt === 0) {
     return lastAttemptAge >= AUDIO_FALLBACK_INITIAL_WAIT_MS;
   }
@@ -746,7 +911,16 @@ function audioCaptureSettingsKey(value: ContentSettings): string {
 }
 
 async function startAudioFallbackIfNeeded(): Promise<void> {
-  if (!settings.enabled || settings.inputMode === "captions" || audioCaptureRequested || stoppingAudioCapture || !isYouTubeWatchPage()) {
+  if (
+    !settings.enabled ||
+    settings.inputMode === "captions" ||
+    audioCaptureRequested ||
+    audioCaptureSuppressed ||
+    stoppingAudioCapture ||
+    Date.now() < manualAudioStartPendingUntil ||
+    !isYouTubeWatchPage() ||
+    document.visibilityState !== "visible"
+  ) {
     return;
   }
   if (Date.now() < audioStartBlockedUntil) {
@@ -754,42 +928,84 @@ async function startAudioFallbackIfNeeded(): Promise<void> {
   }
 
   if (shouldStartAudioFallback()) {
+    const requestedVideoId = activeVideoId;
     audioStopRequested = false;
     audioCaptureRequested = true;
-    overlay.showStatus("음성 인식을 시작하는 중...", settings);
+    setAudioControlStatus("음성 STT 시작 중");
     try {
-      const response = await chrome.runtime.sendMessage<MessageResponse<{ tabId: number }>>({ type: "START_AUDIO_CAPTURE" });
+      const response = await chrome.runtime.sendMessage<MessageResponse<{ tabId: number }>>({
+        type: "START_AUDIO_CAPTURE",
+        videoId: requestedVideoId
+      });
+      if (requestedVideoId !== activeVideoId || requestedVideoId !== currentWatchVideoId()) {
+        return;
+      }
       if (!response?.ok) {
-        overlay.showError(response?.error ?? "음성 캡처 시작 응답을 받지 못했습니다. 확장 프로그램을 새로고침해 주세요.", settings);
+        console.debug(
+          "Automatic audio capture did not start",
+          response?.error ?? "음성 캡처 시작 응답을 받지 못했습니다."
+        );
+        setAudioControlStatus("음성 STT 대기");
         audioCaptureRequested = false;
         audioStartBlockedUntil = Date.now() + 12_000;
+        return;
       }
     } catch (error) {
-      overlay.showError(getErrorMessage(error), settings);
+      if (requestedVideoId !== activeVideoId || requestedVideoId !== currentWatchVideoId()) {
+        return;
+      }
+      console.debug("Automatic audio capture start failed", getErrorMessage(error));
+      setAudioControlStatus("음성 STT 대기");
       audioCaptureRequested = false;
       audioStartBlockedUntil = Date.now() + 12_000;
     }
   }
 }
 
-async function restartAudioFallback(): Promise<void> {
-  await stopAudioFallback();
-  audioStartBlockedUntil = 0;
-  await startAudioFallbackIfNeeded();
+async function reconfigureAudioFallback(expectedVideoId?: string, startIfMissing = false): Promise<void> {
+  const requestedVideoId = activeVideoId;
+  if ((!audioCaptureRequested && !startIfMissing) || !requestedVideoId) {
+    return;
+  }
+  try {
+    const response = await chrome.runtime.sendMessage<MessageResponse<{ mode?: string }>>({
+      type: "RECONFIGURE_AUDIO_CAPTURE",
+      videoId: requestedVideoId,
+      expectedVideoId,
+      startIfMissing
+    });
+    if (requestedVideoId !== activeVideoId) {
+      return;
+    }
+    if (!response?.ok) {
+      console.debug("Audio capture reconfiguration failed", response?.error);
+      setAudioControlStatus("음성 STT 설정 갱신 실패 · 재시도");
+      return;
+    }
+    audioStopRequested = false;
+    audioCaptureRequested = true;
+    audioStartBlockedUntil = 0;
+    setAudioControlStatus(response.mode === "stream" ? "로컬 스트리밍 STT" : "음성 STT");
+  } catch (error) {
+    if (requestedVideoId === activeVideoId) {
+      console.debug("Audio capture reconfiguration failed", getErrorMessage(error));
+      setAudioControlStatus("음성 STT 설정 갱신 실패 · 재시도");
+    }
+  }
 }
 
-async function stopAudioFallback(force = false): Promise<void> {
+async function stopAudioFallback(force = false, captureVideoId = activeVideoId): Promise<void> {
   if (stoppingAudioCapture) {
     return;
   }
-  audioStopRequested = true;
   if (!audioCaptureRequested && !force) {
     return;
   }
+  audioStopRequested = true;
   stoppingAudioCapture = true;
   audioCaptureRequested = false;
   try {
-    await chrome.runtime.sendMessage({ type: "STOP_AUDIO_CAPTURE" });
+    await chrome.runtime.sendMessage({ type: "STOP_AUDIO_CAPTURE", videoId: captureVideoId });
   } catch (error) {
     console.debug("Audio fallback stop failed", error);
   } finally {
@@ -805,26 +1021,73 @@ async function disableTranslator(): Promise<void> {
   resetTimedTextState();
   audioCaptureRequested = false;
   audioStopRequested = true;
+  audioCaptureSuppressed = true;
   audioStartBlockedUntil = 0;
-  overlay.destroy();
+  manualAudioStartPendingUntil = 0;
   await chrome.runtime.sendMessage({ type: "STOP_AUDIO_CAPTURE" }).catch(() => undefined);
+  if (settings.miniControlsEnabled && isYouTubeWatchPage()) {
+    ensureOverlay();
+    overlay.clear();
+    overlay.setControlStatus(controlStatusText(), settings);
+  } else {
+    overlay.destroy();
+  }
 }
 
-function applySettingsUpdate(nextSettings: ContentSettings): void {
+function shouldReloadTimedTextForSettingsChange(
+  previousSettings: ContentSettings,
+  nextSettings: ContentSettings
+): boolean {
+  if (nextSettings.inputMode === "audio") {
+    return false;
+  }
+  if (!previousSettings.enabled && nextSettings.enabled) {
+    return true;
+  }
+  return (
+    previousSettings.inputMode !== nextSettings.inputMode ||
+    previousSettings.sourceLanguage !== nextSettings.sourceLanguage ||
+    previousSettings.contentMode !== nextSettings.contentMode
+  );
+}
+
+function applySettingsUpdate(nextSettings: ContentSettings, revision?: number): void {
+  if (revision !== undefined) {
+    if (revision <= settingsRevision) {
+      return;
+    }
+    settingsRevision = revision;
+  }
   const previousSettings = settings;
   if (JSON.stringify(previousSettings) === JSON.stringify(nextSettings)) {
     return;
   }
   const wasAudioCaptureActive = Boolean(previousSettings?.enabled && audioCaptureRequested);
   const inputModeChanged = previousSettings.inputMode !== nextSettings.inputMode;
+  if (
+    (!previousSettings.enabled && nextSettings.enabled) ||
+    (inputModeChanged && nextSettings.inputMode !== "captions")
+  ) {
+    audioCaptureSuppressed = false;
+  }
   const shouldPauseAudioForOfficialCaptions =
-    inputModeChanged && previousSettings.inputMode === "audio" && nextSettings.inputMode === "captionsThenAudio";
+    inputModeChanged &&
+    previousSettings.inputMode === "audio" &&
+    nextSettings.inputMode === "captionsThenAudio" &&
+    timedTextSegments.length > 0;
   const shouldStopAudio = !nextSettings.enabled || nextSettings.inputMode === "captions" || shouldPauseAudioForOfficialCaptions;
-  const shouldRestartAudio =
+  const shouldReconfigureAudio =
     wasAudioCaptureActive &&
     !shouldStopAudio &&
     audioCaptureSettingsKey(previousSettings) !== audioCaptureSettingsKey(nextSettings);
-  const translationConfigChanged = previousSettings.translationConfigRevision !== nextSettings.translationConfigRevision;
+  const translationBehaviorChanged =
+    previousSettings.translationConfigRevision !== nextSettings.translationConfigRevision ||
+    previousSettings.targetLanguage !== nextSettings.targetLanguage ||
+    previousSettings.sourceLanguage !== nextSettings.sourceLanguage ||
+    previousSettings.contentMode !== nextSettings.contentMode ||
+    previousSettings.translationProvider !== nextSettings.translationProvider ||
+    previousSettings.lyricsAssistEnabled !== nextSettings.lyricsAssistEnabled;
+  const shouldReloadTimedText = shouldReloadTimedTextForSettingsChange(previousSettings, nextSettings);
   settings = nextSettings;
   lastSentKey = "";
 
@@ -835,8 +1098,11 @@ function applySettingsUpdate(nextSettings: ContentSettings): void {
 
   if (shouldStopAudio) {
     void stopAudioFallback(true);
-  } else if (shouldRestartAudio) {
-    void restartAudioFallback();
+  } else if (shouldReconfigureAudio) {
+    audioStopRequested = false;
+    void reconfigureAudioFallback();
+  } else {
+    audioStopRequested = false;
   }
 
   ensureOverlay();
@@ -845,10 +1111,13 @@ function applySettingsUpdate(nextSettings: ContentSettings): void {
     activeVideoId = currentWatchVideoId();
   }
 
-  if (translationConfigChanged) {
+  if (translationBehaviorChanged) {
     timedTextTranslations = new Map();
     pretranslateRequestKey = "";
     pretranslateRetryBlockedUntil = 0;
+    captionRequestsInFlight = new Set();
+    blockedCaptionRequestKeys = new Set();
+    captionRequestRetryAfter = new Map();
     const currentSegment = getCurrentTimedTextSegment(timedTextSegments, settings);
     if (currentSegment) {
       renderTimedTextSegment(currentSegment);
@@ -858,10 +1127,15 @@ function applySettingsUpdate(nextSettings: ContentSettings): void {
         void requestPretranslation();
       }
     });
+    if (shouldReloadTimedText) {
+      void loadTimedText(activeVideoId);
+    }
     return;
   }
 
-  void loadTimedText(activeVideoId);
+  if (shouldReloadTimedText) {
+    void loadTimedText(activeVideoId);
+  }
 }
 
 function handleUrlChange(): void {
@@ -893,11 +1167,11 @@ function handleVideoElementChange(): void {
     beginVideoSession(videoId);
     return;
   }
-  // YouTube can replace the media element after SPA navigation while its
-  // player response is still pending. Retry only when captions have not yet
-  // been acquired, avoiding a reset during normal playback.
+  // The URL change owns the video session. Replacing the media element for the
+  // same video must not invalidate captions or restart tab audio capture.
   if (settings.inputMode !== "audio" && (timedTextVideoId !== videoId || timedTextSegments.length === 0)) {
-    beginVideoSession(videoId);
+    scheduleVideoSessionCaptionLoads(videoId);
+    void runTick();
   }
 }
 
@@ -914,19 +1188,36 @@ async function tick(): Promise<void> {
   handleUrlChange();
   handleVideoElementChange();
 
-  if (!settings.enabled || !isYouTubeWatchPage()) {
+  if (!isYouTubeWatchPage()) {
     await stopAudioFallback();
     overlay.destroy();
     return;
   }
+  if (!settings.enabled) {
+    await stopAudioFallback();
+    if (settings.miniControlsEnabled) {
+      ensureOverlay();
+      overlay.clear();
+      overlay.setControlStatus(controlStatusText(), settings);
+    } else {
+      overlay.destroy();
+    }
+    return;
+  }
 
-  if (audioCaptureRequested && !videoCanProduceAudio()) {
+  // YouTube briefly pauses or swaps media state while entering/exiting fullscreen.
+  // Keep the existing tab stream alive through that transition.
+  if (audioCaptureRequested && videoPlaybackEnded()) {
     await stopAudioFallback();
   }
 
   if (settings.inputMode !== "audio") {
     reloadTimedTextIfSelectedTrackChanged();
     retryTimedTextIfNeeded();
+
+    if (settings.inputMode === "captionsThenAudio" && audioCaptureRequested && timedTextSegments.length > 0) {
+      await stopAudioFallback();
+    }
 
     const timedTextSegment = getCurrentTimedTextSegment(timedTextSegments, settings);
     if (timedTextSegment) {
@@ -945,6 +1236,7 @@ async function tick(): Promise<void> {
 }
 
 async function runTick(): Promise<void> {
+  overlay.reconcilePlacement();
   if (tickInProgress) {
     return;
   }
@@ -957,9 +1249,112 @@ async function runTick(): Promise<void> {
   }
 }
 
+function scheduleFullscreenAudioResume(delayMs: number): void {
+  if (fullscreenAudioResumeTimer !== undefined) {
+    window.clearTimeout(fullscreenAudioResumeTimer);
+  }
+  fullscreenAudioResumeTimer = window.setTimeout(() => {
+    fullscreenAudioResumeTimer = undefined;
+    resumeAudioAfterFullscreenIntent();
+  }, delayMs);
+}
+
+function resumeAudioAfterFullscreenIntent(): void {
+  if (!resumeAudioAfterFullscreenIntentRequested) {
+    return;
+  }
+  if (stoppingAudioCapture) {
+    scheduleFullscreenAudioResume(100);
+    return;
+  }
+  resumeAudioAfterFullscreenIntentRequested = false;
+  audioCaptureSuppressed = false;
+  audioStopRequested = false;
+  audioStartBlockedUntil = 0;
+  manualAudioStartPendingUntil = 0;
+  void startAudioFallbackIfNeeded();
+}
+
+async function suspendAudioForFullscreenIntent(): Promise<void> {
+  if (
+    !settings.enabled ||
+    !audioCaptureRequested ||
+    audioStopRequested ||
+    stoppingAudioCapture ||
+    !activeVideoId
+  ) {
+    return;
+  }
+  const requestedVideoId = activeVideoId;
+  resumeAudioAfterFullscreenIntentRequested = true;
+  audioCaptureSuppressed = true;
+  setAudioControlStatus("전체화면 전환 · 음성 STT 일시 중지");
+  scheduleFullscreenAudioResume(FULLSCREEN_AUDIO_FALLBACK_MS);
+  await stopAudioFallback(false, requestedVideoId);
+}
+
+function handleFullscreenPointerIntent(event: PointerEvent): void {
+  const target = event.target;
+  if (!(target instanceof Element) || !target.closest(".ytp-fullscreen-button")) {
+    return;
+  }
+  const player = findPlayerElement();
+  if (document.fullscreenElement || player?.classList.contains("ytp-fullscreen")) {
+    return;
+  }
+  void suspendAudioForFullscreenIntent();
+}
+
+function handleFullscreenChange(): void {
+  if (resumeAudioAfterFullscreenIntentRequested && document.fullscreenElement) {
+    scheduleFullscreenAudioResume(FULLSCREEN_AUDIO_RESUME_DELAY_MS);
+  }
+}
+
+function isOverlayMutationElement(element: Element): boolean {
+  return element.id === OVERLAY_HOST_SELECTOR.slice(1) || Boolean(element.closest(OVERLAY_HOST_SELECTOR));
+}
+
+function mutationTouchesPlayer(mutation: MutationRecord): boolean {
+  const selector = "#movie_player, .html5-video-player, video, .ytp-caption-segment, .captions-text";
+  let changedElementCount = 0;
+  let onlyOverlayElements = true;
+  for (const nodes of [mutation.addedNodes, mutation.removedNodes]) {
+    for (const node of nodes) {
+      if (node instanceof Element) {
+        changedElementCount += 1;
+        onlyOverlayElements &&= isOverlayMutationElement(node);
+      }
+    }
+  }
+  if (changedElementCount > 0 && onlyOverlayElements) {
+    return false;
+  }
+  const target = mutation.target;
+  if (target instanceof Element && isOverlayMutationElement(target)) {
+    return false;
+  }
+  if (target instanceof Element && target.closest(selector)) {
+    return true;
+  }
+  for (const nodes of [mutation.addedNodes, mutation.removedNodes]) {
+    for (const node of nodes) {
+      if (node instanceof Element && (node.matches(selector) || node.querySelector(selector))) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function installObservers(): void {
-  const bodyObserver = new MutationObserver(() => {
+  const bodyObserver = new MutationObserver((mutations) => {
+    const urlChanged = location.href !== currentUrl;
     handleUrlChange();
+    if (!urlChanged && !mutations.some(mutationTouchesPlayer)) {
+      return;
+    }
+    handleVideoElementChange();
     if (settings.enabled) {
       scheduleOverlayRefresh();
       scheduleVisibleOfficialCaptionRead();
@@ -995,9 +1390,20 @@ function installObservers(): void {
     },
     true
   );
+  document.addEventListener(
+    "playing",
+    (event) => {
+      if (event.target === findVideoElement()) {
+        void runTick();
+      }
+    },
+    true
+  );
   document.addEventListener("yt-navigate-finish", resyncVideoSessionAfterNavigation);
   document.addEventListener("yt-page-data-updated", resyncVideoSessionAfterNavigation);
   document.addEventListener("yt-player-updated", resyncVideoSessionAfterNavigation);
+  document.addEventListener("pointerdown", handleFullscreenPointerIntent, true);
+  document.addEventListener("fullscreenchange", handleFullscreenChange, true);
   window.addEventListener("popstate", resyncVideoSessionAfterNavigation);
   document.addEventListener(
     "click",
@@ -1020,25 +1426,48 @@ function installObservers(): void {
     if (areaName !== "local" || !(SETTINGS_KEY in changes)) {
       return;
     }
-    void loadContentSettings().then(applySettingsUpdate).catch((error) => {
-      overlay.showError(getErrorMessage(error), settings);
-    });
+    void loadContentSettings()
+      .then((snapshot) => applySettingsUpdate(snapshot.settings, snapshot.revision))
+      .catch((error) => {
+        overlay.showError(getErrorMessage(error), settings);
+      });
   });
 
   chrome.runtime.onMessage.addListener((rawMessage, _sender, sendResponse) => {
     const message = rawMessage as RuntimeMessage;
     if (message.type === "TRANSLATION_READY") {
-      if (settings.enabled && shouldAcceptAudioSegment(message.segment)) {
-        overlay.showTranslation(message.segment, message.translatedText, message.provider, settings);
+      if (
+        settings.enabled &&
+        shouldAcceptAudioSegment(message.segment) &&
+        (!message.videoId || message.videoId === activeVideoId)
+      ) {
+        if (message.segment.source === "audioStt") {
+          showAudioTranslation(message.videoId, message.segment, message.translatedText, message.provider);
+        } else {
+          overlay.showTranslation(message.segment, message.translatedText, message.provider, settings);
+        }
       }
       sendResponse({ ok: true });
       return;
     }
 
     if (message.type === "TRANSLATION_ERROR") {
-      if (settings.enabled && shouldAcceptAudioSegment(message.segment)) {
+      if (
+        settings.enabled &&
+        shouldAcceptAudioSegment(message.segment) &&
+        (!message.videoId || message.videoId === activeVideoId)
+      ) {
+        if (isBlockedTranslationError(message.error)) {
+          overlay.clear();
+          sendResponse({ ok: true });
+          return;
+        }
         if (message.segment) {
-          overlay.showSegmentError(message.segment, message.error, settings);
+          if (message.segment.source === "audioStt") {
+            showAudioSegmentError(message.videoId, message.segment, message.error);
+          } else {
+            overlay.showSegmentError(message.segment, message.error, settings);
+          }
         } else {
           overlay.showError(message.error, settings);
         }
@@ -1080,48 +1509,85 @@ function installObservers(): void {
     }
 
     if (message.type === "AUDIO_TRANSCRIPT") {
-      if (settings.enabled && shouldAcceptAudioSegment(message.segment)) {
-        overlay.showStatus(`음성 인식됨, 번역 중... ${compactStatusText(message.segment.text)}`, settings);
+      if (settings.enabled && message.videoId === activeVideoId && shouldAcceptAudioSegment(message.segment)) {
+        showAudioStatus(`음성 인식됨, 번역 중... ${compactStatusText(message.segment.text)}`);
       }
       sendResponse({ ok: true });
       return;
     }
 
     if (message.type === "STREAM_STT_TRANSCRIPT") {
-      if (settings.enabled && !message.isFinal && shouldAcceptAudioSegment(message.segment)) {
-        overlay.showStatus(`음성 인식 중... ${compactStatusText(message.segment.text)}`, settings);
+      if (
+        settings.enabled &&
+        message.videoId === activeVideoId &&
+        !message.isFinal &&
+        shouldAcceptAudioSegment(message.segment)
+      ) {
+        showAudioStatus(`음성 인식 중... ${compactStatusText(message.segment.text)}`);
       }
       sendResponse({ ok: true });
       return;
     }
 
     if (message.type === "AUDIO_CAPTURE_STATUS") {
+      if (!message.videoId || message.videoId !== activeVideoId) {
+        sendResponse({ ok: true });
+        return;
+      }
       if (message.state === "recording") {
-        if (audioStopRequested || !settings.enabled || settings.inputMode === "captions" || !isYouTubeWatchPage()) {
+        const shouldStopRecording =
+          audioStopRequested ||
+          audioCaptureSuppressed ||
+          !settings.enabled ||
+          settings.inputMode === "captions" ||
+          !isYouTubeWatchPage();
+        if (shouldStopRecording) {
           audioCaptureRequested = false;
-          void chrome.runtime.sendMessage({ type: "STOP_AUDIO_CAPTURE" }).catch(() => undefined);
+          void chrome.runtime
+            .sendMessage({ type: "STOP_AUDIO_CAPTURE", videoId: message.videoId })
+            .catch(() => undefined);
           sendResponse({ ok: true });
           return;
         }
         audioCaptureRequested = true;
+        manualAudioStartPendingUntil = 0;
         audioStartBlockedUntil = 0;
-        overlay.showStatus(message.statusText ?? "음성 인식 중...", settings);
-        overlay.setControlStatus(controlStatusText(), settings);
+        showAudioStatus(message.statusText ?? "음성 인식 중...");
+        setAudioControlStatus(controlStatusText());
       } else if (message.state === "idle") {
         audioCaptureRequested = false;
-        overlay.setControlStatus(controlStatusText(), settings);
+        manualAudioStartPendingUntil = 0;
+        setAudioControlStatus(controlStatusText());
       } else if (message.error) {
         audioCaptureRequested = false;
+        manualAudioStartPendingUntil = 0;
         audioStartBlockedUntil = Date.now() + 12_000;
-        overlay.showError(message.error, settings);
-        overlay.setControlStatus(controlStatusText(), settings);
+        console.debug("Audio capture failed", message.error);
+        setAudioControlStatus("음성 STT 오류");
       }
       sendResponse({ ok: true });
       return;
     }
 
+    if (message.type === "PREPARE_AUDIO_CAPTURE") {
+      audioStopRequested = false;
+      audioCaptureSuppressed = false;
+      manualAudioStartPendingUntil = Date.now() + MANUAL_AUDIO_START_PENDING_MS;
+      audioStartBlockedUntil = 0;
+      sendResponse({ ok: true, videoId: activeVideoId });
+      return;
+    }
+
+    if (message.type === "PREPARE_AUDIO_STOP") {
+      audioStopRequested = true;
+      audioCaptureSuppressed = true;
+      manualAudioStartPendingUntil = 0;
+      sendResponse({ ok: true, videoId: activeVideoId });
+      return;
+    }
+
     if (message.type === "SETTINGS_UPDATED") {
-      applySettingsUpdate(message.settings);
+      applySettingsUpdate(message.settings, message.revision);
       sendResponse({ ok: true });
       return;
     }
@@ -1131,6 +1597,7 @@ function installObservers(): void {
         ok: true,
         audioCaptureRequested,
         timedTextSegments: timedTextSegments.length,
+        contentScriptVersion: CONTENT_SCRIPT_VERSION,
         url: location.href
       });
       return;
@@ -1139,7 +1606,9 @@ function installObservers(): void {
 }
 
 async function main(): Promise<void> {
-  settings = await loadContentSettings();
+  const settingsSnapshot = await loadContentSettings();
+  settings = settingsSnapshot.settings;
+  settingsRevision = settingsSnapshot.revision;
   activeVideoId = currentWatchVideoId();
   observedVideoElement = findVideoElement();
   lastCaptionSeenAt = 0;

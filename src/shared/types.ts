@@ -28,6 +28,7 @@ export type CaptionSegment = {
   endMs: number;
   text: string;
   contextText?: string;
+  detectedContentMode?: "spoken" | "live" | "lyrics";
 };
 
 export type OverlayStyle = {
@@ -83,6 +84,8 @@ export type TranslatorSettings = {
   contentMode: ContentMode;
   pretranslateEnabled: boolean;
   miniControlsEnabled: boolean;
+  miniControlsCollapsed: boolean;
+  lyricsAssistEnabled: boolean;
   streamingSttEnabled: boolean;
   streamingSttEndpoint: string;
   speakerTurnDetection: boolean;
@@ -110,7 +113,9 @@ export type ContentSettings = Omit<
   translationConfigRevision: number;
 };
 
-export type MiniControlSettingsPatch = Partial<Pick<TranslatorSettings, "enabled" | "contentMode" | "overlayStyle">>;
+export type MiniControlSettingsPatch = Partial<
+  Pick<TranslatorSettings, "enabled" | "inputMode" | "contentMode" | "miniControlsCollapsed" | "overlayStyle">
+>;
 
 export type SettingsSnapshot = {
   settings: TranslatorSettings;

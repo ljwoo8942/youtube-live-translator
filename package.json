@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
+    "test:contracts": "node --test tests/layout-audio-contract.test.mjs",
     "preview": "vite preview",
     "stt:setup": "uv python install 3.11 && uv venv --python 3.11 .venv-stt && uv pip install --python .venv-stt/Scripts/python.exe -r local_stt/requirements.txt",
     "stt:start": ".\\.venv-stt\\Scripts\\python.exe -m uvicorn local_stt.app:app --host 127.0.0.1 --port 8765",
