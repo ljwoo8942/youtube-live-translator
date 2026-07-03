@@ -37,6 +37,7 @@ const PRETRANSLATE_PRIORITY_PAST_WINDOW_MS = 10_000;
 const PRETRANSLATE_PRIORITY_FUTURE_WINDOW_MS = 180_000;
 const PRETRANSLATE_RECENT_PAST_WINDOW_MS = 60_000;
 const CAPTION_CONTEXT_SEGMENT_COUNT = 2;
+const LYRICS_ASSIST_MATCH_BATCH_SIZE = 24;
 const DUPLICATE_FINAL_TRANSCRIPT_WINDOW_MS = 6_000;
 const TRANSLATION_MEMORY_CACHE_LIMIT = 300;
 const STREAM_PARTIAL_TRANSLATION_MIN_INTERVAL_MS = 1_250;
@@ -558,6 +559,29 @@ async function readPageMediaContext(tabId: number, videoId: string): Promise<Lyr
   }
 }
 
+function notifyLyricsAssistStatus(
+  tabId: number,
+  videoId: string,
+  state: "searching" | "ready" | "empty" | "applied",
+  candidateCount?: number
+): void {
+  const statusText =
+    state === "searching"
+      ? "가사 보완 검색 중"
+      : state === "ready"
+        ? `가사 후보 ${candidateCount ?? 0}개 확인`
+        : state === "applied"
+          ? "가사 보완 적용됨"
+          : "가사 후보 없음";
+  void notifyTab(tabId, {
+    type: "LYRICS_ASSIST_STATUS",
+    videoId,
+    state,
+    statusText,
+    candidateCount
+  });
+}
+
 async function prepareLyricsAssist(tabId: number, videoId: string, settings: TranslatorSettings): Promise<void> {
   if (!settings.lyricsAssistEnabled || settings.contentMode === "spoken") {
     lyricsAssistByTab.delete(tabId);
@@ -565,13 +589,18 @@ async function prepareLyricsAssist(tabId: number, videoId: string, settings: Tra
   }
   const session = createLyricsAssistSession(videoId);
   lyricsAssistByTab.set(tabId, session);
+  notifyLyricsAssistStatus(tabId, videoId, "searching");
   const media = await readPageMediaContext(tabId, videoId);
   if (!media || lyricsAssistByTab.get(tabId) !== session || !isActiveAudioSession(tabId, videoId)) {
+    if (!media && lyricsAssistByTab.get(tabId) === session) {
+      notifyLyricsAssistStatus(tabId, videoId, "empty", 0);
+    }
     return;
   }
   const candidates = await searchLyricsCandidates(media);
   if (lyricsAssistByTab.get(tabId) === session && isActiveAudioSession(tabId, videoId)) {
     setLyricsCandidates(session, candidates);
+    notifyLyricsAssistStatus(tabId, videoId, candidates.length > 0 ? "ready" : "empty", candidates.length);
   }
 }
 
@@ -597,14 +626,19 @@ function startCaptionLyricsAssist(
     ready: Promise.resolve()
   };
   captionLyricsAssistByTab.set(tabId, state);
+  notifyLyricsAssistStatus(tabId, videoId, "searching");
   state.ready = (async () => {
     const media = await readPageMediaContext(tabId, videoId);
     if (!media || captionLyricsAssistByTab.get(tabId) !== state) {
+      if (!media && captionLyricsAssistByTab.get(tabId) === state) {
+        notifyLyricsAssistStatus(tabId, videoId, "empty", 0);
+      }
       return;
     }
     const candidates = await searchLyricsCandidates(media);
     if (captionLyricsAssistByTab.get(tabId) === state) {
       setLyricsCandidates(session, candidates);
+      notifyLyricsAssistStatus(tabId, videoId, candidates.length > 0 ? "ready" : "empty", candidates.length);
     }
   })();
   return state;
@@ -613,16 +647,21 @@ function startCaptionLyricsAssist(
 async function captionLyricsAssistSession(
   tabId: number,
   videoId: string,
-  settings: TranslatorSettings
+  settings: TranslatorSettings,
+  waitForReady = false
 ): Promise<LyricsAssistSession | undefined> {
   const state = startCaptionLyricsAssist(tabId, videoId, settings);
   if (!state) {
     return undefined;
   }
-  await Promise.race([
-    state.ready,
-    new Promise<void>((resolve) => globalThis.setTimeout(resolve, 900))
-  ]);
+  if (waitForReady) {
+    await state.ready;
+  } else {
+    await Promise.race([
+      state.ready,
+      new Promise<void>((resolve) => globalThis.setTimeout(resolve, 900))
+    ]);
+  }
   return captionLyricsAssistByTab.get(tabId) === state ? state.session : undefined;
 }
 
@@ -630,10 +669,38 @@ async function addCaptionLyricsAssist(
   tabId: number,
   videoId: string,
   settings: TranslatorSettings,
-  segments: CaptionSegment[]
+  segments: CaptionSegment[],
+  waitForReady = false
 ): Promise<CaptionSegment[]> {
-  const session = await captionLyricsAssistSession(tabId, videoId, settings);
-  return session ? segments.map((segment) => assistOfficialCaptionSegment(session, segment)) : segments;
+  const session = await captionLyricsAssistSession(tabId, videoId, settings, waitForReady);
+  if (!session) {
+    return segments;
+  }
+  const matchingSession =
+    segments.length > 1
+      ? {
+          ...session,
+          candidates: session.candidates
+        }
+      : session;
+  const assistedSegments: CaptionSegment[] = [];
+  for (let offset = 0; offset < segments.length; offset += LYRICS_ASSIST_MATCH_BATCH_SIZE) {
+    const currentState = captionLyricsAssistByTab.get(tabId);
+    if (!currentState || currentState.videoId !== videoId || currentState.session !== session) {
+      return segments;
+    }
+    const end = Math.min(segments.length, offset + LYRICS_ASSIST_MATCH_BATCH_SIZE);
+    for (let index = offset; index < end; index += 1) {
+      assistedSegments.push(assistOfficialCaptionSegment(matchingSession, segments[index]));
+    }
+    if (end < segments.length) {
+      await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0));
+    }
+  }
+  if (assistedSegments.some((segment) => segment.detectedContentMode === "lyrics")) {
+    notifyLyricsAssistStatus(tabId, videoId, "applied", session.candidates.length);
+  }
+  return assistedSegments;
 }
 
 async function ensureOffscreenDocument(): Promise<void> {
@@ -1115,6 +1182,9 @@ function polishJapaneseKoreanMeaning(sourceText: string, translatedText: string,
     return translatedText;
   }
   const source = sourceText.replace(/[\s　]/g, "");
+  if (/BADなダンス(?:腫魔|ハマ)ったらいいじゃん/iu.test(source)) {
+    return "BAD한 댄스에 빠져버리면 되잖아";
+  }
   if (/ここに居ようとして(?:る|いる)/u.test(source)) {
     return translatedText
       .replace(/여기(?:에)?\s*있으려고\s*(?:하고\s*있는|하는)/gu, "여기에 머물려는")
@@ -1554,7 +1624,8 @@ function addCaptionContext(
     if (index === undefined) {
       return segment;
     }
-    const contextText = captionContextText(allSegments, index, settings);
+    const surroundingContext = captionContextText(allSegments, index, settings);
+    const contextText = [segment.contextText, surroundingContext].filter(Boolean).join("\n");
     return contextText ? { ...segment, contextText } : segment;
   });
 }
@@ -1568,8 +1639,9 @@ async function handlePretranslateCaptions(
   }
 
   const settings = await loadSettings();
-  const segments = await addCaptionLyricsAssist(tabId, message.videoId, settings, message.segments);
-  const assistedMessage = segments === message.segments ? message : { ...message, segments };
+  const lyricsAssistedSegments = await addCaptionLyricsAssist(tabId, message.videoId, settings, message.segments, true);
+  const segments = addCaptionContext(lyricsAssistedSegments, lyricsAssistedSegments, settings);
+  const assistedMessage = { ...message, segments };
   const context = createCaptionCacheContext(settings, message.videoId, message.captionHash, message.trackLanguage);
   const cachedMap = await getCachedCaptionTranslations(context, segments);
   const cachedEntries = entriesFromCache(segments, cachedMap);
@@ -1651,7 +1723,7 @@ async function runPretranslationJob(
     }
     const source = hotMissing.length > 0 ? hotMissing : missing;
     const batchSize = hotMissing.length > 0 ? hotPretranslateBatchSize(settings) : pretranslateBatchSize(settings);
-    const batch = addCaptionContext(source.slice(0, batchSize), message.segments, settings);
+    const batch = source.slice(0, batchSize);
     const result = await translatePretranslationBatch(settings, batch);
     if (job.cancelled) {
       break;
@@ -1669,7 +1741,7 @@ async function runPretranslationJob(
       })
       .filter((entry): entry is CaptionTranslationEntry => Boolean(entry));
 
-    await putCachedCaptionTranslations(context, safeTranslations);
+    await putCachedCaptionTranslations(context, safeTranslations, batch);
     for (const entry of safeTranslations) {
       cachedMap.set(entry.id, entry.translatedText);
     }
@@ -2286,6 +2358,9 @@ async function processAudioChunk(message: Extract<RuntimeMessage, { type: "AUDIO
     text: transcript
   };
   const segment = assistLyricsSegment(lyricsAssistByTab.get(message.tabId), rawSegment, settings.contentMode, true);
+  if (segment.detectedContentMode === "lyrics") {
+    notifyLyricsAssistStatus(message.tabId, message.videoId, "applied", lyricsAssistByTab.get(message.tabId)?.candidates.length);
+  }
 
   await notifyTab(message.tabId, { type: "AUDIO_TRANSCRIPT", tabId: message.tabId, videoId: message.videoId, segment });
 
@@ -2333,6 +2408,9 @@ async function processStreamTranscript(message: Extract<RuntimeMessage, { type: 
     settings.contentMode,
     message.isFinal
   );
+  if (segment.detectedContentMode === "lyrics") {
+    notifyLyricsAssistStatus(message.tabId, message.videoId, "applied", lyricsAssistByTab.get(message.tabId)?.candidates.length);
+  }
 
   if (!message.isFinal) {
     await notifyTab(message.tabId, { ...message, segment });

@@ -82,6 +82,13 @@ export type RuntimeMessage =
   | { type: "AUDIO_TRANSCRIPT"; tabId: number; videoId: string; segment: CaptionSegment }
   | { type: "STREAM_STT_TRANSCRIPT"; tabId: number; videoId: string; segment: CaptionSegment; isFinal: boolean }
   | { type: "AUDIO_CAPTURE_STATUS"; state: string; error?: string; tabId?: number; videoId?: string; statusText?: string }
+  | {
+      type: "LYRICS_ASSIST_STATUS";
+      videoId: string;
+      state: "searching" | "ready" | "empty" | "applied";
+      statusText: string;
+      candidateCount?: number;
+    }
   | { type: "SETTINGS_UPDATED"; settings: ContentSettings; revision: number }
   | { type: "SAVE_SETTINGS"; patch: Partial<TranslatorSettings> }
   | { type: "MINI_CONTROL_UPDATE"; patch: MiniControlSettingsPatch }

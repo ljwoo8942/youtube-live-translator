@@ -8,7 +8,9 @@ const LIVE_MATCH_THRESHOLD = 0.64;
 const LYRICS_MATCH_THRESHOLD = 0.68;
 const OFFICIAL_CAPTION_MATCH_THRESHOLD = 0.86;
 const OFFICIAL_CAPTION_MIN_CHARACTERS = 6;
+const MIN_CANDIDATE_METADATA_SCORE = 0.36;
 const MISSES_TO_LEAVE_LYRICS = 2;
+const OFFICIAL_CAPTION_MISSES_TO_UNLOCK = 4;
 const MATCHES_TO_ENTER_LYRICS = 2;
 
 export type LyricsMediaContext = {
@@ -24,7 +26,10 @@ export type LyricsCandidate = {
   id: number;
   trackName: string;
   artistName: string;
+  durationSeconds?: number;
+  metadataScore?: number;
   lines: string[];
+  normalizedLines?: string[];
 };
 
 export type LyricsAssistSession = {
@@ -43,6 +48,7 @@ type LyricsRecord = {
   id?: unknown;
   trackName?: unknown;
   artistName?: unknown;
+  duration?: unknown;
   instrumental?: unknown;
   plainLyrics?: unknown;
   syncedLyrics?: unknown;
@@ -68,7 +74,10 @@ export function createLyricsAssistSession(videoId: string): LyricsAssistSession 
 }
 
 export function setLyricsCandidates(session: LyricsAssistSession, candidates: LyricsCandidate[]): void {
-  session.candidates = candidates;
+  session.candidates = candidates.map((candidate) => ({
+    ...candidate,
+    normalizedLines: candidate.normalizedLines ?? candidate.lines.map(normalizeLyricText)
+  }));
   session.activeLyrics = false;
   session.selectedCandidateId = undefined;
   session.cursor = 0;
@@ -122,7 +131,12 @@ export async function searchLyricsCandidates(
         return value
           .map(normalizeLyricsRecord)
           .filter((candidate): candidate is LyricsCandidate => Boolean(candidate))
-          .sort((left, right) => candidateMetadataScore(right, query, media) - candidateMetadataScore(left, query, media))
+          .map((candidate) => ({
+            ...candidate,
+            metadataScore: candidateMetadataScore(candidate, query, media)
+          }))
+          .filter((candidate) => (candidate.metadataScore ?? 0) >= MIN_CANDIDATE_METADATA_SCORE)
+          .sort((left, right) => (right.metadataScore ?? 0) - (left.metadataScore ?? 0))
           .slice(0, 3);
       } catch {
         return [];
@@ -134,11 +148,14 @@ export async function searchLyricsCandidates(
 
   const unique = new Map<number, LyricsCandidate>();
   for (const candidate of resultGroups.flat()) {
-    if (!unique.has(candidate.id)) {
+    const existing = unique.get(candidate.id);
+    if (!existing || (candidate.metadataScore ?? 0) > (existing.metadataScore ?? 0)) {
       unique.set(candidate.id, candidate);
     }
   }
-  return [...unique.values()].slice(0, MAX_CANDIDATES);
+  return [...unique.values()]
+    .sort((left, right) => (right.metadataScore ?? 0) - (left.metadataScore ?? 0))
+    .slice(0, MAX_CANDIDATES);
 }
 
 export function assistLyricsSegment(
@@ -214,8 +231,22 @@ export function assistOfficialCaptionSegment(
 
   const match = findBestMatch(session, segment.text);
   if (!match || match.score < OFFICIAL_CAPTION_MATCH_THRESHOLD) {
+    if (session.activeLyrics) {
+      session.consecutiveMisses += 1;
+      if (session.consecutiveMisses >= OFFICIAL_CAPTION_MISSES_TO_UNLOCK) {
+        session.activeLyrics = false;
+        session.selectedCandidateId = undefined;
+        session.cursor = 0;
+        session.consecutiveMisses = 0;
+      }
+    }
     return segment;
   }
+
+  session.activeLyrics = true;
+  session.selectedCandidateId = match.candidate.id;
+  session.cursor = match.lineIndex + match.lineCount;
+  session.consecutiveMisses = 0;
 
   const contextStart = Math.max(0, match.lineIndex - 1);
   const contextEnd = Math.min(match.candidate.lines.length, match.lineIndex + match.lineCount + 1);
@@ -234,8 +265,10 @@ export function assistOfficialCaptionSegment(
 }
 
 export function lyricLineSimilarity(left: string, right: string): number {
-  const normalizedLeft = normalizeLyricText(left);
-  const normalizedRight = normalizeLyricText(right);
+  return normalizedLyricSimilarity(normalizeLyricText(left), normalizeLyricText(right));
+}
+
+function normalizedLyricSimilarity(normalizedLeft: string, normalizedRight: string): number {
   if (normalizedLeft.length < MIN_MATCH_CHARACTERS || normalizedRight.length < MIN_MATCH_CHARACTERS) {
     return 0;
   }
@@ -266,11 +299,16 @@ export function lyricLineSimilarity(left: string, right: string): number {
 }
 
 function findBestMatch(session: LyricsAssistSession, transcript: string): LyricsMatch | undefined {
+  const normalizedTranscript = normalizeLyricText(transcript);
+  if (normalizedTranscript.length < MIN_MATCH_CHARACTERS) {
+    return undefined;
+  }
   let best: LyricsMatch | undefined;
   const selectedCandidate = session.candidates.find((candidate) => candidate.id === session.selectedCandidateId);
   const candidates = session.activeLyrics && selectedCandidate ? [selectedCandidate] : session.candidates;
 
   for (const candidate of candidates) {
+    const normalizedLines = candidate.normalizedLines ?? candidate.lines.map(normalizeLyricText);
     const start = session.activeLyrics && candidate.id === session.selectedCandidateId ? Math.max(0, session.cursor - 3) : 0;
     const end =
       session.activeLyrics && candidate.id === session.selectedCandidateId
@@ -281,9 +319,11 @@ function findBestMatch(session: LyricsAssistSession, transcript: string): Lyrics
         if (index + lineCount > candidate.lines.length) {
           continue;
         }
-        const text = candidate.lines.slice(index, index + lineCount).join("\n");
-        const score = lyricLineSimilarity(transcript, text);
+        const normalizedText =
+          lineCount === 1 ? normalizedLines[index] : `${normalizedLines[index]}${normalizedLines[index + 1]}`;
+        const score = normalizedLyricSimilarity(normalizedTranscript, normalizedText);
         if (!best || score > best.score) {
+          const text = candidate.lines.slice(index, index + lineCount).join("\n");
           best = { candidate, lineIndex: index, lineCount, text, score };
         }
       }
@@ -319,6 +359,10 @@ function normalizeLyricsRecord(value: unknown): LyricsCandidate | undefined {
     id: record.id,
     trackName: record.trackName.trim(),
     artistName: record.artistName.trim(),
+    durationSeconds:
+      typeof record.duration === "number" && Number.isFinite(record.duration) && record.duration > 0
+        ? record.duration
+        : undefined,
     lines
   };
 }
@@ -341,17 +385,31 @@ function candidateMetadataScore(candidate: LyricsCandidate, query: string, media
     lyricLineSimilarity(candidate.trackName, media.title)
   );
   const artistScore = lyricLineSimilarity(candidate.artistName, media.author);
-  return titleScore * 0.8 + artistScore * 0.2;
+  const durationScore =
+    !media.isLive && media.durationSeconds && candidate.durationSeconds
+      ? Math.max(0, 1 - Math.abs(media.durationSeconds - candidate.durationSeconds) / 90)
+      : 0;
+  return titleScore * 0.78 + artistScore * 0.17 + durationScore * 0.05;
 }
 
 function cleanSearchText(value: string): string {
   return value
     .replace(/\s*-\s*YouTube\s*$/i, "")
-    .replace(/【[^】]{0,100}】|\[[^\]]{0,100}\]/g, " ")
+    .replace(/【([^】]{0,100})】|\[([^\]]{0,100})\]/g, (_match, cornerText: string, squareText: string) => {
+      const text = (cornerText || squareText || "").trim();
+      return isSearchDecoration(text) ? " " : ` ${text} `;
+    })
+    .replace(/\((?:official\s*(?:music\s*)?video|official\s*mv|music\s*video|lyrics?|cover(?:ed)?|歌ってみた)\)/gi, " ")
     .replace(/#\S+/g, " ")
     .replace(/\b(?:official\s*(?:music\s*)?video|official\s*mv|music\s*video|lyrics?|cover(?:ed)?|歌ってみた|初配信)\b/gi, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function isSearchDecoration(value: string): boolean {
+  return /^(?:official\s*(?:music\s*)?video|official\s*mv|music\s*video|lyrics?|cover(?:ed)?|歌ってみた|初配信|mv|pv|4k)$/i.test(
+    value
+  );
 }
 
 function normalizeLyricText(value: string): string {

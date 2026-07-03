@@ -19,6 +19,8 @@ const overlay = readSource("src/content/overlay.ts");
 const popup = readSource("src/popup/index.ts");
 const offscreen = readSource("src/offscreen/index.ts");
 const background = readSource("src/background/index.ts");
+const captionCache = readSource("src/background/captionCache.ts");
+const lyricsAssistSource = readSource("src/background/lyricsAssist.ts");
 const providers = readSource("src/background/providers.ts");
 const storage = readSource("src/shared/storage.ts");
 const defaults = readSource("src/shared/defaults.ts");
@@ -431,7 +433,7 @@ test("Korean lyrics prompt avoids dry declarative prose endings", () => {
   assert.match(providers, /초안이 ~다, ~한다, ~된다, ~였다로 끝나면 원문이 의도적 선언문이 아닌 한 다시 써서 가사다운 종결로 바꾼다/);
   assert.match(providers, /한국어 일반 자막도 기본값을 문어체 ~다로 두지 않는다/);
   assert.match(providers, /痛むごとに血が流れて落ちていく -> 아플 때마다 피가 흘러내려/);
-  assert.match(translationVersion, /subtitle-fidelity-first-v26/);
+  assert.match(translationVersion, /subtitle-fidelity-first-v28/);
 });
 
 test("manual audio start clears stale stop intent before starting tab capture", () => {
@@ -508,11 +510,16 @@ test("same-video startup reuses the live STT socket without reconfiguration", ()
   assert.doesNotMatch(reuseCapture, /RECONFIGURE_AUDIO_CAPTURE|START_AUDIO_CAPTURE|STOP_AUDIO_CAPTURE/);
 });
 
-test("mini retry uses the actual offscreen session and starts capture when it is missing", () => {
+test("mini retry clears stale stop intent before restarting the actual offscreen session", () => {
   const retryStart = content.indexOf('case "retry":');
   const retryEnd = content.indexOf('case "options":', retryStart);
   const retryCase = content.slice(retryStart, retryEnd);
+  const clearStopIntent = retryCase.indexOf("audioStopRequested = false");
+  const reconfigure = retryCase.indexOf("reconfigureAudioFallback(undefined, true)");
   assert.ok(retryStart >= 0);
+  assert.ok(clearStopIntent >= 0);
+  assert.ok(clearStopIntent < reconfigure);
+  assert.match(retryCase, /setAudioControlStatus\("음성 STT 재시작 중"\)/);
   assert.match(retryCase, /reconfigureAudioFallback\(undefined, true\)/);
   assert.doesNotMatch(retryCase, /if \(audioCaptureRequested\)/);
   assert.match(
@@ -560,6 +567,12 @@ test("known subtitle thank-you hallucinations are blocked before translation", (
 test("Japanese staying intent is polished into natural Korean", () => {
   assert.match(background, /ここに居ようとして\(\?:る\|いる\)/);
   assert.match(background, /"여기에 머물려는"/);
+});
+
+test("misrecognized Japanese lyric keeps BAD and restores hama meaning", () => {
+  assert.match(providers, /BADなダンス 腫魔ったらいいじゃん -> BAD한 댄스에 빠져버리면 되잖아/);
+  assert.match(background, /BADなダンス\(\?:腫魔\|ハマ\)ったらいいじゃん/);
+  assert.match(background, /"BAD한 댄스에 빠져버리면 되잖아"/);
 });
 
 test("lyrics assist derives search queries from YouTube metadata without manual copying", () => {
@@ -632,6 +645,9 @@ test("official caption lyrics assist adds context without replacing the official
   assert.match(assisted.contextText ?? "", /High-confidence external lyrics reference/);
   assert.match(assisted.contextText ?? "", /夜の向こうへ/);
   assert.equal(assisted.detectedContentMode, "lyrics");
+  assert.equal(session.activeLyrics, true);
+  assert.equal(session.selectedCandidateId, 7);
+  assert.equal(session.cursor, 2);
 
   const unrelated = assistOfficialCaptionSegment(session, {
     ...source,
@@ -641,13 +657,24 @@ test("official caption lyrics assist adds context without replacing the official
   assert.equal(unrelated.contextText, undefined);
 });
 
+test("caption lyrics matching caches normalized lines and yields between batches", () => {
+  assert.match(lyricsAssistSource, /normalizedLines\?: string\[\]/);
+  assert.match(lyricsAssistSource, /candidate\.lines\.map\(normalizeLyricText\)/);
+  assert.match(background, /const LYRICS_ASSIST_MATCH_BATCH_SIZE = 24/);
+  assert.match(
+    background,
+    /await new Promise<void>\(\(resolve\) => globalThis\.setTimeout\(resolve, 0\)\)/
+  );
+});
+
 test("caption-only translation path prepares and applies non-destructive lyrics search assistance", () => {
   assert.match(content, /type: "PREPARE_CAPTION_LYRICS_ASSIST", videoId/);
   assert.match(background, /async function addCaptionLyricsAssist\(/);
   assert.match(
     background,
-    /const segments = await addCaptionLyricsAssist\(tabId, message\.videoId, settings, message\.segments\)/
+    /const lyricsAssistedSegments = await addCaptionLyricsAssist\(tabId, message\.videoId, settings, message\.segments, true\)/
   );
+  assert.match(background, /const segments = addCaptionContext\(lyricsAssistedSegments, lyricsAssistedSegments, settings\)/);
   assert.match(
     background,
     /message\.type === "CAPTION_SEGMENT"[\s\S]*?await addCaptionLyricsAssist\(tabId, videoId, settings, \[message\.segment\]\)/
@@ -686,6 +713,82 @@ test("lyrics search parses synchronized LRCLIB records without trusting instrume
   );
   assert.equal(candidates.length, 1);
   assert.deepEqual(candidates[0].lines, ["一番目", "二番目", "三番目", "四番目"]);
+});
+
+test("lyrics search preserves bracketed song names and rejects unrelated metadata", async () => {
+  assert.deepEqual(
+    extractLyricsSearchQueries({
+      videoId: "video",
+      title: "【Song Title】 Cover",
+      author: "Cover Singer",
+      description: "",
+      durationSeconds: 240,
+      isLive: false
+    }),
+    ["Song Title"]
+  );
+
+  const candidates = await searchLyricsCandidates(
+    {
+      videoId: "video",
+      title: "【Song Title】 Cover",
+      author: "Cover Singer",
+      description: "",
+      durationSeconds: 240,
+      isLive: false
+    },
+    async () =>
+      new Response(
+        JSON.stringify([
+          {
+            id: 11,
+            trackName: "Song Title",
+            artistName: "Original Artist",
+            duration: 238,
+            instrumental: false,
+            plainLyrics: "line one\nline two\nline three\nline four"
+          },
+          {
+            id: 12,
+            trackName: "Completely Different",
+            artistName: "Other Artist",
+            duration: 240,
+            instrumental: false,
+            plainLyrics: "wrong one\nwrong two\nwrong three\nwrong four"
+          }
+        ]),
+        { status: 200 }
+      )
+  );
+
+  assert.deepEqual(candidates.map((candidate) => candidate.id), [11]);
+});
+
+test("caption lyrics assist waits for search and separates assisted cache entries", () => {
+  assert.match(
+    background,
+    /const lyricsAssistedSegments = await addCaptionLyricsAssist\(tabId, message\.videoId, settings, message\.segments, true\)/
+  );
+  assert.match(
+    background,
+    /if \(waitForReady\) \{\s*await state\.ready;\s*\}/
+  );
+  assert.match(
+    background,
+    /const contextText = \[segment\.contextText, surroundingContext\]\.filter\(Boolean\)\.join\("\\n"\)/
+  );
+  assert.match(captionCache, /function segmentFingerprint\(segment: CaptionSegment\): string/);
+  assert.match(captionCache, /cacheKey\(context, segment\)/);
+  assert.match(
+    background,
+    /putCachedCaptionTranslations\(context, safeTranslations, batch\)/
+  );
+});
+
+test("lyrics assist reports search and application state to the current video", () => {
+  assert.match(background, /type: "LYRICS_ASSIST_STATUS"/);
+  assert.match(content, /message\.type === "LYRICS_ASSIST_STATUS"/);
+  assert.match(content, /lyricsAssistStatus = message\.statusText/);
 });
 
 test("lyrics search assist is configurable and restricted to its API host", () => {

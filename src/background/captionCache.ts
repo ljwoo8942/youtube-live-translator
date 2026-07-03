@@ -87,8 +87,18 @@ function cachePrefix(context: CaptionCacheContext): string {
   ].join("|");
 }
 
-function cacheKey(context: CaptionCacheContext, segmentId: string): string {
-  return `${cachePrefix(context)}|${segmentId}`;
+function segmentFingerprint(segment: CaptionSegment): string {
+  const value = [segment.text, segment.contextText ?? "", segment.detectedContentMode ?? ""].join("\u241e");
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function cacheKey(context: CaptionCacheContext, segment: CaptionSegment): string {
+  return `${cachePrefix(context)}|${segment.id}|${segmentFingerprint(segment)}`;
 }
 
 function txComplete(transaction: IDBTransaction): Promise<void> {
@@ -116,7 +126,7 @@ export async function getCachedCaptionTranslations(
   const complete = txComplete(transaction);
   const entries = await Promise.all(
     segments.map(async (segment) => {
-      const record = await requestResult<CaptionTranslationRecord | undefined>(store.get(cacheKey(context, segment.id)));
+      const record = await requestResult<CaptionTranslationRecord | undefined>(store.get(cacheKey(context, segment)));
       return record?.translatedText ? ([segment.id, record.translatedText] as const) : undefined;
     })
   );
@@ -126,7 +136,8 @@ export async function getCachedCaptionTranslations(
 
 export async function putCachedCaptionTranslations(
   context: CaptionCacheContext,
-  translations: CaptionTranslationEntry[]
+  translations: CaptionTranslationEntry[],
+  segments: CaptionSegment[]
 ): Promise<void> {
   if (translations.length === 0) {
     return;
@@ -137,10 +148,15 @@ export async function putCachedCaptionTranslations(
   const store = transaction.objectStore(STORE_NAME);
   const complete = txComplete(transaction);
   const updatedAt = Date.now();
+  const segmentsById = new Map(segments.map((segment) => [segment.id, segment]));
   for (const translation of translations) {
+    const segment = segmentsById.get(translation.id);
+    if (!segment) {
+      continue;
+    }
     const record: CaptionTranslationRecord = {
       ...context,
-      key: cacheKey(context, translation.id),
+      key: cacheKey(context, segment),
       segmentId: translation.id,
       translatedText: translation.translatedText,
       updatedAt

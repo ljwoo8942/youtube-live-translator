@@ -15,7 +15,7 @@ import {
 } from "./youtubeCaptions";
 const SETTINGS_KEY = "translatorSettings";
 const BLOCKED_HALLUCINATION_ERROR = "환각 의심 번역 결과를 차단했습니다.";
-const CONTENT_SCRIPT_VERSION = 25;
+const CONTENT_SCRIPT_VERSION = 26;
 const CONTENT_BOOTSTRAP_FLAG = "__yt_live_translator_content_bootstrapped__";
 const overlay = new TranslatorOverlay();
 const AUDIO_FALLBACK_INITIAL_WAIT_MS = 2200;
@@ -48,6 +48,7 @@ let pretranslateRequestKey = "";
 let pretranslateRetryBlockedUntil = 0;
 let currentUrl = location.href;
 let activeVideoId = "";
+let lyricsAssistStatus = "";
 let lastSentKey = "";
 let lastCaptionSeenAt = 0;
 let audioCaptureRequested = false;
@@ -242,6 +243,7 @@ function beginVideoSession(videoId: string): void {
   const previousVideoId = activeVideoId;
   void cancelPretranslation(videoId);
   activeVideoId = videoId;
+  lyricsAssistStatus = "";
   timedTextLoadToken += 1;
   timedTextLoading = false;
   timedTextLoadStartedAt = 0;
@@ -332,23 +334,29 @@ function contentModeStatusLabel(): string {
   }
 }
 
+function withLyricsAssistStatus(text: string): string {
+  return lyricsAssistStatus ? `${lyricsAssistStatus} · ${text}` : text;
+}
+
 function controlStatusText(): string {
   if (!settings.enabled) {
-    return "번역 꺼짐";
+    return withLyricsAssistStatus("번역 꺼짐");
   }
   const mode = contentModeStatusLabel();
   const turnMode = settings.speakerTurnDetection && settings.contentMode !== "lyrics" ? " · 발화 분리" : "";
   if (settings.inputMode === "captions") {
-    return `선택한 공식 자막만 사용 · ${mode}${turnMode}`;
+    return withLyricsAssistStatus(`선택한 공식 자막만 사용 · ${mode}${turnMode}`);
   }
   if (timedTextSegments.length > 0) {
-    return `선택한 공식 자막 ${timedTextTranslations.size}/${timedTextSegments.length} · ${mode}${turnMode}`;
+    return withLyricsAssistStatus(
+      `선택한 공식 자막 ${timedTextTranslations.size}/${timedTextSegments.length} · ${mode}${turnMode}`
+    );
   }
   if (audioCaptureRequested) {
     const sttMode = settings.streamingSttEnabled && settings.sttProvider === "whisper" ? "로컬 스트리밍 STT" : "음성 STT";
-    return `${sttMode} · ${mode}${turnMode}`;
+    return withLyricsAssistStatus(`${sttMode} · ${mode}${turnMode}`);
   }
-  return `음성 STT 대기 · ${mode}${turnMode}`;
+  return withLyricsAssistStatus(`음성 STT 대기 · ${mode}${turnMode}`);
 }
 
 function ensureOverlay(): void {
@@ -474,9 +482,11 @@ async function handleMiniControl(action: string): Promise<void> {
       });
       return;
     case "retry":
+      audioStopRequested = false;
+      audioCaptureSuppressed = false;
+      setAudioControlStatus("음성 STT 재시작 중");
       await chrome.runtime.sendMessage({ type: "RESET_AUDIO_CAPTURE_COOLDOWN" }).catch(() => undefined);
       audioStartBlockedUntil = 0;
-      audioCaptureSuppressed = false;
       await reconfigureAudioFallback(undefined, true);
       return;
     case "options":
@@ -1089,6 +1099,9 @@ function applySettingsUpdate(nextSettings: ContentSettings, revision?: number): 
     previousSettings.lyricsAssistEnabled !== nextSettings.lyricsAssistEnabled;
   const shouldReloadTimedText = shouldReloadTimedTextForSettingsChange(previousSettings, nextSettings);
   settings = nextSettings;
+  if (!settings.lyricsAssistEnabled || settings.contentMode === "spoken") {
+    lyricsAssistStatus = "";
+  }
   lastSentKey = "";
 
   if (!settings.enabled) {
@@ -1503,6 +1516,15 @@ function installObservers(): void {
           pretranslateRetryBlockedUntil = Date.now() + PRETRANSLATE_RETRY_COOLDOWN_MS;
         }
         overlay.showStatus(message.statusText, settings);
+      }
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (message.type === "LYRICS_ASSIST_STATUS") {
+      if (message.videoId === activeVideoId) {
+        lyricsAssistStatus = message.statusText;
+        overlay.setControlStatus(controlStatusText(), settings);
       }
       sendResponse({ ok: true });
       return;

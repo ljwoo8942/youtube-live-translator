@@ -458,6 +458,7 @@ function japaneseKoreanAccuracyGuidance(settings: TranslatorSettings, target: st
     "Treat 気付けば as 어느새 or 정신 차려 보니 when it marks an unplanned realization or passage of time. Never invent a causal action such as 마음을 열다 unless the source explicitly contains that action.",
     "가타카나 외래어에 확립된 한국어 대응어가 있으면 시적인 의역으로 바꾸지 말고 그 개념을 보존한다. 특히 テレパシー 또는 가사에서 장음을 줄인 テレパシ는 텔레파시이며, 전보·마음·예감으로 바꾸지 않는다. 예: 届いたテレパシ やっと会えた는 전해진 텔레파시, 드디어 만났어.",
     "가사에서 전부 가타카나로 적힌 구절도 외국어나 이름으로 추측하지 말고 일본어 형태소와 문맥으로 먼저 복원한다. 예: ヨルニニゲタダケ는 夜に逃げただけ이므로 그저 밤으로 도망쳤을 뿐이라는 뜻이며, 여름에 갔다로 옮기지 않는다.",
+    "노래 자막의 腫魔ったら은 발음이 같은 ハマったら을 잘못 인식한 경우이므로 빠지면 또는 빠져버리면으로 복원한다. 라틴 문자로 적힌 BAD는 별로인으로 풀지 않고 그대로 보존한다. 예: BADなダンス 腫魔ったらいいじゃん -> BAD한 댄스에 빠져버리면 되잖아.",
     "Example: 人が嫌いなあの子に気付けば子供ができた means 사람을 싫어하던 그 아이에게도 어느새 아이가 생겼다; do not add 마음을 열고."
   ].join(" ");
 }
