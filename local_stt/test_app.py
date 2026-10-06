@@ -5,6 +5,7 @@ from collections import deque
 from types import SimpleNamespace
 from unittest import mock
 
+import ctranslate2
 import numpy as np
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -25,7 +26,7 @@ class PlatformConfigurationTests(unittest.TestCase):
     def test_macos_uses_cpu_without_querying_cuda(self) -> None:
         with (
             mock.patch.object(app.sys, "platform", "darwin"),
-            mock.patch("ctranslate2.get_cuda_device_count") as cuda_count,
+            mock.patch.object(ctranslate2, "get_cuda_device_count") as cuda_count,
         ):
             self.assertEqual(app._default_device(), "cpu")
             self.assertEqual(app._candidate_cuda_dll_dirs(), [])
@@ -33,9 +34,9 @@ class PlatformConfigurationTests(unittest.TestCase):
 
     def test_cuda_is_used_only_when_available(self) -> None:
         with mock.patch.object(app.sys, "platform", "win32"):
-            with mock.patch("ctranslate2.get_cuda_device_count", return_value=1):
+            with mock.patch.object(ctranslate2, "get_cuda_device_count", return_value=1):
                 self.assertEqual(app._default_device(), "cuda")
-            with mock.patch("ctranslate2.get_cuda_device_count", return_value=0):
+            with mock.patch.object(ctranslate2, "get_cuda_device_count", return_value=0):
                 self.assertEqual(app._default_device(), "cpu")
 
 

@@ -19,7 +19,7 @@ import {
   normalizeSongCorrection
 } from "../src/shared/corrections.ts";
 
-const readSource = (path) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
+const readSource = (path) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8").replaceAll("\r\n", "\n");
 
 const content = readSource("src/content/index.ts");
 const youtubeCaptions = readSource("src/content/youtubeCaptions.ts");
