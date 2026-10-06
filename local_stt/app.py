@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import re
 import sys
 import tempfile
@@ -45,7 +46,7 @@ APP_NAME = "YouTube Live Translator Local STT"
 
 def _default_device() -> str:
     if sys.platform == "darwin":
-        return "cpu"
+        return "mlx" if platform.machine() == "arm64" else "cpu"
     from ctranslate2 import get_cuda_device_count
 
     return "cuda" if get_cuda_device_count() > 0 else "cpu"
@@ -54,7 +55,7 @@ def _default_device() -> str:
 DEFAULT_DEVICE = os.environ.get("YT_TRANSLATOR_STT_DEVICE") or _default_device()
 DEFAULT_COMPUTE_TYPE = os.environ.get(
     "YT_TRANSLATOR_STT_COMPUTE_TYPE",
-    "float16" if DEFAULT_DEVICE == "cuda" else "int8",
+    "float16" if DEFAULT_DEVICE in {"cuda", "mlx"} else "int8",
 )
 DEFAULT_BEAM_SIZE = int(os.environ.get("YT_TRANSLATOR_STT_BEAM_SIZE", "1"))
 DEFAULT_VAD = os.environ.get("YT_TRANSLATOR_STT_VAD", "1") not in {"0", "false", "False"}
@@ -258,6 +259,10 @@ def _cached_faster_whisper_models() -> list[str]:
 
 
 def _cached_models() -> list[str]:
+    if DEFAULT_DEVICE == "mlx":
+        from local_stt.mlx_backend import cached_models
+
+        return cached_models()
     return _cached_faster_whisper_models()
 
 
@@ -295,7 +300,7 @@ async def restrict_browser_origins(request: Request, call_next: Any) -> Any:
 _model_lock = threading.Lock()
 # ponytail: one inference worker bounds CPU/GPU work; use a queue if parallel throughput is needed.
 _inference_lock = threading.Lock()
-_model: WhisperModel | None = None
+_model: Any = None
 _model_name: str | None = None
 _model_error: str | None = None
 _model_error_name: str | None = None
@@ -307,12 +312,13 @@ def _server_config() -> dict[str, Any]:
     return {
         "model": DEFAULT_MODEL,
         "device": DEFAULT_DEVICE,
+        "backend": "mlx-whisper" if DEFAULT_DEVICE == "mlx" else "faster-whisper",
         "compute_type": DEFAULT_COMPUTE_TYPE,
-        "beam_size": DEFAULT_BEAM_SIZE,
-        "lyrics_beam_size": LYRICS_BEAM_SIZE,
-        "live_beam_size": LIVE_BEAM_SIZE,
-        "base_model_beam_size": BASE_MODEL_BEAM_SIZE,
-        "small_model_beam_size": SMALL_MODEL_BEAM_SIZE,
+        "beam_size": 1 if DEFAULT_DEVICE == "mlx" else DEFAULT_BEAM_SIZE,
+        "lyrics_beam_size": 1 if DEFAULT_DEVICE == "mlx" else LYRICS_BEAM_SIZE,
+        "live_beam_size": 1 if DEFAULT_DEVICE == "mlx" else LIVE_BEAM_SIZE,
+        "base_model_beam_size": 1 if DEFAULT_DEVICE == "mlx" else BASE_MODEL_BEAM_SIZE,
+        "small_model_beam_size": 1 if DEFAULT_DEVICE == "mlx" else SMALL_MODEL_BEAM_SIZE,
         "temperature": DECODE_TEMPERATURE,
         "vad_filter": DEFAULT_VAD,
         "empty_retry_no_vad": EMPTY_RETRY_NO_VAD,
@@ -363,6 +369,8 @@ def _health_hint(error: str | None, model_name: str | None = None) -> str | None
 
     if "cuda" in lowered or "cudnn" in lowered or "cublas" in lowered:
         return "CUDA/cuDNN/CTranslate2 런타임을 확인하세요. GPU 런타임 DLL 경로가 PATH에 있어야 합니다."
+    if DEFAULT_DEVICE == "mlx" and ("mlx" in lowered or "metal" in lowered):
+        return "macOS 14 이상과 Apple Silicon용 Python이 필요합니다. npm run stt:setup으로 MLX를 설치하세요. CPU로 실행하려면 YT_TRANSLATOR_STT_DEVICE=cpu를 지정하세요."
 
     return None
 
@@ -407,6 +415,8 @@ def _is_compact_model(model_name: str | None) -> bool:
 
 
 def _beam_size_for_mode(content_mode: str | None, model_name: str | None = None) -> int:
+    if DEFAULT_DEVICE == "mlx":
+        return 1
     if _is_lyrics_mode(content_mode):
         beam_size = max(DEFAULT_BEAM_SIZE, LYRICS_BEAM_SIZE)
     elif _is_live_mode(content_mode):
@@ -560,7 +570,7 @@ def _prepare_audio_for_mode(audio: Any, content_mode: str | None) -> Any:
     return np.clip(normalized, -1.0, 1.0).astype(np.float32)
 
 
-def _load_model(model: str | None = None) -> WhisperModel:
+def _load_model(model: str | None = None) -> Any:
     global _model, _model_name, _model_error, _model_error_name, _runtime_checked_model, _runtime_error
 
     target_model = _requested_model_name(model)
@@ -569,13 +579,18 @@ def _load_model(model: str | None = None) -> WhisperModel:
             return _model
 
         try:
-            from faster_whisper import WhisperModel
+            if DEFAULT_DEVICE == "mlx":
+                from local_stt.mlx_backend import MlxWhisperModel
 
-            loaded_model = WhisperModel(
-                target_model,
-                device=DEFAULT_DEVICE,
-                compute_type=DEFAULT_COMPUTE_TYPE,
-            )
+                loaded_model = MlxWhisperModel(target_model, compute_type=DEFAULT_COMPUTE_TYPE)
+            else:
+                from faster_whisper import WhisperModel
+
+                loaded_model = WhisperModel(
+                    target_model,
+                    device=DEFAULT_DEVICE,
+                    compute_type=DEFAULT_COMPUTE_TYPE,
+                )
             _model = loaded_model
             _model_name = target_model
             _model_error = None
@@ -586,7 +601,7 @@ def _load_model(model: str | None = None) -> WhisperModel:
         except Exception as exc:  # noqa: BLE001 - expose startup failures in /health.
             _model_error = str(exc)
             _model_error_name = target_model
-            print(f"faster-whisper model load failed for {target_model}: {exc}", file=sys.stderr, flush=True)
+            print(f"local STT model load failed for {target_model}: {exc}", file=sys.stderr, flush=True)
             raise
 
 
@@ -602,7 +617,7 @@ def _write_probe_wav(path: Path) -> None:
         wav_file.writeframes(frames)
 
 
-def _probe_runtime(model: WhisperModel, model_name: str) -> None:
+def _probe_runtime(model: Any, model_name: str) -> None:
     global _runtime_checked_model, _runtime_error
 
     if _runtime_checked_model == model_name:
@@ -619,7 +634,7 @@ def _probe_runtime(model: WhisperModel, model_name: str) -> None:
             segments, _ = model.transcribe(
                 str(temp_path),
                 beam_size=DEFAULT_BEAM_SIZE,
-                vad_filter=DEFAULT_VAD,
+                vad_filter=False if DEFAULT_DEVICE == "mlx" else DEFAULT_VAD,
                 condition_on_previous_text=False,
             )
             list(segments)
@@ -885,7 +900,7 @@ def _empty_transcription_response(
 
 
 def _transcribe_audio(
-    whisper_model: WhisperModel,
+    whisper_model: Any,
     audio: Any,
     language: str | None,
     vad_filter: bool,
@@ -916,7 +931,7 @@ def _transcribe_audio(
 
 
 def _transcribe_live_lyrics_fallback(
-    whisper_model: WhisperModel,
+    whisper_model: Any,
     audio: Any,
     language: str | None,
     preserve_turns: bool = False,
@@ -942,7 +957,7 @@ def _transcribe_live_lyrics_fallback(
 
 
 def _stream_transcribe_text(
-    whisper_model: WhisperModel,
+    whisper_model: Any,
     audio: Any,
     language: str | None,
     content_mode: str | None,
@@ -1026,7 +1041,7 @@ def models() -> dict[str, Any]:
             {
                 "id": model_id,
                 "object": "model",
-                "owned_by": "local-faster-whisper",
+                "owned_by": "local-mlx-whisper" if DEFAULT_DEVICE == "mlx" else "local-faster-whisper",
             }
             for model_id in model_ids
         ],
@@ -1059,7 +1074,7 @@ async def transcriptions(
         whisper_model = _load_model(requested_model)
     except Exception as exc:  # noqa: BLE001
         hint = _health_hint(str(exc), requested_model)
-        detail = f"faster-whisper model '{requested_model}' is not ready: {exc}"
+        detail = f"local STT model '{requested_model}' is not ready: {exc}"
         if hint:
             detail = f"{detail} {hint}"
         raise HTTPException(status_code=503, detail=detail) from exc
@@ -1133,8 +1148,8 @@ async def transcriptions(
                 text = ""
                 segment_list = []
         except Exception as exc:  # noqa: BLE001
-            print(f"faster-whisper transcription failed: {exc}", file=sys.stderr, flush=True)
-            raise HTTPException(status_code=503, detail=f"faster-whisper transcription failed: {exc}") from exc
+            print(f"local STT transcription failed: {exc}", file=sys.stderr, flush=True)
+            raise HTTPException(status_code=503, detail=f"local STT transcription failed: {exc}") from exc
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -1192,7 +1207,7 @@ async def audio_stream(websocket: WebSocket) -> None:
         whisper_model = _load_model(requested_model)
     except Exception as exc:  # noqa: BLE001
         hint = _health_hint(str(exc), requested_model)
-        await websocket.send_json({"type": "error", "text": f"faster-whisper model '{requested_model}' is not ready: {exc} {hint or ''}".strip()})
+        await websocket.send_json({"type": "error", "text": f"local STT model '{requested_model}' is not ready: {exc} {hint or ''}".strip()})
         await websocket.close(code=1011)
         return
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from collections import deque
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -11,6 +12,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from local_stt import app
+from local_stt.mlx_backend import MlxWhisperModel
 
 
 class FakeWhisperModel:
@@ -23,14 +25,22 @@ class FakeWhisperModel:
 
 
 class PlatformConfigurationTests(unittest.TestCase):
-    def test_macos_uses_cpu_without_querying_cuda(self) -> None:
+    def test_apple_silicon_uses_mlx_without_querying_cuda(self) -> None:
         with (
             mock.patch.object(app.sys, "platform", "darwin"),
+            mock.patch.object(app.platform, "machine", return_value="arm64"),
             mock.patch.object(ctranslate2, "get_cuda_device_count") as cuda_count,
         ):
-            self.assertEqual(app._default_device(), "cpu")
+            self.assertEqual(app._default_device(), "mlx")
             self.assertEqual(app._candidate_cuda_dll_dirs(), [])
         cuda_count.assert_not_called()
+
+    def test_intel_macos_uses_cpu(self) -> None:
+        with (
+            mock.patch.object(app.sys, "platform", "darwin"),
+            mock.patch.object(app.platform, "machine", return_value="x86_64"),
+        ):
+            self.assertEqual(app._default_device(), "cpu")
 
     def test_cuda_is_used_only_when_available(self) -> None:
         with mock.patch.object(app.sys, "platform", "win32"):
@@ -41,6 +51,11 @@ class PlatformConfigurationTests(unittest.TestCase):
 
 
 class ModeConfigurationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        device = mock.patch.object(app, "DEFAULT_DEVICE", "cpu")
+        device.start()
+        self.addCleanup(device.stop)
+
     def test_browser_origins_are_limited_to_chrome_extensions(self) -> None:
         self.assertFalse(app._allowed_browser_origin(None))
         self.assertTrue(app._allowed_browser_origin("chrome-extension://abcdefghijklmnopabcdefghijklmnop"))
@@ -315,6 +330,116 @@ class ModeConfigurationTests(unittest.TestCase):
         )
 
         self.assertFalse(app._is_low_confidence_segment(segment, "lyrics", "medium"))
+
+
+class MlxBackendTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.transcribe = mock.Mock(return_value={
+            "language": "ja",
+            "segments": [{
+                "start": 0.0, "end": 1.0, "text": "青い風の中で",
+                "no_speech_prob": 0.1, "avg_logprob": -0.2, "compression_ratio": 1.0,
+            }],
+        })
+        self.mx = SimpleNamespace(
+            metal=SimpleNamespace(is_available=mock.Mock(return_value=True)),
+            gpu="gpu",
+            stream=mock.Mock(side_effect=lambda device: nullcontext()),
+            synchronize=mock.Mock(),
+        )
+        modules = mock.patch.dict(app.sys.modules, {
+            "mlx": SimpleNamespace(core=self.mx),
+            "mlx.core": self.mx,
+            "mlx_whisper": SimpleNamespace(transcribe=self.transcribe),
+        })
+        modules.start()
+        self.addCleanup(modules.stop)
+        self.model = MlxWhisperModel("small")
+
+    def test_gpu_result_preserves_timing_language_and_confidence(self) -> None:
+        segments, info = self.model.transcribe(np.zeros(32000, dtype=np.float32), language="ja", beam_size=5)
+        self.assertEqual(info.language, "ja")
+        self.assertEqual(info.duration, 2.0)
+        self.assertEqual(segments[0].text, "青い風の中で")
+        self.assertEqual(segments[0].avg_logprob, -0.2)
+        self.assertEqual(segments[0].end, 1.0)
+        options = self.transcribe.call_args.kwargs
+        self.assertEqual(options["path_or_hf_repo"], "mlx-community/whisper-small-mlx")
+        self.assertTrue(options["fp16"])
+        self.assertNotIn("beam_size", options)
+        self.mx.stream.assert_called_once_with(self.mx.gpu)
+        self.mx.synchronize.assert_called_once()
+
+    def test_vad_keeps_original_audio_timestamps(self) -> None:
+        with mock.patch("faster_whisper.vad.get_speech_timestamps", return_value=[{"start": 16000, "end": 24000}]):
+            self.model.transcribe(np.zeros(32000, dtype=np.float32), vad_filter=True)
+        self.assertEqual(self.transcribe.call_args.kwargs["clip_timestamps"], [1.0, 1.5])
+
+    def test_vad_silence_does_not_trigger_gpu_decoding(self) -> None:
+        with mock.patch("faster_whisper.vad.get_speech_timestamps", return_value=[]):
+            segments, info = self.model.transcribe(np.zeros(32000, dtype=np.float32), vad_filter=True)
+        self.assertEqual(segments, [])
+        self.assertEqual(info.duration, 2.0)
+        self.transcribe.assert_not_called()
+
+    def test_missing_metal_is_not_reported_as_gpu_success(self) -> None:
+        self.mx.metal.is_available.return_value = False
+        with self.assertRaisesRegex(RuntimeError, "Metal GPU is unavailable"):
+            MlxWhisperModel("small")
+
+    def test_cpu_precision_is_rejected_for_mlx(self) -> None:
+        with self.assertRaisesRegex(ValueError, "float16 or float32"):
+            MlxWhisperModel("small", compute_type="int8")
+
+    def test_mlx_factory_and_health_probe_use_the_shared_pipeline(self) -> None:
+        with (
+            mock.patch.object(app, "DEFAULT_DEVICE", "mlx"),
+            mock.patch.object(app, "DEFAULT_COMPUTE_TYPE", "float16"),
+            mock.patch.object(app, "_model", None),
+            mock.patch.object(app, "_model_name", None),
+            mock.patch.object(app, "_runtime_checked_model", None),
+            mock.patch.object(app, "_runtime_error", None),
+        ):
+            model = app._load_model("small")
+            self.assertIsInstance(model, MlxWhisperModel)
+            app._probe_runtime(model, "small")
+            self.assertEqual(app._beam_size_for_mode("lyrics", "small"), 1)
+            self.assertEqual(app._server_config()["backend"], "mlx-whisper")
+        self.transcribe.assert_called_once()
+
+    def test_http_uses_mlx_without_changing_the_response_contract(self) -> None:
+        with (
+            mock.patch.object(app, "DEFAULT_DEVICE", "mlx"),
+            mock.patch.object(app, "DEFAULT_VAD", False),
+            mock.patch.object(app, "_load_model", return_value=self.model),
+            mock.patch("faster_whisper.audio.decode_audio", return_value=np.full(32000, 0.1, dtype=np.float32)),
+        ):
+            response = TestClient(app.app).post(
+                "/v1/audio/transcriptions",
+                files={"file": ("audio.wav", b"audio", "audio/wav")},
+                data={"language": "ja"},
+                headers={"Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["text"], "青い風の中で")
+        self.assertEqual(response.json()["language"], "ja")
+        self.assertEqual(response.json()["beam_size_used"], 1)
+
+    def test_websocket_uses_mlx_for_streaming_transcripts(self) -> None:
+        with (
+            mock.patch.object(app, "DEFAULT_DEVICE", "mlx"),
+            mock.patch.object(app, "DEFAULT_VAD", False),
+            mock.patch.object(app, "_load_model", return_value=self.model),
+            TestClient(app.app).websocket_connect(
+                "/v1/audio/stream?language=ja",
+                headers={"Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop"},
+            ) as websocket,
+        ):
+            websocket.send_bytes(np.full(32000, 6000, dtype="<i2").tobytes())
+            message = websocket.receive_json()
+            self.assertEqual(message["type"], "partial")
+            self.assertEqual(message["text"], "青い風の中で")
+            self.assertEqual(message["beam_size_used"], 1)
 
 
 class StreamBufferTests(unittest.TestCase):

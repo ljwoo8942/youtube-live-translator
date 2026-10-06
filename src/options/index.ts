@@ -505,7 +505,7 @@ function render(): void {
       <section class="hero-tile">
         <p class="eyebrow">Recommended Flow</p>
         <h1>로컬 STT + 번역 API</h1>
-        <p class="muted">faster-whisper로 음성을 인식하고 AI API로 번역합니다.</p>
+        <p class="muted">로컬 Whisper로 음성을 인식하고 AI API로 번역합니다. Apple Silicon은 MLX GPU를 사용합니다.</p>
         <div class="hero-actions">
           <button id="heroLocalPreset" class="primary" type="button">로컬 STT 프리셋</button>
           <button id="heroLivePreset" type="button">라이브 STT 프리셋</button>
@@ -524,7 +524,7 @@ function render(): void {
         <div class="flow-step">
           <span class="flow-index">2</span>
           <strong>로컬 STT</strong>
-          <span>faster-whisper small</span>
+          <span>Whisper small · GPU/CPU</span>
         </div>
         <div class="flow-step">
           <span class="flow-index">3</span>
@@ -852,7 +852,7 @@ function render(): void {
           <div class="summary-grid">
             <div>
               <span>STT</span>
-              <strong>faster-whisper 선택 모델</strong>
+              <strong>Whisper 선택 모델</strong>
             </div>
             <div>
               <span>번역</span>
@@ -866,10 +866,10 @@ function render(): void {
           <div class="actions">
             <button id="localGpuPreset" type="button">로컬 STT + 번역 API 프리셋</button>
             <button id="liveSttPreset" type="button">라이브 STT 프리셋</button>
-            <button id="fasterWhisperProbe" type="button">faster-whisper 연결 확인</button>
+            <button id="fasterWhisperProbe" type="button">로컬 STT 연결 확인</button>
             <button id="localPipelineTest" type="button">STT + 번역 API 전체 테스트</button>
           </div>
-          <span class="hint">기본 STT 모델은 small입니다. Mac은 CPU/int8, NVIDIA GPU가 있는 Windows·Linux는 CUDA를 사용합니다. CPU에서 느리면 base를 선택하고, 인식률이 부족하면 medium을 테스트하세요. 먼저 faster-whisper 연결 확인으로 서버 모델을 적용하세요. 테스트 전 ${LOCAL_STT_START_HINT}</span>
+          <span class="hint">기본 STT 모델은 small입니다. M 시리즈 Mac은 MLX GPU, Intel Mac은 CPU/int8, NVIDIA GPU가 있는 Windows·Linux는 CUDA를 사용합니다. CPU에서 느리면 base를 선택하고, 인식률이 부족하면 medium을 테스트하세요. 먼저 로컬 STT 연결 확인으로 서버 모델을 적용하세요. 테스트 전 ${LOCAL_STT_START_HINT}</span>
         </section>
 
         <section class="section full">
@@ -1114,26 +1114,26 @@ async function probeFasterWhisper(): Promise<void> {
   const baseUrl = normalizeOpenAiBaseUrl(inputValue("whisperBaseUrl", DEFAULT_SETTINGS.whisper.baseUrl));
   setInput("whisperBaseUrl", baseUrl);
   const healthUrl = joinUrl(baseUrl.replace(/\/v1\/?$/, ""), "/health");
-  setStatus("faster-whisper 서버를 확인하는 중입니다...");
+  setStatus("로컬 STT 서버를 확인하는 중입니다...");
 
   const [healthResult, modelsResult] = await Promise.all([
-    fetchText(healthUrl, undefined, "faster-whisper STT 서버", LOCAL_STT_START_HINT),
-    fetchText(joinUrl(baseUrl, "/models"), undefined, "faster-whisper STT 서버", LOCAL_STT_START_HINT)
+    fetchText(healthUrl, undefined, "로컬 STT 서버", LOCAL_STT_START_HINT),
+    fetchText(joinUrl(baseUrl, "/models"), undefined, "로컬 STT 서버", LOCAL_STT_START_HINT)
   ]);
   const { response: healthResponse, text: healthText } = healthResult;
   const { response: modelsResponse, text: modelsText } = modelsResult;
 
   if (!healthResponse.ok) {
-    throw new Error(`faster-whisper health 실패: HTTP ${healthResponse.status} ${healthText.slice(0, 180)}`);
+    throw new Error(`로컬 STT health 실패: HTTP ${healthResponse.status} ${healthText.slice(0, 180)}`);
   }
   if (!modelsResponse.ok) {
-    throw new Error(`faster-whisper models 실패: HTTP ${modelsResponse.status} ${modelsText.slice(0, 180)}`);
+    throw new Error(`로컬 STT models 실패: HTTP ${modelsResponse.status} ${modelsText.slice(0, 180)}`);
   }
 
   const health = healthText ? JSON.parse(healthText) : {};
   const models = modelsText ? JSON.parse(modelsText) : {};
   if (health.ok === false) {
-    throw new Error(`faster-whisper 준비 실패: ${formatLocalSttHealthStatus(health)}`);
+    throw new Error(`로컬 STT 준비 실패: ${formatLocalSttHealthStatus(health)}`);
   }
 
   const modelIds = Array.isArray(models.data)
@@ -1158,8 +1158,8 @@ async function probeFasterWhisper(): Promise<void> {
   setInput("sttProvider", "whisper");
   setStatus(
     health.ok
-      ? `faster-whisper 연결 성공: ${modelId}, ${health.device ?? "device?"}/${health.compute_type ?? "compute?"}`
-      : `faster-whisper 응답 오류: ${health.error ?? "상태를 확인하세요."}`
+      ? `로컬 STT 연결 성공: ${modelId}, ${health.backend ?? "Whisper"}, ${health.device ?? "device?"}/${health.compute_type ?? "compute?"}`
+      : `로컬 STT 응답 오류: ${health.error ?? "상태를 확인하세요."}`
   );
 }
 
@@ -1219,7 +1219,7 @@ async function testLocalPipeline(): Promise<void> {
       method: "POST",
       body: form
     },
-    "faster-whisper STT 서버",
+    "로컬 STT 서버",
     LOCAL_STT_START_HINT
   );
   if (!sttResponse.ok) {

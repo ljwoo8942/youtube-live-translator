@@ -1,4 +1,4 @@
-# Local faster-whisper STT server
+# Local Whisper STT server (MLX and faster-whisper)
 
 OpenAI-compatible speech-to-text server for the YouTube Live Translator extension on Windows and macOS (Apple Silicon and Intel).
 
@@ -32,19 +32,25 @@ If you want the older detached background launcher, run:
 npm run stt:daemon
 ```
 
-The first `/health` request loads the faster-whisper model. The default model is `small`. Transcription requests can also pass a `model` form field, so choosing another model in the extension loads it when it is cached locally. Run once with internet access so faster-whisper can download the model you want, or set `YT_TRANSLATOR_STT_MODEL` to a local model directory.
+The first `/health` request loads and probes the selected engine's model. The default model is `small`. Transcription requests can also pass a `model` form field, so choosing another model in the extension loads it when it is cached locally. Set `YT_TRANSLATOR_STT_MODEL` before starting the server to prepare a new model or select a local model directory.
 
-Device selection is automatic: macOS uses CPU, while Windows/Linux uses CUDA when an NVIDIA GPU is available and CPU otherwise. Environment overrides remain available.
+Device selection is automatic: native Apple Silicon macOS uses MLX Metal GPU, Intel macOS uses CPU, and Windows/Linux uses CUDA when an NVIDIA GPU is available and CPU otherwise. Environment overrides remain available.
 
 - model: `small`
-- device: `cpu` on macOS; `cuda` when available on Windows/Linux
-- compute type: `int8` on CPU, `float16` on CUDA
+- device: `mlx` on Apple Silicon; `cpu` on Intel Mac; `cuda` when available on Windows/Linux
+- compute type: `float16` on MLX/CUDA, `int8` on CPU
 - beam size: `1`
 - VAD: enabled
 - stream window: `6s`
 - stream decode interval: `1.1s`
 
-The [CTranslate2 backend](https://opennmt.net/CTranslate2/hardware_support.html) supports macOS CPUs, not Apple's MPS/Metal GPU. For a slower Mac, try `YT_TRANSLATOR_STT_MODEL=base npm run stt:start`, then use the extension's connection check to adopt the server model. A virtual environment from Windows cannot be copied to macOS; recreate it with `npm run stt:setup`.
+Apple Silicon GPU acceleration uses [MLX Whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper), installed only on Darwin/arm64. It requires macOS 14+ and native arm64 Python. After updating an existing checkout, rerun `npm run stt:setup` and restart the server. `npm run stt:health` must report `backend=mlx-whisper`, `device=mlx`, `compute_type=float16`, and `ok=true`; the health probe executes short GPU inference with VAD disabled rather than checking model loading alone.
+
+MLX model aliases (`tiny`, `base`, `small`, `medium`, `large-v3`, `large-v3-turbo`) resolve to verified `mlx-community` repositories. MLX and faster-whisper weights are different; only models cached for the selected engine appear in the model list. A configured local directory must contain weights for that engine.
+
+MLX Whisper 0.4.3 uses greedy decoding, so effective beam size is reported as 1. VAD uses the existing Silero detector and forwards original audio clip timestamps; confidence scores, hallucination filters, and the HTTP/WebSocket contracts remain shared. Automatic language detection runs once per rolling window.
+
+To select MLX explicitly, use `YT_TRANSLATOR_STT_DEVICE=mlx npm run stt:start`. For CPU, use `YT_TRANSLATOR_STT_DEVICE=cpu YT_TRANSLATOR_STT_COMPUTE_TYPE=int8 npm run stt:start`. For a slower machine, try `YT_TRANSLATOR_STT_MODEL=base npm run stt:start`, then use the extension's connection check to adopt the server model. Recreate copied virtual environments with `npm run stt:setup` on the target OS.
 
 When the extension sends `content_mode=lyrics`, the server switches to a song-friendly profile:
 

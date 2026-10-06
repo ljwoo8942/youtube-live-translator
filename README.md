@@ -2,7 +2,7 @@
 
 YouTube 실시간 방송과 녹화 영상 위에 번역 자막을 표시하는 Manifest V3 Chrome 확장 프로그램입니다.
 
-제작자가 제공한 YouTube 공식 자막을 먼저 사용하고, 자막이 없을 때만 탭 오디오 STT로 전환합니다. 번역은 OpenAI 호환 AI API, LM Studio 또는 Ollama로 처리할 수 있으며, 포함된 faster-whisper 서버로 Windows와 macOS에서 로컬 STT도 사용할 수 있습니다.
+제작자가 제공한 YouTube 공식 자막을 먼저 사용하고, 자막이 없을 때만 탭 오디오 STT로 전환합니다. 번역은 OpenAI 호환 AI API, LM Studio 또는 Ollama로 처리할 수 있으며, 로컬 STT는 Apple Silicon Mac의 MLX GPU와 Windows·Linux의 faster-whisper CUDA/CPU를 지원합니다.
 
 > API 키는 확장 프로그램 설정 화면에서 입력하며 `chrome.storage.local`에만 저장됩니다. API 키는 이 저장소나 빌드된 확장 프로그램 소스에 포함되지 않습니다.
 
@@ -48,22 +48,26 @@ npm run stt:setup
 npm run stt:start
 ```
 
-위 터미널은 열어 두고, Chrome에 `dist` 폴더를 로드하세요. 옵션 페이지에서 AI 번역 API 키를 입력한 뒤 `faster-whisper 연결 확인`과 `STT + 번역 API 전체 테스트`를 실행합니다. 새 터미널에서 `npm run stt:health`로 서버 상태를 확인할 수도 있습니다.
+위 터미널은 열어 두고, Chrome에 `dist` 폴더를 로드하세요. 옵션 페이지에서 AI 번역 API 키를 입력한 뒤 `로컬 STT 연결 확인`과 `STT + 번역 API 전체 테스트`를 실행합니다. 새 터미널에서 `npm run stt:health`로 서버 상태를 확인할 수도 있습니다.
 
-Mac에서는 STT가 CPU/int8로 실행됩니다. 현재 [CTranslate2 실행 엔진](https://opennmt.net/CTranslate2/hardware_support.html)은 Apple GPU의 MPS/Metal 실행을 지원하지 않습니다. 인식이 느리면 서버 시작 전에 `YT_TRANSLATOR_STT_MODEL=base npm run stt:start`로 더 작은 모델을 선택하고, 옵션 페이지의 `faster-whisper 연결 확인`으로 서버 모델을 적용하세요. API STT로 전환하는 것도 가능합니다. LM Studio/Ollama 번역은 별도로 선택할 수 있습니다.
+M 시리즈 Mac에서는 [MLX Whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper)가 Metal GPU를 사용하도록 자동 선택됩니다. macOS 14 이상과 Apple Silicon용 arm64 Python이 필요하며, `npm run stt:setup`이 해당 Mac에서만 MLX를 설치합니다. Intel Mac 또는 Rosetta의 x86_64 Python에서는 faster-whisper CPU/int8을 사용합니다. LM Studio/Ollama 번역은 별도로 선택할 수 있습니다.
+
+이미 설치한 Mac은 `git pull`, `npm run stt:setup`을 실행하고 기존 STT 서버를 종료한 뒤 다시 시작하세요. 최초 인식 또는 상태 확인 시 MLX 형식의 모델을 내려받습니다. `npm run stt:health` 응답의 `backend`가 `mlx-whisper`, `device`가 `mlx`, `compute_type`이 `float16`, `ok`가 `true`이면 실제 GPU 초기화와 짧은 추론 검사를 통과한 것입니다.
+
+직접 지정하려면 `YT_TRANSLATOR_STT_DEVICE=mlx npm run stt:start`를 사용하세요. CPU로 실행할 때는 `YT_TRANSLATOR_STT_DEVICE=cpu YT_TRANSLATOR_STT_COMPUTE_TYPE=int8 npm run stt:start`를 사용합니다. 모델을 바꾸려면 서버 시작 전에 `YT_TRANSLATOR_STT_MODEL=base` 등으로 지정하고 옵션 페이지의 `로컬 STT 연결 확인`으로 서버 모델을 적용하세요.
 
 가상환경 `.venv-stt`는 운영체제와 CPU 구조에 종속됩니다. Windows 가상환경을 Mac으로 복사하지 말고 Mac에서 `npm run stt:setup`을 실행하세요. 설정·곡 교정 사전은 각 Chrome 프로필에 저장되므로, 곡 교정 사전은 JSON 내보내기/가져오기로 옮길 수 있습니다.
 
 ## 로컬 AI 기본값
 
 - Ollama: `http://localhost:11434`
-- faster-whisper 로컬 STT: `http://127.0.0.1:8765/v1/audio/transcriptions`
-- faster-whisper 스트리밍 STT: `ws://127.0.0.1:8765/v1/audio/stream`
+- 로컬 Whisper STT: `http://127.0.0.1:8765/v1/audio/transcriptions`
+- 로컬 Whisper 스트리밍 STT: `ws://127.0.0.1:8765/v1/audio/stream`
 - LM Studio: 로컬 LLM 번역을 선택한 경우 `http://127.0.0.1:1234/v1`
 
 확장 프로그램의 옵션 페이지에서 제공자를 선택하고, API 키와 언어 코드를 입력하며, 자막 오버레이를 조절할 수 있습니다.
 
-기본 권장 조합은 로컬 faster-whisper STT와 AI 번역 API입니다. 텍스트 번역 제공자로 LM Studio를 직접 선택한 경우에만 `LM Studio 연결 확인`을 사용하세요.
+기본 권장 조합은 로컬 Whisper STT와 AI 번역 API입니다. 텍스트 번역 제공자로 LM Studio를 직접 선택한 경우에만 `LM Studio 연결 확인`을 사용하세요.
 
 `Gemma4-E4B-Instruct-Pure-GGUF` 기준의 모델 Load, Inference, Local Server, 확장 프로그램 연결 값은 [LM Studio 설정 값](docs/lm-studio-settings.md)에서 확인할 수 있습니다.
 
@@ -125,7 +129,7 @@ API STT 기본값:
 
 ## 로컬 STT + 번역 API
 
-이 프로젝트에는 자막이 없을 때 사용할 수 있는 OpenAI 호환 및 WebSocket faster-whisper STT 서버가 포함돼 있습니다.
+이 프로젝트에는 자막이 없을 때 사용할 수 있는 OpenAI 호환 및 WebSocket STT 서버가 포함돼 있습니다. MLX와 faster-whisper가 같은 오디오 처리·음성 감지·자막 필터를 사용합니다.
 
 `uv`로 Python 3.11 가상환경을 설정합니다.
 
@@ -147,18 +151,18 @@ YouTube 번역을 사용하는 동안 이 터미널을 열어 두세요. `stt:st
 npm run stt:health
 ```
 
-서버는 Mac에서 CPU를 사용하고, Windows·Linux에서는 사용 가능한 NVIDIA GPU가 있으면 CUDA를 선택합니다. `YT_TRANSLATOR_STT_DEVICE`와 `YT_TRANSLATOR_STT_COMPUTE_TYPE`으로 직접 지정할 수도 있습니다.
+서버는 M 시리즈 Mac에서 MLX GPU, Intel Mac에서 CPU를 사용하고, Windows·Linux에서는 사용 가능한 NVIDIA GPU가 있으면 CUDA를 선택합니다. `YT_TRANSLATOR_STT_DEVICE`와 `YT_TRANSLATOR_STT_COMPUTE_TYPE`으로 직접 지정할 수도 있습니다.
 
 - 모델: `small`
-- 장치: Mac 및 GPU 없는 환경은 `cpu`, NVIDIA GPU가 있으면 `cuda`
-- 연산 형식: CUDA는 `float16`, CPU는 `int8`
+- 장치: Apple Silicon은 `mlx`, Intel Mac 및 GPU 없는 환경은 `cpu`, NVIDIA GPU가 있으면 `cuda`
+- 연산 형식: MLX와 CUDA는 `float16`, CPU는 `int8`
 - 스트리밍 엔드포인트: `ws://127.0.0.1:8765/v1/audio/stream`
 - HTTP 대체 청크: `8000ms`
 - 엔드포인트: `http://127.0.0.1:8765/v1/audio/transcriptions`
 
 옵션 페이지에서 로컬 STT 모델을 선택할 수 있습니다. 기본값인 `small`은 속도와 안정성의 균형을 목표로 합니다. 더 가볍게 테스트하려면 `base`, 끊김이 없고 인식률이 부족하면 `medium`을 선택하고 저장한 뒤 `STT + 번역 API 전체 테스트`를 실행하세요.
 
-로컬 STT 서버의 기본 모델도 `small`입니다. 요청된 모델을 동적으로 불러올 수 있으므로 옵션 페이지에서 `base`, `small`, `medium`을 선택하면 해당 faster-whisper 모델이 로컬에서 사용 가능한 경우 자동으로 적용됩니다.
+로컬 STT 서버의 기본 모델도 `small`입니다. 요청된 모델을 동적으로 불러올 수 있으므로 옵션 페이지에서 `base`, `small`, `medium`을 선택하면 선택된 엔진 형식의 모델이 로컬 캐시에 있는 경우 적용됩니다. MLX는 `mlx-community`의 변환된 모델을 사용하며 faster-whisper의 모델 파일과 캐시가 별도입니다. 사용자 모델 경로는 `YT_TRANSLATOR_STT_MODEL`로 지정하세요.
 
 노래에는 `노래 STT 프리셋`을 사용하거나 `콘텐츠 모드`를 `노래/가사`로 설정하세요. 확장 프로그램이 로컬 STT 서버에 `content_mode=lyrics`를 전송하면 VAD를 비활성화하고, 인식 창과 beam size를 늘려 가창 음성 인식을 개선합니다. CPU에서는 medium보다 base/small부터 테스트하세요. 서버에서 아직 준비하지 않은 모델을 쓰려면 `YT_TRANSLATOR_STT_MODEL`로 지정한 뒤 서버를 재시작하세요.
 
@@ -166,7 +170,7 @@ npm run stt:health
 
 - `AI API` 키 입력
 - `로컬 STT + 번역 API 프리셋` 클릭
-- `faster-whisper 연결 확인` 클릭
+- `로컬 STT 연결 확인` 클릭
 - `STT + 번역 API 전체 테스트`로 로컬 STT와 AI API 번역을 함께 확인
 
 로컬 프리셋은 `로컬 STT WebSocket 스트리밍 사용`을 활성화합니다. WebSocket 스트림에 실패하면 확장 프로그램은 기존 HTTP 전사 청크 방식으로 자동 전환하고, 설정된 경우 API STT로 한 번 더 대체합니다.
@@ -175,7 +179,7 @@ npm run stt:health
 
 `/health`가 CUDA 오류를 보고하면 faster-whisper/CTranslate2에 필요한 NVIDIA CUDA/cuDNN 런타임을 설치한 뒤 `npm run stt:start`를 다시 실행하세요.
 
-`/health`가 모델 파일을 로컬에서 찾을 수 없고 Hub에서 다운로드할 수 없다고 표시하면, 일반 네트워크 환경의 터미널에서 `npm run stt:start`를 한 번 실행해 선택한 모델을 캐시하세요. 또는 `YT_TRANSLATOR_STT_MODEL`에 로컬 faster-whisper 모델 디렉터리를 설정할 수 있습니다.
+`/health`가 모델 파일을 로컬에서 찾을 수 없고 Hub에서 다운로드할 수 없다고 표시하면, 인터넷에 연결된 상태에서 서버를 시작하고 `npm run stt:health`로 모델을 준비하세요. 또는 `YT_TRANSLATOR_STT_MODEL`에 현재 엔진에 맞는 로컬 모델 디렉터리를 설정할 수 있습니다.
 
 ## Mindlogic Gateway
 
@@ -192,7 +196,8 @@ npm run stt:health
 ## 참고 사항
 
 - LM Studio 텍스트 번역은 OpenAI 호환 `/chat/completions` 또는 `/responses`를 사용합니다.
-- 로컬 실시간 음성 번역의 기본 경로는 faster-whisper STT와 AI API 텍스트 번역입니다. LM Studio 번역은 선택 가능한 로컬 LLM 모드로 계속 사용할 수 있습니다.
+- 로컬 실시간 음성 번역의 기본 경로는 로컬 Whisper STT와 AI API 텍스트 번역입니다. LM Studio 번역은 선택 가능한 로컬 LLM 모드로 계속 사용할 수 있습니다.
+- MLX Whisper 0.4.3은 beam search를 지원하지 않아 greedy decoding을 사용합니다. 상태·전사 응답의 beam 값도 `1`로 표시하며 언어 자동 감지는 각 오디오 창에서 수행합니다. 음성 감지와 환각 차단은 두 엔진 모두에 적용됩니다.
 
 ## 검증
 
@@ -203,4 +208,4 @@ uv pip install --python .venv-stt -r local_stt/requirements-dev.txt
 npm run stt:test
 ```
 
-GitHub Actions는 Windows, Apple Silicon Mac, Intel Mac에서 빌드·테스트·STT 설치와 실제 CPU/int8 모델 초기화를 확인합니다. YouTube 재생 중 탭 오디오 캡처와 자막 표시까지는 Chrome에서 확인해야 합니다.
+GitHub Actions는 Windows, Apple Silicon Mac, Intel Mac에서 빌드·테스트·STT 설치와 실제 CPU/int8 모델 초기화를 확인합니다. Metal GPU 검사는 Apple Silicon에서 실행하며, runner에 GPU가 없으면 생략 사유를 표시합니다. 실제 M 시리즈 Mac에서는 `YT_TRANSLATOR_STT_MODEL=tiny uv run --no-project --python .venv-stt python -m unittest local_stt.test_mlx_runtime -v`로 GPU 추론을 확인할 수 있습니다. YouTube 재생 중 탭 오디오 캡처와 자막 표시까지는 Chrome에서 확인해야 합니다.

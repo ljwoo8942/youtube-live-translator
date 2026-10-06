@@ -37,3 +37,10 @@ jobs:
         run: >-
           uv run --no-project --python .venv-stt python -c
           "from local_stt import app; result = app.health(); assert result['ok'], result; print('CPU/int8 Whisper runtime passed')"
+      - name: MLX Metal model smoke test
+        if: matrix.os == 'macos-15'
+        env:
+          YT_TRANSLATOR_STT_DEVICE: mlx
+          YT_TRANSLATOR_STT_COMPUTE_TYPE: float16
+          YT_TRANSLATOR_STT_MODEL: tiny
+        run: uv run --no-project --python .venv-stt python -m unittest local_stt.test_mlx_runtime -v

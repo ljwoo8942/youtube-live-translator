@@ -3,3 +3,4 @@ uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9
 faster-whisper>=1.2.1
 numpy>=1.26.0
+mlx-whisper==0.4.3; platform_system == "Darwin" and platform_machine == "arm64"
