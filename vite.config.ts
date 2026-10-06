@@ -25,7 +25,8 @@ export default defineConfig({
         content: "src/content/index.ts",
         offscreen: "offscreen.html",
         popup: "popup.html",
-        options: "options.html"
+        options: "options.html",
+        corrections: "corrections.html"
       },
       output: {
         entryFileNames: "[name].js",

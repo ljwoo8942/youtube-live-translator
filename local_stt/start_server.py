@@ -21,7 +21,11 @@ ERR_LOG_PATH = ROOT / "local_stt_server.err.log"
 
 def _read_health() -> dict[str, object] | None:
     try:
-        with urllib.request.urlopen(HEALTH_URL, timeout=10) as response:
+        request = urllib.request.Request(
+            HEALTH_URL,
+            headers={"Origin": "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
             body = response.read().decode("utf-8", errors="replace")
             return json.loads(body) if body else {}
     except (OSError, urllib.error.URLError, json.JSONDecodeError):
@@ -63,7 +67,7 @@ def main() -> int:
         str(PORT),
     ]
 
-    with LOG_PATH.open("ab") as stdout, ERR_LOG_PATH.open("ab") as stderr:
+    with LOG_PATH.open("wb") as stdout, ERR_LOG_PATH.open("wb") as stderr:
         process = subprocess.Popen(
             command,
             cwd=ROOT,
@@ -71,6 +75,7 @@ def main() -> int:
             stdout=stdout,
             stderr=stderr,
             creationflags=_creation_flags(),
+            start_new_session=os.name != "nt",
             close_fds=True,
         )
 

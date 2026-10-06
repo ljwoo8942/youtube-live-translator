@@ -122,21 +122,3 @@ export type SettingsSnapshot = {
   revision: number;
   translationConfigRevision: number;
 };
-
-export type TranslationRequest = {
-  segment: CaptionSegment;
-};
-
-export type TranslationResult = {
-  ok: true;
-  segment: CaptionSegment;
-  translatedText: string;
-  provider: TranslationProvider;
-};
-
-export type FailureResult = {
-  ok: false;
-  error: string;
-};
-
-export type AudioCaptureState = "idle" | "starting" | "recording" | "error";

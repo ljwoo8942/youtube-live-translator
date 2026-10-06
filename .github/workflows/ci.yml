@@ -1,0 +1,39 @@
+name: Windows and macOS
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          cache: npm
+      - uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+      - run: npm ci
+      - run: npm run test:contracts
+      - run: npm run build
+      - run: npm run stt:setup
+      - run: uv pip install --python .venv-stt -r local_stt/requirements-dev.txt
+      - run: npm run stt:test
+      - name: CPU model smoke test
+        env:
+          YT_TRANSLATOR_STT_DEVICE: cpu
+          YT_TRANSLATOR_STT_COMPUTE_TYPE: int8
+          YT_TRANSLATOR_STT_MODEL: tiny
+        run: >-
+          uv run --no-project --python .venv-stt python -c
+          "from local_stt import app; result = app.health(); assert result['ok'], result; print('CPU/int8 Whisper runtime passed')"

@@ -12,7 +12,11 @@ HEALTH_TIMEOUT_SECONDS = 60
 
 def main() -> int:
     try:
-        with urllib.request.urlopen(HEALTH_URL, timeout=HEALTH_TIMEOUT_SECONDS) as response:
+        request = urllib.request.Request(
+            HEALTH_URL,
+            headers={"Origin": "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        )
+        with urllib.request.urlopen(request, timeout=HEALTH_TIMEOUT_SECONDS) as response:
             body = response.read().decode("utf-8", errors="replace")
             print(body)
             try:

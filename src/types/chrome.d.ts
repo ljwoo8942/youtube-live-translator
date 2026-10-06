@@ -68,6 +68,7 @@ declare namespace chrome {
     };
 
     function query(queryInfo: Record<string, unknown>): Promise<Tab[]>;
+    function create(createProperties: { url?: string; active?: boolean }): Promise<Tab>;
     function sendMessage<T = unknown>(tabId: number, message: unknown): Promise<T>;
     function reload(tabId: number): Promise<void>;
 

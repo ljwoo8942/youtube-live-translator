@@ -1,16 +1,18 @@
 # Local faster-whisper STT server
 
-OpenAI-compatible speech-to-text server for the YouTube Live Translator extension.
+OpenAI-compatible speech-to-text server for the YouTube Live Translator extension on Windows and macOS (Apple Silicon and Intel).
 
 ## Setup
 
-```powershell
+Install Node.js 22.18+ and [uv](https://docs.astral.sh/uv/getting-started/installation/). The same commands work in PowerShell and macOS Terminal; uv finds `.venv-stt`'s platform-specific interpreter automatically.
+
+```bash
 npm run stt:setup
 ```
 
 ## Run
 
-```powershell
+```bash
 npm run stt:start
 ```
 
@@ -26,32 +28,36 @@ It sends 16 kHz mono PCM16 frames and receives JSON messages with `type`, `text`
 
 If you want the older detached background launcher, run:
 
-```powershell
+```bash
 npm run stt:daemon
 ```
 
 The first `/health` request loads the faster-whisper model. The default model is `small`. Transcription requests can also pass a `model` form field, so choosing another model in the extension loads it when it is cached locally. Run once with internet access so faster-whisper can download the model you want, or set `YT_TRANSLATOR_STT_MODEL` to a local model directory.
 
-Default GPU settings are tuned for an RTX 5070 12 GB:
+Device selection is automatic: macOS uses CPU, while Windows/Linux uses CUDA when an NVIDIA GPU is available and CPU otherwise. Environment overrides remain available.
 
 - model: `small`
-- device: `cuda`
-- compute type: `float16` (`int8` when the device is CPU)
+- device: `cpu` on macOS; `cuda` when available on Windows/Linux
+- compute type: `int8` on CPU, `float16` on CUDA
 - beam size: `1`
 - VAD: enabled
 - stream window: `6s`
 - stream decode interval: `1.1s`
 
+The [CTranslate2 backend](https://opennmt.net/CTranslate2/hardware_support.html) supports macOS CPUs, not Apple's MPS/Metal GPU. For a slower Mac, try `YT_TRANSLATOR_STT_MODEL=base npm run stt:start`, then use the extension's connection check to adopt the server model. A virtual environment from Windows cannot be copied to macOS; recreate it with `npm run stt:setup`.
+
 When the extension sends `content_mode=lyrics`, the server switches to a song-friendly profile:
 
 - VAD: disabled, because accompaniment often makes vocal VAD unreliable
-- beam size: `3` by default
-- stream window: `12s`
-- stream decode interval: `1.6s`
-- minimum audio before decode: `3s`
-- overlap after finalized text: `2s`
+- beam size: `5` by default
+- stream window: `14s`
+- stream decode interval: `1.2s`
+- minimum audio before decode: `2.4s`
+- overlap after finalized text: `3s`
 - a fixed source language is preserved; `auto` enables per-segment language detection
 - deterministic decoding and a more permissive no-speech threshold
+
+The server accepts Chrome extension origins only. HTTP uploads are limited to 16 MiB and 60 seconds of decoded audio, WebSocket frames to 256 KiB, and CPU/GPU inference is serialized. Override these ceilings with `YT_TRANSLATOR_STT_MAX_UPLOAD_BYTES`, `YT_TRANSLATOR_STT_MAX_AUDIO_SECONDS`, and `YT_TRANSLATOR_STT_MAX_STREAM_CHUNK_BYTES` only when needed. The bundled health-check commands supply the required origin header.
 
 When the extension sends `content_mode=live`, the server uses a speech-first hybrid profile for streams that alternate between talking and singing:
 

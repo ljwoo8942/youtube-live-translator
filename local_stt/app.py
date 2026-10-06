@@ -13,11 +13,14 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 
 def _candidate_cuda_dll_dirs() -> list[Path]:
+    if sys.platform != "win32":
+        return []
     candidates: list[Path] = []
 
     explicit = os.environ.get("YT_TRANSLATOR_CUDA_DLL_DIR")
@@ -38,7 +41,17 @@ for dll_dir in CUDA_DLL_DIRS:
         os.add_dll_directory(str(dll_dir))
 
 APP_NAME = "YouTube Live Translator Local STT"
-DEFAULT_DEVICE = os.environ.get("YT_TRANSLATOR_STT_DEVICE", "cuda")
+
+
+def _default_device() -> str:
+    if sys.platform == "darwin":
+        return "cpu"
+    from ctranslate2 import get_cuda_device_count
+
+    return "cuda" if get_cuda_device_count() > 0 else "cpu"
+
+
+DEFAULT_DEVICE = os.environ.get("YT_TRANSLATOR_STT_DEVICE") or _default_device()
 DEFAULT_COMPUTE_TYPE = os.environ.get(
     "YT_TRANSLATOR_STT_COMPUTE_TYPE",
     "float16" if DEFAULT_DEVICE == "cuda" else "int8",
@@ -51,6 +64,10 @@ BASE_MODEL_BEAM_SIZE = int(os.environ.get("YT_TRANSLATOR_STT_BASE_BEAM_SIZE", "5
 SMALL_MODEL_BEAM_SIZE = int(os.environ.get("YT_TRANSLATOR_STT_SMALL_BEAM_SIZE", "5"))
 DECODE_TEMPERATURE = float(os.environ.get("YT_TRANSLATOR_STT_TEMPERATURE", "0.0"))
 STRICT_MODEL = os.environ.get("YT_TRANSLATOR_STT_STRICT_MODEL", "0") in {"1", "true", "True"}
+MAX_UPLOAD_BYTES = max(1, int(os.environ.get("YT_TRANSLATOR_STT_MAX_UPLOAD_BYTES", str(16 * 1024 * 1024))))
+MAX_STREAM_CHUNK_BYTES = max(1, int(os.environ.get("YT_TRANSLATOR_STT_MAX_STREAM_CHUNK_BYTES", str(256 * 1024))))
+MAX_DECODED_AUDIO_SECONDS = max(1, int(os.environ.get("YT_TRANSLATOR_STT_MAX_AUDIO_SECONDS", "60")))
+CHROME_EXTENSION_ORIGIN = re.compile(r"^chrome-extension://[a-p]{32}$")
 EMPTY_RETRY_NO_VAD = os.environ.get("YT_TRANSLATOR_STT_EMPTY_RETRY_NO_VAD", "0") not in {"0", "false", "False"}
 ALLOW_HEAVY_CACHED_FALLBACK = os.environ.get("YT_TRANSLATOR_STT_ALLOW_HEAVY_FALLBACK", "0") in {"1", "true", "True"}
 LIVE_VAD_THRESHOLD = float(os.environ.get("YT_TRANSLATOR_STT_LIVE_VAD_THRESHOLD", "0.4"))
@@ -258,13 +275,26 @@ DEFAULT_MODEL = _default_model()
 app = FastAPI(title=APP_NAME)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=CHROME_EXTENSION_ORIGIN.pattern,
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
+
+def _allowed_browser_origin(origin: str | None) -> bool:
+    return origin is not None and CHROME_EXTENSION_ORIGIN.fullmatch(origin) is not None
+
+
+@app.middleware("http")
+async def restrict_browser_origins(request: Request, call_next: Any) -> Any:
+    if not _allowed_browser_origin(request.headers.get("origin")):
+        return JSONResponse(status_code=403, content={"detail": "Browser origin is not allowed."})
+    return await call_next(request)
+
 _model_lock = threading.Lock()
+# ponytail: one inference worker bounds CPU/GPU work; use a queue if parallel throughput is needed.
+_inference_lock = threading.Lock()
 _model: WhisperModel | None = None
 _model_name: str | None = None
 _model_error: str | None = None
@@ -341,6 +371,8 @@ def _requested_model_name(model: str | None = None) -> str:
     requested = (model or "").strip()
     if not requested or requested == "whisper-1":
         return DEFAULT_MODEL
+    if requested != DEFAULT_MODEL and requested not in _cached_models():
+        raise ValueError(f"STT model '{requested}' is not configured or cached locally.")
     return requested
 
 
@@ -532,7 +564,7 @@ def _load_model(model: str | None = None) -> WhisperModel:
     global _model, _model_name, _model_error, _model_error_name, _runtime_checked_model, _runtime_error
 
     target_model = _requested_model_name(model)
-    with _model_lock:
+    with _inference_lock, _model_lock:
         if _model is not None and _model_name == target_model:
             return _model
 
@@ -583,13 +615,14 @@ def _probe_runtime(model: WhisperModel, model_name: str) -> None:
 
     try:
         _write_probe_wav(temp_path)
-        segments, _ = model.transcribe(
-            str(temp_path),
-            beam_size=DEFAULT_BEAM_SIZE,
-            vad_filter=DEFAULT_VAD,
-            condition_on_previous_text=False,
-        )
-        list(segments)
+        with _inference_lock:
+            segments, _ = model.transcribe(
+                str(temp_path),
+                beam_size=DEFAULT_BEAM_SIZE,
+                vad_filter=DEFAULT_VAD,
+                condition_on_previous_text=False,
+            )
+            list(segments)
         _runtime_error = None
     except Exception as exc:  # noqa: BLE001 - health should expose CUDA runtime failures.
         _runtime_error = str(exc)
@@ -611,6 +644,11 @@ def _audio_stats(audio: Any) -> tuple[float, float]:
     peak = float(np.max(np.abs(audio_array)))
     rms = float(np.sqrt(np.mean(np.square(audio_array))))
     return peak, rms
+
+
+def _validate_audio_length(audio: Any) -> None:
+    if getattr(audio, "size", 0) > STREAM_SAMPLE_RATE * MAX_DECODED_AUDIO_SECONDS:
+        raise HTTPException(status_code=413, detail="Decoded audio is too long.")
 
 
 def _append_stream_samples(
@@ -858,22 +896,23 @@ def _transcribe_audio(
     model_name: str | None = None,
 ) -> tuple[list[Any], Any, bool]:
     normalized_language = _normalized_language(language)
-    segments, info = whisper_model.transcribe(
-        audio,
-        language=normalized_language,
-        beam_size=beam_size,
-        vad_filter=vad_filter,
-        vad_parameters=_vad_parameters_for_mode(content_mode) if vad_filter else None,
-        initial_prompt=initial_prompt,
-        condition_on_previous_text=False,
-        temperature=DECODE_TEMPERATURE,
-        no_speech_threshold=no_speech_threshold,
-        multilingual=_multilingual_for_mode(normalized_language, content_mode),
-        language_detection_segments=(6 if _is_base_model(model_name) else 5 if _is_small_model(model_name) else 3)
-        if normalized_language is None
-        else 1,
-    )
-    return list(segments), info, vad_filter
+    with _inference_lock:
+        segments, info = whisper_model.transcribe(
+            audio,
+            language=normalized_language,
+            beam_size=beam_size,
+            vad_filter=vad_filter,
+            vad_parameters=_vad_parameters_for_mode(content_mode) if vad_filter else None,
+            initial_prompt=initial_prompt,
+            condition_on_previous_text=False,
+            temperature=DECODE_TEMPERATURE,
+            no_speech_threshold=no_speech_threshold,
+            multilingual=_multilingual_for_mode(normalized_language, content_mode),
+            language_detection_segments=(6 if _is_base_model(model_name) else 5 if _is_small_model(model_name) else 3)
+            if normalized_language is None
+            else 1,
+        )
+        return list(segments), info, vad_filter
 
 
 def _transcribe_live_lyrics_fallback(
@@ -980,8 +1019,7 @@ def health() -> dict[str, Any]:
 
 @app.get("/v1/models")
 def models() -> dict[str, Any]:
-    known_models = ["tiny", "base", "small", "medium", "large-v3-turbo", "large-v3"]
-    model_ids = list(dict.fromkeys([DEFAULT_MODEL, *_cached_models(), *known_models]))
+    model_ids = list(dict.fromkeys([DEFAULT_MODEL, *_cached_models()]))
     return {
         "object": "list",
         "data": [
@@ -1003,25 +1041,32 @@ async def transcriptions(
     content_mode: str | None = Form(default=None),
     response_format: str | None = Form(default="json"),
 ) -> dict[str, Any] | str:
-    requested_model = _requested_model_name(model)
+    try:
+        requested_model = _requested_model_name(model)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if STRICT_MODEL and requested_model != DEFAULT_MODEL:
         raise HTTPException(status_code=400, detail=f"Configured STT model is {DEFAULT_MODEL}, not {requested_model}.")
+
+    suffix = Path(file.filename or "audio.webm").suffix or ".webm"
+    started_at = time.perf_counter()
+
+    audio_bytes = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(audio_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Audio upload is too large.")
 
     try:
         whisper_model = _load_model(requested_model)
     except Exception as exc:  # noqa: BLE001
         hint = _health_hint(str(exc), requested_model)
-        detail = f"faster-whisper GPU model '{requested_model}' is not ready: {exc}"
+        detail = f"faster-whisper model '{requested_model}' is not ready: {exc}"
         if hint:
             detail = f"{detail} {hint}"
         raise HTTPException(status_code=503, detail=detail) from exc
 
-    suffix = Path(file.filename or "audio.webm").suffix or ".webm"
-    started_at = time.perf_counter()
-
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
         temp_path = Path(temp_file.name)
-        temp_file.write(await file.read())
+        temp_file.write(audio_bytes)
 
     try:
         try:
@@ -1029,6 +1074,7 @@ async def transcriptions(
                 from faster_whisper.audio import decode_audio
 
                 audio = decode_audio(str(temp_path), sampling_rate=16000)
+                _validate_audio_length(audio)
             except Exception as exc:  # noqa: BLE001 - short browser chunks can occasionally be undecodable.
                 duration_ms = round((time.perf_counter() - started_at) * 1000)
                 print(f"audio decode failed: {exc}", file=sys.stderr, flush=True)
@@ -1121,12 +1167,20 @@ async def transcriptions(
 
 @app.websocket("/v1/audio/stream")
 async def audio_stream(websocket: WebSocket) -> None:
+    if not _allowed_browser_origin(websocket.headers.get("origin")):
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     model = websocket.query_params.get("model")
     language = websocket.query_params.get("language")
     content_mode = websocket.query_params.get("content_mode") or websocket.query_params.get("mode")
     preserve_turns = websocket.query_params.get("speaker_turns", "").strip().lower() in {"1", "true", "yes", "on"}
-    requested_model = _requested_model_name(model)
+    try:
+        requested_model = _requested_model_name(model)
+    except ValueError as exc:
+        await websocket.send_json({"type": "error", "text": str(exc)})
+        await websocket.close(code=1008)
+        return
     profile = _profile_name(content_mode)
     print(f"stream connected model={requested_model} language={language or 'auto'} profile={profile}", flush=True)
     if STRICT_MODEL and requested_model != DEFAULT_MODEL:
@@ -1178,6 +1232,9 @@ async def audio_stream(websocket: WebSocket) -> None:
 
             chunk = message.get("bytes")
             if chunk:
+                if len(chunk) > MAX_STREAM_CHUNK_BYTES:
+                    await websocket.close(code=1009)
+                    return
                 if len(chunk) % 2:
                     chunk = chunk[:-1]
                 samples = np.frombuffer(chunk, dtype="<i2").astype(np.float32) / 32768.0
@@ -1284,7 +1341,7 @@ async def audio_stream(websocket: WebSocket) -> None:
             sequence += 1
             end_ms = round(total_samples * 1000 / STREAM_SAMPLE_RATE)
             start_ms = max(0, end_ms - round(recent.size * 1000 / STREAM_SAMPLE_RATE))
-            print(f"stream {message_type} seq={sequence} text={_safe_log_text(text, 120)}", flush=True)
+            print(f"stream {message_type} seq={sequence} chars={len(text)}", flush=True)
             await websocket.send_json(
                 {
                     "type": message_type,

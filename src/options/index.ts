@@ -510,6 +510,7 @@ function render(): void {
           <button id="heroLocalPreset" class="primary" type="button">로컬 STT 프리셋</button>
           <button id="heroLivePreset" type="button">라이브 STT 프리셋</button>
           <button id="heroLyricsPreset" type="button">노래 STT 프리셋</button>
+          <button id="openCorrections" type="button">곡 교정 사전</button>
           <button id="heroPipelineTest" type="button">전체 테스트</button>
         </div>
       </section>
@@ -847,7 +848,7 @@ function render(): void {
         </section>
 
         <section class="section full recommended-section">
-          <h2>로컬 GPU STT + 번역 API</h2>
+          <h2>로컬 STT + 번역 API</h2>
           <div class="summary-grid">
             <div>
               <span>STT</span>
@@ -868,7 +869,7 @@ function render(): void {
             <button id="fasterWhisperProbe" type="button">faster-whisper 연결 확인</button>
             <button id="localPipelineTest" type="button">STT + 번역 API 전체 테스트</button>
           </div>
-          <span class="hint">RTX 5070 12GB 기준 기본 STT는 small입니다. base도 안정 프로파일을 사용하지만, 끊김이 없고 인식률이 부족하면 medium으로 테스트하세요. STT는 로컬 GPU로 처리하고 번역만 AI API 키를 사용합니다. 테스트 전 ${LOCAL_STT_START_HINT}</span>
+          <span class="hint">기본 STT 모델은 small입니다. Mac은 CPU/int8, NVIDIA GPU가 있는 Windows·Linux는 CUDA를 사용합니다. CPU에서 느리면 base를 선택하고, 인식률이 부족하면 medium을 테스트하세요. 먼저 faster-whisper 연결 확인으로 서버 모델을 적용하세요. 테스트 전 ${LOCAL_STT_START_HINT}</span>
         </section>
 
         <section class="section full">
@@ -1232,7 +1233,7 @@ async function testLocalPipeline(): Promise<void> {
       source: "audioStt",
       startMs: 0,
       endMs: 1000,
-      text: "Local GPU speech recognition and AI translation API are connected."
+      text: "Local speech recognition and AI translation API are connected."
     }
   });
 
@@ -1501,6 +1502,12 @@ function bindActions(): void {
 
   byId<HTMLButtonElement>("heroLyricsPreset").addEventListener("click", () => {
     applyLyricsSttPreset();
+  });
+
+  byId<HTMLButtonElement>("openCorrections").addEventListener("click", () => {
+    runAction(async () => {
+      await chrome.tabs.create({ url: chrome.runtime.getURL("corrections.html") });
+    });
   });
 
   byId<HTMLButtonElement>("heroPipelineTest").addEventListener("click", () => {

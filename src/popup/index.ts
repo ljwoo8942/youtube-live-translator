@@ -6,6 +6,8 @@ import "./style.css";
 const app = document.querySelector<HTMLDivElement>("#app");
 let settings: TranslatorSettings;
 let currentTabIsYouTube = false;
+let correctionEnabled = true;
+let correctionCount = 0;
 
 function activeTab(): Promise<chrome.tabs.Tab | undefined> {
   return chrome.tabs.query({ active: true, currentWindow: true }).then((tabs) => tabs[0]);
@@ -50,8 +52,11 @@ type PreparedAudioCapture = {
 };
 
 async function prepareAudioCapture(): Promise<PreparedAudioCapture> {
-  await ensureTabCapturePermission();
   const tab = await activeTab();
+  if (!isSupportedYouTubeUrl(tab?.url)) {
+    return {};
+  }
+  await ensureTabCapturePermission();
   const prepared = tab?.id
     ? await chrome.tabs
         .sendMessage<MessageResponse<{ videoId: string }>>(tab.id, { type: "PREPARE_AUDIO_CAPTURE" })
@@ -85,8 +90,19 @@ function closePopupAfterSuccess(): void {
   window.setTimeout(() => window.close(), 120);
 }
 
+async function openCorrectionsPage(): Promise<void> {
+  await chrome.tabs.create({ url: chrome.runtime.getURL("corrections.html") });
+  closePopupAfterSuccess();
+}
+
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function escapeHtml(value: string): string {
+  const element = document.createElement("span");
+  element.textContent = value;
+  return element.innerHTML;
 }
 
 function runAction(action: () => Promise<void>): void {
@@ -203,6 +219,7 @@ function render(): void {
         </section>
         <div class="actions">
           <button id="options" class="primary">전체 설정</button>
+          <button id="corrections">교정 사전</button>
         </div>
         <div id="status" class="status">YouTube 영상 탭에서 다시 열어 주세요.</div>
       </section>
@@ -211,6 +228,9 @@ function render(): void {
       runAction(async () => {
         await chrome.runtime.openOptionsPage();
       });
+    });
+    document.querySelector("#corrections")?.addEventListener("click", () => {
+      runAction(openCorrectionsPage);
     });
     return;
   }
@@ -239,12 +259,13 @@ function render(): void {
           <strong>${isRecommendedFlow ? "권장 흐름" : "사용자 설정"}</strong>
         </div>
         <div class="status-metrics">
-          <span>${inputModeLabel(settings.inputMode)}</span>
-          <span>${contentModeLabel(settings.contentMode)}</span>
-          <span>${sttProviderLabel(settings.sttProvider)}</span>
-          <span>${sttModelLabel(settings)}</span>
-          <span>${translationProviderLabel(settings.translationProvider)}</span>
-          <span>${translationModelLabel(settings)}</span>
+          <span>${escapeHtml(inputModeLabel(settings.inputMode))}</span>
+          <span>${escapeHtml(contentModeLabel(settings.contentMode))}</span>
+          <span>${escapeHtml(sttProviderLabel(settings.sttProvider))}</span>
+          <span>${escapeHtml(sttModelLabel(settings))}</span>
+          <span>${escapeHtml(translationProviderLabel(settings.translationProvider))}</span>
+          <span>${escapeHtml(translationModelLabel(settings))}</span>
+          <span>교정 ${correctionCount}곡</span>
         </div>
       </section>
 
@@ -309,10 +330,15 @@ function render(): void {
           <span>영상 미니 컨트롤</span>
           <input id="miniControlsEnabled" type="checkbox" />
         </label>
+        <label class="panel-switch">
+          <span>사용자 교정 사전</span>
+          <input id="correctionEnabled" type="checkbox" />
+        </label>
       </section>
 
       <div class="actions">
         <button id="options" class="primary">전체 설정</button>
+        <button id="corrections">교정 사전</button>
         <button id="save">저장</button>
         <button id="startAudio">음성 시작</button>
         <button id="stopAudio">음성 중지</button>
@@ -329,6 +355,7 @@ function render(): void {
   const sourceLanguage = document.querySelector<HTMLSelectElement>("#sourceLanguage");
   const targetLanguage = document.querySelector<HTMLInputElement>("#targetLanguage");
   const miniControlsEnabled = document.querySelector<HTMLInputElement>("#miniControlsEnabled");
+  const correctionToggle = document.querySelector<HTMLInputElement>("#correctionEnabled");
 
   if (enabled) enabled.checked = settings.enabled;
   if (inputMode) inputMode.value = settings.inputMode;
@@ -338,6 +365,7 @@ function render(): void {
   setSelectWithCustomOption(sourceLanguage, settings.sourceLanguage);
   if (targetLanguage) targetLanguage.value = settings.targetLanguage;
   if (miniControlsEnabled) miniControlsEnabled.checked = settings.miniControlsEnabled;
+  if (correctionToggle) correctionToggle.checked = correctionEnabled;
 
   enabled?.addEventListener("change", () => {
     runAction(async () => {
@@ -368,6 +396,21 @@ function render(): void {
     runAction(async () => {
       await persist({ miniControlsEnabled: miniControlsEnabled.checked });
       setStatus(miniControlsEnabled.checked ? "영상 미니 컨트롤을 표시합니다." : "영상 미니 컨트롤을 숨겼습니다.");
+      closePopupAfterSuccess();
+    });
+  });
+
+  correctionToggle?.addEventListener("change", () => {
+    runAction(async () => {
+      const response = await chrome.runtime.sendMessage<MessageResponse<{ enabled: boolean }>>({
+        type: "SET_CORRECTION_ENABLED",
+        enabled: correctionToggle.checked
+      });
+      if (!response?.ok) {
+        throw new Error(response?.error ?? "교정 설정을 저장하지 못했습니다.");
+      }
+      correctionEnabled = response.enabled;
+      setStatus(correctionEnabled ? "사용자 교정을 적용합니다." : "사용자 교정을 사용하지 않습니다.");
       closePopupAfterSuccess();
     });
   });
@@ -438,11 +481,25 @@ function render(): void {
       }
     });
   });
+
+  document.querySelector("#corrections")?.addEventListener("click", () => {
+    runAction(openCorrectionsPage);
+  });
 }
 
 async function main(): Promise<void> {
   currentTabIsYouTube = isSupportedYouTubeUrl((await activeTab())?.url);
-  settings = await loadSettings();
+  const [loadedSettings, correctionStatus] = await Promise.all([
+    loadSettings(),
+    chrome.runtime.sendMessage<MessageResponse<{ enabled: boolean; count: number }>>({
+      type: "GET_CORRECTION_STATUS"
+    })
+  ]);
+  settings = loadedSettings;
+  if (correctionStatus?.ok) {
+    correctionEnabled = correctionStatus.enabled;
+    correctionCount = correctionStatus.count;
+  }
   render();
 }
 

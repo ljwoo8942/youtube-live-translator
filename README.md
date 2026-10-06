@@ -2,7 +2,7 @@
 
 YouTube 실시간 방송과 녹화 영상 위에 번역 자막을 표시하는 Manifest V3 Chrome 확장 프로그램입니다.
 
-제작자가 제공한 YouTube 공식 자막을 먼저 사용하고, 자막이 없을 때만 탭 오디오 STT로 전환합니다. 번역은 OpenAI 호환 AI API, LM Studio 또는 Ollama로 처리할 수 있으며, 포함된 faster-whisper 서버로 로컬 GPU STT도 사용할 수 있습니다.
+제작자가 제공한 YouTube 공식 자막을 먼저 사용하고, 자막이 없을 때만 탭 오디오 STT로 전환합니다. 번역은 OpenAI 호환 AI API, LM Studio 또는 Ollama로 처리할 수 있으며, 포함된 faster-whisper 서버로 Windows와 macOS에서 로컬 STT도 사용할 수 있습니다.
 
 > API 키는 확장 프로그램 설정 화면에서 입력하며 `chrome.storage.local`에만 저장됩니다. API 키는 이 저장소나 빌드된 확장 프로그램 소스에 포함되지 않습니다.
 
@@ -12,6 +12,7 @@ YouTube 실시간 방송과 녹화 영상 위에 번역 자막을 표시하는 M
 - YouTube timed text, 전체 자막 선번역, IndexedDB 캐시를 활용하는 공식 자막 우선 처리
 - 공식 자막이 없을 때 `chrome.tabCapture`, offscreen WebAudio, 로컬 WebSocket STT를 이용하는 음성 인식 대체 경로
 - 제목·설명의 곡 후보를 LRCLIB에서 한 번 검색하고 STT와 연속 일치할 때만 가사를 채택하는 노래 보조
+- 사용자가 입력한 원문·교정 번역과 커버별 차이를 로컬에 저장하는 곡 교정 사전
 - 켜기/끄기, 원문 표시, 노래 모드, 글자 크기, 위치, 재시도, 설정 열기를 제공하는 YouTube 미니 컨트롤
 - 번역 제공자:
   - OpenAI 호환 AI API
@@ -25,17 +26,38 @@ YouTube 실시간 방송과 녹화 영상 위에 번역 자막을 표시하는 M
 
 ## 빌드 및 설치
 
+Node.js 22.18 이상(권장 24)과 Chrome 116 이상이 필요합니다. 로컬 STT를 사용하려면 [uv](https://docs.astral.sh/uv/getting-started/installation/)도 설치하세요. Windows PowerShell과 macOS 터미널에서 같은 npm 명령을 사용합니다.
+
 ```bash
-npm install
+npm ci
 npm run build
 ```
 
 Chrome에서 개발자 모드를 켠 뒤 `chrome://extensions`의 `압축해제된 확장 프로그램을 로드합니다`로 생성된 `dist` 폴더를 선택합니다.
 
+## macOS에서 처음 실행
+
+Apple Silicon(M 시리즈)과 Intel Mac에서 다음 순서로 실행합니다.
+
+```bash
+git clone https://github.com/ljwoo8942/youtube-live-translator.git
+cd youtube-live-translator
+npm ci
+npm run build
+npm run stt:setup
+npm run stt:start
+```
+
+위 터미널은 열어 두고, Chrome에 `dist` 폴더를 로드하세요. 옵션 페이지에서 AI 번역 API 키를 입력한 뒤 `faster-whisper 연결 확인`과 `STT + 번역 API 전체 테스트`를 실행합니다. 새 터미널에서 `npm run stt:health`로 서버 상태를 확인할 수도 있습니다.
+
+Mac에서는 STT가 CPU/int8로 실행됩니다. 현재 [CTranslate2 실행 엔진](https://opennmt.net/CTranslate2/hardware_support.html)은 Apple GPU의 MPS/Metal 실행을 지원하지 않습니다. 인식이 느리면 서버 시작 전에 `YT_TRANSLATOR_STT_MODEL=base npm run stt:start`로 더 작은 모델을 선택하고, 옵션 페이지의 `faster-whisper 연결 확인`으로 서버 모델을 적용하세요. API STT로 전환하는 것도 가능합니다. LM Studio/Ollama 번역은 별도로 선택할 수 있습니다.
+
+가상환경 `.venv-stt`는 운영체제와 CPU 구조에 종속됩니다. Windows 가상환경을 Mac으로 복사하지 말고 Mac에서 `npm run stt:setup`을 실행하세요. 설정·곡 교정 사전은 각 Chrome 프로필에 저장되므로, 곡 교정 사전은 JSON 내보내기/가져오기로 옮길 수 있습니다.
+
 ## 로컬 AI 기본값
 
 - Ollama: `http://localhost:11434`
-- faster-whisper GPU STT: `http://127.0.0.1:8765/v1/audio/transcriptions`
+- faster-whisper 로컬 STT: `http://127.0.0.1:8765/v1/audio/transcriptions`
 - faster-whisper 스트리밍 STT: `ws://127.0.0.1:8765/v1/audio/stream`
 - LM Studio: 로컬 LLM 번역을 선택한 경우 `http://127.0.0.1:1234/v1`
 
@@ -52,6 +74,14 @@ YouTube timed text를 사용할 수 있으면 확장 프로그램은 오디오 �
 번역 자막 캐시는 영상 ID, 자막 해시, 목표 언어, 제공자/모델, 콘텐츠 모드를 기준으로 IndexedDB에 저장됩니다. 같은 영상을 다시 열면 캐시된 번역을 즉시 표시할 수 있습니다.
 
 음악 영상의 가사형 번역에는 옵션 페이지의 `콘텐츠 모드` 또는 YouTube 미니 컨트롤의 `♪` 버튼을 사용하세요.
+
+## 곡 교정 사전
+
+팝업이나 옵션 페이지의 `곡 교정 사전`을 누르면 독립된 관리 페이지가 열립니다. 곡 이름, 가수/작곡가, YouTube 영상 ID, 원문 가사와 교정 번역을 줄 단위 또는 일괄 입력으로 저장할 수 있습니다.
+
+공식 자막은 저장 원문과 일치하는 줄을 즉시 교정문으로 표시합니다. 음성 STT는 같은 곡의 원문이 두 줄 연속 일치한 뒤 교정문을 사용하며, 불일치가 이어지면 기존 실시간 번역으로 돌아갑니다. 커버 프로필에는 영상 ID, 커버 가수와 개사된 줄만 별도로 저장할 수 있습니다.
+
+교정 사전은 IndexedDB에 로컬로 저장되며 서버로 전송되지 않습니다. JSON 백업과 복원, LRC/SRT 원문 가져오기를 지원합니다.
 
 ## 자막 없는 노래 가사 보조
 
@@ -93,7 +123,7 @@ API STT 기본값:
 
 확장 프로그램은 선택한 모델을 `AI API > 모델`에 저장하고, 기존의 OpenAI 호환 `/chat/completions` 또는 `/responses` 경로로 번역 요청을 보냅니다.
 
-## 로컬 GPU STT + 번역 API
+## 로컬 STT + 번역 API
 
 이 프로젝트에는 자막이 없을 때 사용할 수 있는 OpenAI 호환 및 WebSocket faster-whisper STT 서버가 포함돼 있습니다.
 
@@ -117,11 +147,11 @@ YouTube 번역을 사용하는 동안 이 터미널을 열어 두세요. `stt:st
 npm run stt:health
 ```
 
-기본 STT 설정은 RTX 5070 12 GB VRAM에서 YouTube 재생을 부드럽게 유지하는 데 초점을 둡니다.
+서버는 Mac에서 CPU를 사용하고, Windows·Linux에서는 사용 가능한 NVIDIA GPU가 있으면 CUDA를 선택합니다. `YT_TRANSLATOR_STT_DEVICE`와 `YT_TRANSLATOR_STT_COMPUTE_TYPE`으로 직접 지정할 수도 있습니다.
 
 - 모델: `small`
-- 장치: `cuda`
-- 연산 형식: `int8_float16`
+- 장치: Mac 및 GPU 없는 환경은 `cpu`, NVIDIA GPU가 있으면 `cuda`
+- 연산 형식: CUDA는 `float16`, CPU는 `int8`
 - 스트리밍 엔드포인트: `ws://127.0.0.1:8765/v1/audio/stream`
 - HTTP 대체 청크: `8000ms`
 - 엔드포인트: `http://127.0.0.1:8765/v1/audio/transcriptions`
@@ -130,7 +160,7 @@ npm run stt:health
 
 로컬 STT 서버의 기본 모델도 `small`입니다. 요청된 모델을 동적으로 불러올 수 있으므로 옵션 페이지에서 `base`, `small`, `medium`을 선택하면 해당 faster-whisper 모델이 로컬에서 사용 가능한 경우 자동으로 적용됩니다.
 
-노래에는 `노래 STT 프리셋`을 사용하거나 `콘텐츠 모드`를 `노래/가사`로 설정하세요. 확장 프로그램이 로컬 STT 서버에 `content_mode=lyrics`를 전송하면 VAD를 비활성화하고, 인식 창을 12초로 늘리며, beam size를 높여 가창 음성 인식을 개선합니다.
+노래에는 `노래 STT 프리셋`을 사용하거나 `콘텐츠 모드`를 `노래/가사`로 설정하세요. 확장 프로그램이 로컬 STT 서버에 `content_mode=lyrics`를 전송하면 VAD를 비활성화하고, 인식 창과 beam size를 늘려 가창 음성 인식을 개선합니다. CPU에서는 medium보다 base/small부터 테스트하세요. 서버에서 아직 준비하지 않은 모델을 쓰려면 `YT_TRANSLATOR_STT_MODEL`로 지정한 뒤 서버를 재시작하세요.
 
 옵션 페이지에서 다음을 설정합니다.
 
@@ -163,3 +193,14 @@ npm run stt:health
 
 - LM Studio 텍스트 번역은 OpenAI 호환 `/chat/completions` 또는 `/responses`를 사용합니다.
 - 로컬 실시간 음성 번역의 기본 경로는 faster-whisper STT와 AI API 텍스트 번역입니다. LM Studio 번역은 선택 가능한 로컬 LLM 모드로 계속 사용할 수 있습니다.
+
+## 검증
+
+```bash
+npm run test:contracts
+npm run build
+uv pip install --python .venv-stt -r local_stt/requirements-dev.txt
+npm run stt:test
+```
+
+GitHub Actions는 Windows, Apple Silicon Mac, Intel Mac에서 빌드·테스트·STT 설치와 실제 CPU/int8 모델 초기화를 확인합니다. YouTube 재생 중 탭 오디오 캡처와 자막 표시까지는 Chrome에서 확인해야 합니다.

@@ -15,7 +15,7 @@ import {
 } from "./youtubeCaptions";
 const SETTINGS_KEY = "translatorSettings";
 const BLOCKED_HALLUCINATION_ERROR = "환각 의심 번역 결과를 차단했습니다.";
-const CONTENT_SCRIPT_VERSION = 26;
+const CONTENT_SCRIPT_VERSION = 28;
 const CONTENT_BOOTSTRAP_FLAG = "__yt_live_translator_content_bootstrapped__";
 const overlay = new TranslatorOverlay();
 const AUDIO_FALLBACK_INITIAL_WAIT_MS = 2200;
@@ -23,6 +23,7 @@ const AUDIO_FALLBACK_NO_CAPTION_WAIT_MS = 250;
 const AUDIO_FALLBACK_STALE_CAPTION_MS = 4200;
 const TIMED_TEXT_RETRY_MS = 3000;
 const TIMED_TEXT_SELECTION_CHECK_MS = 250;
+const TIMED_TEXT_TRANSLATION_PREFETCH_MS = 4000;
 const PRETRANSLATE_RETRY_COOLDOWN_MS = 15_000;
 const PRETRANSLATE_PRIORITY_BUCKET_MS = 5_000;
 const OVERLAY_REFRESH_DELAY_MS = 100;
@@ -49,6 +50,7 @@ let pretranslateRetryBlockedUntil = 0;
 let currentUrl = location.href;
 let activeVideoId = "";
 let lyricsAssistStatus = "";
+let correctionMatchStatus = "";
 let lastSentKey = "";
 let lastCaptionSeenAt = 0;
 let audioCaptureRequested = false;
@@ -244,6 +246,7 @@ function beginVideoSession(videoId: string): void {
   void cancelPretranslation(videoId);
   activeVideoId = videoId;
   lyricsAssistStatus = "";
+  correctionMatchStatus = "";
   timedTextLoadToken += 1;
   timedTextLoading = false;
   timedTextLoadStartedAt = 0;
@@ -335,7 +338,7 @@ function contentModeStatusLabel(): string {
 }
 
 function withLyricsAssistStatus(text: string): string {
-  return lyricsAssistStatus ? `${lyricsAssistStatus} · ${text}` : text;
+  return [correctionMatchStatus, lyricsAssistStatus, text].filter(Boolean).join(" · ");
 }
 
 function controlStatusText(): string {
@@ -562,12 +565,20 @@ function isCurrentTimedTextSegment(segment: CaptionSegment): boolean {
   return getCurrentTimedTextSegment(timedTextSegments, settings)?.id === segment.id;
 }
 
+function isCurrentVisibleOfficialCaption(segment: CaptionSegment): boolean {
+  const current = readVisibleCaptionSegment();
+  return Boolean(current && segmentKey(current.text) === segmentKey(segment.text));
+}
+
 function shouldDisplayCaptionTranslation(segment: CaptionSegment): boolean {
   if (segment.source === "audioStt") {
     return shouldAcceptAudioSegment(segment);
   }
   if (segment.source === "youtubeTimedText") {
     return isCurrentTimedTextSegment(segment);
+  }
+  if (segment.source === "youtubeDom") {
+    return isCurrentVisibleOfficialCaption(segment);
   }
   return true;
 }
@@ -602,6 +613,26 @@ function renderTimedTextSegment(segment: CaptionSegment): void {
   }
 
   void processCaptionSegment(withTimedTextContext(segment));
+}
+
+function prefetchUpcomingTimedTextTranslation(): void {
+  if (!settings.pretranslateEnabled || timedTextSegments.length === 0) {
+    return;
+  }
+  const video = findVideoElement();
+  if (!video) {
+    return;
+  }
+  const currentMs = video.currentTime * 1000 + settings.latencyOffsetMs;
+  const segment = timedTextSegments.find(
+    (candidate) =>
+      candidate.endMs >= currentMs &&
+      candidate.startMs <= currentMs + TIMED_TEXT_TRANSLATION_PREFETCH_MS &&
+      !timedTextTranslations.has(candidate.id)
+  );
+  if (segment) {
+    void processCaptionSegment(withTimedTextContext(segment));
+  }
 }
 
 function readVisibleOfficialCaption(): void {
@@ -1232,6 +1263,7 @@ async function tick(): Promise<void> {
       await stopAudioFallback();
     }
 
+    prefetchUpcomingTimedTextTranslation();
     const timedTextSegment = getCurrentTimedTextSegment(timedTextSegments, settings);
     if (timedTextSegment) {
       await stopAudioFallback();
@@ -1526,6 +1558,28 @@ function installObservers(): void {
         lyricsAssistStatus = message.statusText;
         overlay.setControlStatus(controlStatusText(), settings);
       }
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (message.type === "CORRECTION_MATCH_STATUS") {
+      if (message.videoId === activeVideoId) {
+        correctionMatchStatus = message.statusText;
+        overlay.setControlStatus(controlStatusText(), settings);
+      }
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (message.type === "CORRECTION_LIBRARY_UPDATED") {
+      correctionMatchStatus = "";
+      timedTextTranslations = new Map();
+      pretranslateRequestKey = "";
+      pretranslateRetryBlockedUntil = 0;
+      captionRequestsInFlight = new Set();
+      lastSentKey = "";
+      overlay.setControlStatus(controlStatusText(), settings);
+      void requestPretranslation();
       sendResponse({ ok: true });
       return;
     }

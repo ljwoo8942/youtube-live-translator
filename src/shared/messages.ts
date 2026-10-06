@@ -2,10 +2,8 @@ import type {
   CaptionSegment,
   ContentSettings,
   MiniControlSettingsPatch,
-  PageCaptionSnapshot,
   TranslatorSettings
 } from "./types";
-
 export const BLOCKED_HALLUCINATION_ERROR = "환각 의심 번역 결과를 차단했습니다.";
 
 export type CaptionTranslationEntry = {
@@ -89,12 +87,24 @@ export type RuntimeMessage =
       statusText: string;
       candidateCount?: number;
     }
+  | {
+      type: "CORRECTION_MATCH_STATUS";
+      videoId: string;
+      state: "matched" | "applied" | "none";
+      statusText: string;
+      songTitle?: string;
+    }
   | { type: "SETTINGS_UPDATED"; settings: ContentSettings; revision: number }
   | { type: "SAVE_SETTINGS"; patch: Partial<TranslatorSettings> }
   | { type: "MINI_CONTROL_UPDATE"; patch: MiniControlSettingsPatch }
   | { type: "CANCEL_PRETRANSLATION"; keepVideoId?: string }
   | { type: "RESET_AUDIO_CAPTURE_COOLDOWN"; tabId?: number }
   | { type: "OPEN_OPTIONS_PAGE" }
+  | { type: "OPEN_CORRECTIONS_PAGE" }
+  | { type: "GET_CURRENT_YOUTUBE_MEDIA" }
+  | { type: "GET_CORRECTION_STATUS" }
+  | { type: "SET_CORRECTION_ENABLED"; enabled: boolean }
+  | { type: "CORRECTION_LIBRARY_UPDATED" }
   | { type: "GET_SETTINGS" }
   | { type: "GET_PAGE_CAPTION_SNAPSHOT"; videoId: string }
   | { type: "PREPARE_CAPTION_LYRICS_ASSIST"; videoId: string }

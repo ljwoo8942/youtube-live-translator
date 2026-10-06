@@ -19,6 +19,19 @@ import {
   type LyricsAssistSession,
   type LyricsMediaContext
 } from "./lyricsAssist";
+import {
+  cloneCorrectionMatchSession,
+  createCorrectionMatchSession,
+  matchCorrectionSegment,
+  type CorrectionMatchResult,
+  type CorrectionMatchSession
+} from "./correctionMatcher";
+import {
+  getCorrectionPreferences,
+  listSongCorrections,
+  setCorrectionPreferences
+} from "../shared/correctionStore";
+import type { CorrectionMediaContext, SongCorrection } from "../shared/corrections";
 
 const OFFSCREEN_DOCUMENT_PATH = "offscreen.html";
 const AUDIO_FAILURE_COOLDOWN_MS = 12_000;
@@ -36,6 +49,8 @@ const LOCAL_PRETRANSLATE_REST_MS = 500;
 const PRETRANSLATE_PRIORITY_PAST_WINDOW_MS = 10_000;
 const PRETRANSLATE_PRIORITY_FUTURE_WINDOW_MS = 180_000;
 const PRETRANSLATE_RECENT_PAST_WINDOW_MS = 60_000;
+const MAX_REMOTE_PRETRANSLATE_SEGMENTS = 500;
+const MAX_REMOTE_PRETRANSLATE_CHARACTERS = 100_000;
 const CAPTION_CONTEXT_SEGMENT_COUNT = 2;
 const LYRICS_ASSIST_MATCH_BATCH_SIZE = 24;
 const DUPLICATE_FINAL_TRANSCRIPT_WINDOW_MS = 6_000;
@@ -70,6 +85,14 @@ type CaptionLyricsAssistState = {
   ready: Promise<void>;
 };
 const captionLyricsAssistByTab = new Map<number, CaptionLyricsAssistState>();
+type CorrectionSessionState = {
+  videoId: string;
+  session?: CorrectionMatchSession;
+  ready: Promise<void>;
+  appliedNotified: boolean;
+};
+const correctionSessionsByTab = new Map<number, CorrectionSessionState>();
+let correctionLibraryCache: SongCorrection[] | undefined;
 
 void chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" }).catch((error) => {
   console.debug("Could not restrict local storage to trusted extension contexts", error);
@@ -78,8 +101,10 @@ type PretranslateJob = {
   cancelled: boolean;
   currentTimeMs: number;
 };
+type PretranslateBudget = { segments: number; characters: number };
 
 const pretranslateJobs = new Map<string, PretranslateJob>();
+const pretranslateBudgets = new Map<string, PretranslateBudget>();
 const PROBABLE_AUDIO_HALLUCINATION_KEYS = new Set([
   "you",
   "youyou",
@@ -582,6 +607,126 @@ function notifyLyricsAssistStatus(
   });
 }
 
+function notifyCorrectionMatchStatus(
+  tabId: number,
+  videoId: string,
+  state: "matched" | "applied" | "none",
+  songTitle?: string
+): void {
+  const statusText =
+    state === "matched"
+      ? `교정 후보: ${songTitle ?? "확인됨"}`
+      : state === "applied"
+        ? `사용자 교정 적용: ${songTitle ?? "현재 곡"}`
+        : "사용자 교정 없음";
+  void notifyTab(tabId, {
+    type: "CORRECTION_MATCH_STATUS",
+    videoId,
+    state,
+    statusText,
+    songTitle
+  });
+}
+
+async function correctionLibrary(): Promise<SongCorrection[]> {
+  correctionLibraryCache ??= await listSongCorrections();
+  return correctionLibraryCache;
+}
+
+function invalidateCorrectionLibrary(): void {
+  correctionLibraryCache = undefined;
+  correctionSessionsByTab.clear();
+}
+
+function startCorrectionSession(tabId: number, videoId: string): CorrectionSessionState {
+  const existing = correctionSessionsByTab.get(tabId);
+  if (existing?.videoId === videoId) {
+    return existing;
+  }
+  const state: CorrectionSessionState = {
+    videoId,
+    ready: Promise.resolve(),
+    appliedNotified: false
+  };
+  correctionSessionsByTab.set(tabId, state);
+  state.ready = (async () => {
+    const preferences = await getCorrectionPreferences();
+    if (!preferences.enabled || correctionSessionsByTab.get(tabId) !== state) {
+      return;
+    }
+    const [media, songs, settings] = await Promise.all([
+      readPageMediaContext(tabId, videoId),
+      correctionLibrary(),
+      loadSettings()
+    ]);
+    if (!media || correctionSessionsByTab.get(tabId) !== state) {
+      return;
+    }
+    state.session = createCorrectionMatchSession(media, songs, settings.targetLanguage);
+    if (state.session) {
+      notifyCorrectionMatchStatus(tabId, videoId, "matched", state.session.song.title);
+    }
+  })();
+  return state;
+}
+
+async function correctionSession(tabId: number, videoId: string): Promise<CorrectionSessionState> {
+  const state = startCorrectionSession(tabId, videoId);
+  await state.ready;
+  return state;
+}
+
+async function matchUserCorrection(
+  tabId: number,
+  videoId: string,
+  segment: CaptionSegment,
+  commit: boolean
+): Promise<CorrectionMatchResult | undefined> {
+  const state = await correctionSession(tabId, videoId);
+  if (correctionSessionsByTab.get(tabId) !== state) {
+    return undefined;
+  }
+  const result = matchCorrectionSegment(state.session, segment, commit);
+  if (result && !state.appliedNotified) {
+    state.appliedNotified = true;
+    notifyCorrectionMatchStatus(tabId, videoId, "applied", result.songTitle);
+  }
+  return result;
+}
+
+async function correctionEntriesForSegments(
+  tabId: number,
+  videoId: string,
+  segments: CaptionSegment[]
+): Promise<CaptionTranslationEntry[]> {
+  const state = await correctionSession(tabId, videoId);
+  if (!state.session || correctionSessionsByTab.get(tabId) !== state) {
+    return [];
+  }
+  const matchingSession = cloneCorrectionMatchSession(state.session);
+  const entries: CaptionTranslationEntry[] = [];
+  for (let offset = 0; offset < segments.length; offset += LYRICS_ASSIST_MATCH_BATCH_SIZE) {
+    if (correctionSessionsByTab.get(tabId) !== state) {
+      return [];
+    }
+    const end = Math.min(segments.length, offset + LYRICS_ASSIST_MATCH_BATCH_SIZE);
+    for (let index = offset; index < end; index += 1) {
+      const result = matchCorrectionSegment(matchingSession, segments[index], true);
+      if (result) {
+        entries.push({ id: segments[index].id, translatedText: result.translatedText });
+      }
+    }
+    if (end < segments.length) {
+      await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0));
+    }
+  }
+  if (entries.length > 0 && !state.appliedNotified) {
+    state.appliedNotified = true;
+    notifyCorrectionMatchStatus(tabId, videoId, "applied", state.session.song.title);
+  }
+  return entries;
+}
+
 async function prepareLyricsAssist(tabId: number, videoId: string, settings: TranslatorSettings): Promise<void> {
   if (!settings.lyricsAssistEnabled || settings.contentMode === "spoken") {
     lyricsAssistByTab.delete(tabId);
@@ -768,6 +913,25 @@ function isSupportedYouTubeUrl(url?: string): boolean {
   }
 }
 
+async function stopAudioCaptureOutsideYouTube(tabId: number, url?: string): Promise<void> {
+  const tabUrl = url ?? (await getTabUrl(tabId));
+  if (isSupportedYouTubeUrl(tabUrl)) {
+    return;
+  }
+  if (activeAudioTabId !== tabId && !(await liveCapturedTabIds()).includes(tabId)) {
+    return;
+  }
+  await stopAudioCapture(tabId);
+}
+
+async function stopStaleAudioCaptureOnStartup(): Promise<void> {
+  const state = await getOffscreenAudioState();
+  if (!state?.recording || !state.activeTabId) {
+    return;
+  }
+  await stopAudioCaptureOutsideYouTube(state.activeTabId);
+}
+
 function youtubeVideoIdFromUrl(url?: string): string | undefined {
   if (!url) {
     return undefined;
@@ -781,6 +945,39 @@ function youtubeVideoIdFromUrl(url?: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+async function currentYouTubeMedia(): Promise<CorrectionMediaContext | undefined> {
+  const tabs = await chrome.tabs.query({ url: ["*://www.youtube.com/*", "*://m.youtube.com/*"] });
+  const candidates = tabs
+    .map((tab) => ({ tab, videoId: youtubeVideoIdFromUrl(tab.url) }))
+    .filter((entry): entry is { tab: chrome.tabs.Tab; videoId: string } => Boolean(entry.tab.id && entry.videoId))
+    .sort((left, right) => {
+      const leftAccessed = (left.tab as chrome.tabs.Tab & { lastAccessed?: number }).lastAccessed ?? 0;
+      const rightAccessed = (right.tab as chrome.tabs.Tab & { lastAccessed?: number }).lastAccessed ?? 0;
+      return rightAccessed - leftAccessed;
+    });
+  const current = candidates[0];
+  if (!current?.tab.id) {
+    return undefined;
+  }
+  const media = await readPageMediaContext(current.tab.id, current.videoId);
+  return media
+    ? {
+        videoId: media.videoId,
+        title: media.title,
+        author: media.author,
+        durationSeconds: media.durationSeconds,
+        isLive: media.isLive
+      }
+    : undefined;
+}
+
+async function broadcastCorrectionLibraryUpdated(): Promise<void> {
+  const tabs = await chrome.tabs.query({ url: ["*://www.youtube.com/*", "*://m.youtube.com/*"] });
+  await Promise.all(
+    tabs.flatMap((tab) => (tab.id ? [notifyTab(tab.id, { type: "CORRECTION_LIBRARY_UPDATED" })] : []))
+  );
 }
 
 async function updateActionAvailability(tabId: number, url?: string): Promise<void> {
@@ -1185,6 +1382,9 @@ function polishJapaneseKoreanMeaning(sourceText: string, translatedText: string,
   if (/BADなダンス(?:腫魔|ハマ)ったらいいじゃん/iu.test(source)) {
     return "BAD한 댄스에 빠져버리면 되잖아";
   }
+  if (/[“"]?最高[”"]?で止まらないように更新したい/u.test(source)) {
+    return "“최고”에서 멈추지 않도록 갱신하고 싶어";
+  }
   if (/ここに居ようとして(?:る|いる)/u.test(source)) {
     return translatedText
       .replace(/여기(?:에)?\s*있으려고\s*(?:하고\s*있는|하는)/gu, "여기에 머물려는")
@@ -1419,6 +1619,7 @@ function clearAudioQueue(tabId: number): void {
   streamTranslationGenerationByTab.delete(tabId);
   audioContextByTab.delete(tabId);
   lyricsAssistByTab.delete(tabId);
+  correctionSessionsByTab.delete(tabId);
 }
 
 function isActiveAudioSession(tabId: number, videoId: string): boolean {
@@ -1515,6 +1716,11 @@ function cancelTabPretranslationJobs(tabId: number, exceptKey?: string, keepVide
     if (key.startsWith(prefix) && key !== exceptKey && (!keepVideoId || !key.startsWith(`${prefix}${keepVideoId}|`))) {
       job.cancelled = true;
       pretranslateJobs.delete(key);
+    }
+  }
+  for (const key of pretranslateBudgets.keys()) {
+    if (key.startsWith(prefix) && key !== exceptKey && (!keepVideoId || !key.startsWith(`${prefix}${keepVideoId}|`))) {
+      pretranslateBudgets.delete(key);
     }
   }
 }
@@ -1644,7 +1850,21 @@ async function handlePretranslateCaptions(
   const assistedMessage = { ...message, segments };
   const context = createCaptionCacheContext(settings, message.videoId, message.captionHash, message.trackLanguage);
   const cachedMap = await getCachedCaptionTranslations(context, segments);
+  const correctionEntries = await correctionEntriesForSegments(tabId, message.videoId, segments);
+  for (const entry of correctionEntries) {
+    cachedMap.set(entry.id, entry.translatedText);
+  }
   const cachedEntries = entriesFromCache(segments, cachedMap);
+  if (correctionEntries.length > 0) {
+    await notifyTab(tabId, {
+      type: "PRETRANSLATE_RESULT",
+      videoId: message.videoId,
+      captionHash: message.captionHash,
+      translations: correctionEntries,
+      provider: "사용자 교정",
+      translationConfigRevision: message.translationConfigRevision
+    });
+  }
 
   if (!settings.enabled || !settings.pretranslateEnabled || segments.length === 0) {
     return { ok: true, translations: cachedEntries, total: segments.length, cached: cachedEntries.length };
@@ -1653,7 +1873,9 @@ async function handlePretranslateCaptions(
   try {
     assertTranslationReady(settings);
   } catch (error) {
-    return { ok: false, error: getErrorMessage(error) };
+    return cachedEntries.length > 0
+      ? { ok: true, translations: cachedEntries, total: segments.length, cached: cachedEntries.length }
+      : { ok: false, error: getErrorMessage(error) };
   }
 
   const jobKey = pretranslateJobKey(tabId, context);
@@ -1695,6 +1917,8 @@ async function runPretranslationJob(
   cachedMap: Map<string, string>
 ): Promise<void> {
   let translated = cachedMap.size;
+  const budget = pretranslateBudgets.get(jobKey) ?? { segments: 0, characters: 0 };
+  pretranslateBudgets.set(jobKey, budget);
   const skippedIds = new Set<string>();
   const usesLocalTranslation = settings.translationProvider === "lmStudio" || settings.translationProvider === "ollama";
   const hotFutureWindowMs = usesLocalTranslation
@@ -1711,7 +1935,7 @@ async function runPretranslationJob(
     statusText: translated >= message.segments.length ? "캐시된 번역 자막 사용 중" : "현재 위치 자막 우선 번역 중..."
   });
 
-  while (!job.cancelled) {
+  while (!job.cancelled && (usesLocalTranslation || budget.segments < MAX_REMOTE_PRETRANSLATE_SEGMENTS)) {
     const missing = prioritizeMissingSegments(message.segments, cachedMap, job.currentTimeMs).filter((segment) => !skippedIds.has(segment.id));
     if (missing.length === 0) {
       break;
@@ -1723,7 +1947,22 @@ async function runPretranslationJob(
     }
     const source = hotMissing.length > 0 ? hotMissing : missing;
     const batchSize = hotMissing.length > 0 ? hotPretranslateBatchSize(settings) : pretranslateBatchSize(settings);
-    const batch = source.slice(0, batchSize);
+    const remainingSegments = usesLocalTranslation
+      ? batchSize
+      : Math.min(batchSize, MAX_REMOTE_PRETRANSLATE_SEGMENTS - budget.segments);
+    const batch = source.slice(0, remainingSegments);
+    while (
+      !usesLocalTranslation &&
+      batch.length > 0 &&
+      budget.characters + batch.reduce((total, segment) => total + segment.text.length, 0) > MAX_REMOTE_PRETRANSLATE_CHARACTERS
+    ) {
+      batch.pop();
+    }
+    if (batch.length === 0) {
+      break;
+    }
+    budget.segments += batch.length;
+    budget.characters += batch.reduce((total, segment) => total + segment.text.length, 0);
     const result = await translatePretranslationBatch(settings, batch);
     if (job.cancelled) {
       break;
@@ -1856,6 +2095,12 @@ async function reconfigureAudioCaptureInternal(
   expectedVideoId?: string,
   startIfMissing = false
 ): Promise<MessageResponse<{ tabId: number; mode?: string }>> {
+  const tabUrl = await getTabUrl(tabId);
+  if (!isSupportedYouTubeUrl(tabUrl)) {
+    await stopAudioCaptureInternal(tabId);
+    return { ok: false, error: "YouTube 영상 탭에서만 음성 자막을 유지할 수 있습니다." };
+  }
+
   const state = await getOffscreenAudioState();
   if (
     !state?.recording ||
@@ -1892,6 +2137,7 @@ async function reconfigureAudioCaptureInternal(
   activeAudioVideoId = videoId;
   clearAudioQueue(tabId);
   void prepareLyricsAssist(tabId, videoId, settings);
+  void correctionSession(tabId, videoId);
   await notifyTab(tabId, {
     type: "AUDIO_CAPTURE_STATUS",
     state: "recording",
@@ -2012,6 +2258,7 @@ async function startAudioCaptureInternal(
   activeAudioTabId = tabId;
   activeAudioVideoId = videoId;
   void prepareLyricsAssist(tabId, videoId, settings);
+  void correctionSession(tabId, videoId);
   let offscreenResponse: MessageResponse | undefined;
   try {
     offscreenResponse = await chrome.runtime.sendMessage<MessageResponse>({
@@ -2168,6 +2415,9 @@ async function broadcastContentSettings(settings: TranslatorSettings, revision: 
 
 async function saveSettingsPatch(patch: Partial<TranslatorSettings>) {
   const snapshot = await patchSettings(patch);
+  if ("targetLanguage" in patch) {
+    correctionSessionsByTab.clear();
+  }
   await broadcastContentSettings(snapshot.settings, snapshot.revision, snapshot.translationConfigRevision);
   if (
     activeAudioTabId &&
@@ -2198,13 +2448,18 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
   void updateActionAvailability(activeInfo.tabId);
 });
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.url) {
-    void updateActionAvailability(tabId, changeInfo.url);
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  const tabUrl = changeInfo.url ?? tab.url;
+  if (changeInfo.url || changeInfo.status === "loading") {
+    void stopAudioCaptureOutsideYouTube(tabId, tabUrl);
+  }
+  if (tabUrl) {
+    void updateActionAvailability(tabId, tabUrl);
   }
 });
 
 void initializeActionAvailability();
+void stopStaleAudioCaptureOnStartup();
 
 function segmentWithAudioContext(tabId: number, segment: CaptionSegment): CaptionSegment {
   const context = audioContextByTab.get(tabId) ?? [];
@@ -2364,6 +2619,21 @@ async function processAudioChunk(message: Extract<RuntimeMessage, { type: "AUDIO
 
   await notifyTab(message.tabId, { type: "AUDIO_TRANSCRIPT", tabId: message.tabId, videoId: message.videoId, segment });
 
+  const correction = await matchUserCorrection(message.tabId, message.videoId, segment, true);
+  if (correction) {
+    if (isActiveAudioSession(message.tabId, message.videoId)) {
+      rememberAudioContext(message.tabId, segment.text);
+      await notifyTab(message.tabId, {
+        type: "TRANSLATION_READY",
+        segment,
+        translatedText: correction.translatedText,
+        provider: correction.provider,
+        videoId: message.videoId
+      });
+    }
+    return;
+  }
+
   const translation = await translateAndRespond(segmentWithAudioContext(message.tabId, segment));
   if (!isActiveAudioSession(message.tabId, message.videoId)) {
     return;
@@ -2460,6 +2730,26 @@ async function translateStreamSegment(tabId: number, videoId: string, segment: C
   const generation = (streamTranslationGenerationByTab.get(tabId) ?? 0) + 1;
   streamTranslationGenerationByTab.set(tabId, generation);
 
+  const correction = await matchUserCorrection(tabId, videoId, segment, isFinal);
+  if (
+    correction &&
+    streamTranslationGenerationByTab.get(tabId) === generation &&
+    tabId === activeAudioTabId &&
+    videoId === activeAudioVideoId
+  ) {
+    if (isFinal) {
+      rememberAudioContext(tabId, segment.text);
+    }
+    await notifyTab(tabId, {
+      type: "TRANSLATION_READY",
+      segment,
+      translatedText: correction.translatedText,
+      provider: isFinal ? correction.provider : `${correction.provider} (partial)`,
+      videoId
+    });
+    return;
+  }
+
   const translation = await translateAndRespond(segmentWithAudioContext(tabId, segment));
   if (
     streamTranslationGenerationByTab.get(tabId) !== generation ||
@@ -2509,6 +2799,47 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
 
   void (async () => {
     try {
+      if (message.type === "GET_CORRECTION_STATUS") {
+        const [preferences, storedSongs] = await Promise.all([getCorrectionPreferences(), correctionLibrary()]);
+        sendResponse({ ok: true, enabled: preferences.enabled, count: storedSongs.length });
+        return;
+      }
+
+      if (message.type === "SET_CORRECTION_ENABLED") {
+        await setCorrectionPreferences({ enabled: message.enabled });
+        invalidateCorrectionLibrary();
+        for (const job of pretranslateJobs.values()) {
+          job.cancelled = true;
+        }
+        pretranslateJobs.clear();
+        await broadcastCorrectionLibraryUpdated();
+        sendResponse({ ok: true, enabled: message.enabled });
+        return;
+      }
+
+      if (message.type === "CORRECTION_LIBRARY_UPDATED") {
+        invalidateCorrectionLibrary();
+        for (const job of pretranslateJobs.values()) {
+          job.cancelled = true;
+        }
+        pretranslateJobs.clear();
+        await broadcastCorrectionLibraryUpdated();
+        sendResponse({ ok: true });
+        return;
+      }
+
+      if (message.type === "GET_CURRENT_YOUTUBE_MEDIA") {
+        const media = await currentYouTubeMedia();
+        sendResponse(media ? { ok: true, media } : { ok: false, error: "재생 중인 YouTube 영상을 찾지 못했습니다." });
+        return;
+      }
+
+      if (message.type === "OPEN_CORRECTIONS_PAGE") {
+        await chrome.tabs.create({ url: chrome.runtime.getURL("corrections.html") });
+        sendResponse({ ok: true });
+        return;
+      }
+
       if (message.type === "GET_SETTINGS") {
         const snapshot = await loadSettingsSnapshot();
         sendResponse({
@@ -2535,6 +2866,7 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
         }
         const settings = await loadSettings();
         startCaptionLyricsAssist(sender.tab.id, message.videoId, settings);
+        startCorrectionSession(sender.tab.id, message.videoId);
         sendResponse({ ok: true });
         return;
       }
@@ -2547,6 +2879,16 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
           tabId && videoId
             ? await addCaptionLyricsAssist(tabId, videoId, settings, [message.segment])
             : [message.segment];
+        const correction =
+          settings.enabled && tabId && videoId ? await matchUserCorrection(tabId, videoId, segment, true) : undefined;
+        if (correction) {
+          sendResponse({
+            ok: true,
+            translatedText: correction.translatedText,
+            provider: correction.provider
+          });
+          return;
+        }
         sendResponse(await translateAndRespond(segment));
         return;
       }

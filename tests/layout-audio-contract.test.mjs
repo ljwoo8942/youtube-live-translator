@@ -10,6 +10,14 @@ import {
   searchLyricsCandidates,
   setLyricsCandidates
 } from "../src/background/lyricsAssist.ts";
+import {
+  createCorrectionMatchSession,
+  matchCorrectionSegment
+} from "../src/background/correctionMatcher.ts";
+import {
+  normalizeCorrectionLibrary,
+  normalizeSongCorrection
+} from "../src/shared/corrections.ts";
 
 const readSource = (path) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
 
@@ -27,6 +35,9 @@ const defaults = readSource("src/shared/defaults.ts");
 const translationVersion = readSource("src/shared/translationVersion.ts");
 const manifest = readSource("public/manifest.json");
 const options = readSource("src/options/index.ts");
+const correctionsPage = readSource("src/corrections/index.ts");
+const correctionStore = readSource("src/shared/correctionStore.ts");
+const viteConfig = readSource("vite.config.ts");
 const localStt = readSource("local_stt/app.py");
 
 test("STT code does not control YouTube fullscreen or video layout", () => {
@@ -422,6 +433,39 @@ test("late official caption translations are cached instead of being permanently
   assert.match(content, /function captionRequestKey\(segment: CaptionSegment\)[\s\S]*?segment\.id/);
 });
 
+test("official caption transitions block a late previous response without clearing the displayed subtitle", () => {
+  const visibleStart = content.indexOf("function readVisibleOfficialCaption");
+  const visibleEnd = content.indexOf("function scheduleVisibleOfficialCaptionRead", visibleStart);
+  const visibleReader = content.slice(visibleStart, visibleEnd);
+  assert.match(visibleReader, /lastVisibleOfficialCaptionKey = key;[\s\S]*?void processCaptionSegment\(segment\);/);
+  assert.doesNotMatch(visibleReader, /overlay\.clear\(\)/);
+  assert.match(
+    content,
+    /function isCurrentVisibleOfficialCaption\(segment: CaptionSegment\): boolean \{[\s\S]*?readVisibleCaptionSegment\(\)[\s\S]*?segmentKey\(current\.text\) === segmentKey\(segment\.text\)/
+  );
+  assert.match(
+    content,
+    /if \(segment\.source === "youtubeDom"\) \{\s*return isCurrentVisibleOfficialCaption\(segment\);\s*\}/
+  );
+});
+
+test("official timed text prefetches the next line without flashing blank while waiting", () => {
+  assert.match(content, /const TIMED_TEXT_TRANSLATION_PREFETCH_MS = 4000/);
+  assert.match(
+    content,
+    /function prefetchUpcomingTimedTextTranslation\(\): void \{[\s\S]*?startMs <= currentMs \+ TIMED_TEXT_TRANSLATION_PREFETCH_MS[\s\S]*?void processCaptionSegment\(withTimedTextContext\(segment\)\);/
+  );
+  assert.match(
+    content,
+    /prefetchUpcomingTimedTextTranslation\(\);[\s\S]*?const timedTextSegment = getCurrentTimedTextSegment\(timedTextSegments, settings\);/
+  );
+  const renderStart = content.indexOf("function renderTimedTextSegment");
+  const renderEnd = content.indexOf("function readVisibleOfficialCaption", renderStart);
+  const renderTimedText = content.slice(renderStart, renderEnd);
+  assert.match(renderTimedText, /if \(translatedText\)[\s\S]*?return;[\s\S]*?void processCaptionSegment/);
+  assert.doesNotMatch(renderTimedText, /overlay\.clear\(\)/);
+});
+
 test("visible caption reader falls back to newer YouTube caption DOM shapes", () => {
   assert.match(youtubeCaptions, /querySelectorAll<HTMLElement>\("\.ytp-caption-segment"\)/);
   assert.match(youtubeCaptions, /querySelectorAll<HTMLElement>\("\.caption-visual-line"\)/);
@@ -433,7 +477,7 @@ test("Korean lyrics prompt avoids dry declarative prose endings", () => {
   assert.match(providers, /초안이 ~다, ~한다, ~된다, ~였다로 끝나면 원문이 의도적 선언문이 아닌 한 다시 써서 가사다운 종결로 바꾼다/);
   assert.match(providers, /한국어 일반 자막도 기본값을 문어체 ~다로 두지 않는다/);
   assert.match(providers, /痛むごとに血が流れて落ちていく -> 아플 때마다 피가 흘러내려/);
-  assert.match(translationVersion, /subtitle-fidelity-first-v28/);
+  assert.match(translationVersion, /subtitle-fidelity-first-v29/);
 });
 
 test("manual audio start clears stale stop intent before starting tab capture", () => {
@@ -443,6 +487,46 @@ test("manual audio start clears stale stop intent before starting tab capture", 
   assert.ok(startIndex > prepareIndex);
   assert.match(popup, /videoId:\s*prepared\?\.ok\s*\?\s*prepared\.videoId\s*:\s*undefined/);
   assert.match(popup, /videoId:\s*prepared\.videoId/);
+});
+
+test("popup does not request tab capture permission outside YouTube", () => {
+  const prepareStart = popup.indexOf("async function prepareAudioCapture");
+  const prepareEnd = popup.indexOf("function startPreparedAudioCapture", prepareStart);
+  const prepareAudio = popup.slice(prepareStart, prepareEnd);
+  assert.ok(prepareStart >= 0);
+  assert.match(
+    prepareAudio,
+    /const tab = await activeTab\(\);[\s\S]*?if \(!isSupportedYouTubeUrl\(tab\?\.url\)\) \{[\s\S]*?return \{\};[\s\S]*?await ensureTabCapturePermission\(\);/
+  );
+});
+
+test("tab capture is limited to YouTube and stops when a captured tab leaves YouTube", () => {
+  assert.match(
+    manifest,
+    /"matches":\s*\["https:\/\/www\.youtube\.com\/\*",\s*"https:\/\/m\.youtube\.com\/\*"\]/
+  );
+  assert.doesNotMatch(manifest, /"matches":\s*\[[^\]]*"https:\/\/\*\/\*"/);
+  assert.match(
+    background,
+    /async function stopAudioCaptureOutsideYouTube\(tabId: number, url\?: string\): Promise<void> \{[\s\S]*?if \(isSupportedYouTubeUrl\(tabUrl\)\) \{[\s\S]*?return;[\s\S]*?await stopAudioCapture\(tabId\);/
+  );
+  assert.match(
+    background,
+    /chrome\.tabs\.onUpdated\.addListener\(\(tabId, changeInfo, tab\) => \{[\s\S]*?changeInfo\.url \|\| changeInfo\.status === "loading"[\s\S]*?stopAudioCaptureOutsideYouTube\(tabId, tabUrl\)/
+  );
+  assert.match(
+    background,
+    /async function stopStaleAudioCaptureOnStartup\(\): Promise<void> \{[\s\S]*?getOffscreenAudioState\(\)[\s\S]*?state\?\.recording[\s\S]*?state\.activeTabId[\s\S]*?await stopAudioCaptureOutsideYouTube\(state\.activeTabId\);/
+  );
+  assert.match(background, /void stopStaleAudioCaptureOnStartup\(\);/);
+  const reconfigureStart = background.indexOf("async function reconfigureAudioCaptureInternal");
+  const reconfigureEnd = background.indexOf("async function reuseAudioCapture", reconfigureStart);
+  const reconfigureCapture = background.slice(reconfigureStart, reconfigureEnd);
+  assert.ok(reconfigureStart >= 0);
+  assert.match(
+    reconfigureCapture,
+    /const tabUrl = await getTabUrl\(tabId\);[\s\S]*?if \(!isSupportedYouTubeUrl\(tabUrl\)\) \{[\s\S]*?await stopAudioCaptureInternal\(tabId\);[\s\S]*?return \{ ok: false, error: "YouTube 영상 탭에서만 음성 자막을 유지할 수 있습니다\." \};/
+  );
 });
 
 test("popup stop suppresses automatic restart and is bound to the prepared video session", () => {
@@ -573,6 +657,13 @@ test("misrecognized Japanese lyric keeps BAD and restores hama meaning", () => {
   assert.match(providers, /BADなダンス 腫魔ったらいいじゃん -> BAD한 댄스에 빠져버리면 되잖아/);
   assert.match(background, /BADなダンス\(\?:腫魔\|ハマ\)ったらいいじゃん/);
   assert.match(background, /"BAD한 댄스에 빠져버리면 되잖아"/);
+});
+
+test("Japanese de boundary keeps the explicit stop predicate", () => {
+  assert.match(providers, /Xで止まらない는 X에서 멈추지 않다/);
+  assert.match(background, /最高.*で止まらないように更新したい/);
+  assert.match(background, /"“최고”에서 멈추지 않도록 갱신하고 싶어"/);
+  assert.match(translationVersion, /subtitle-fidelity-first-v29/);
 });
 
 test("lyrics assist derives search queries from YouTube metadata without manual copying", () => {
@@ -799,4 +890,165 @@ test("lyrics search assist is configurable and restricted to its API host", () =
   assert.match(background, /void prepareLyricsAssist\(tabId, videoId, settings\)/);
   assert.match(background, /settings\.contentMode === "spoken"/);
   assert.match(background, /assistLyricsSegment\([\s\S]*?message\.isFinal/);
+});
+
+test("user correction applies immediately to an exact official subtitle", () => {
+  const song = normalizeSongCorrection({
+    id: "song-1",
+    title: "Blue Wind",
+    artist: "Singer",
+    sourceLanguage: "ja",
+    targetLanguage: "ko",
+    videoIds: ["video-1"],
+    lines: [
+      { id: "line-1", source: "青い風の中で", translation: "푸른 바람 속에서" },
+      { id: "line-2", source: "やっと会えた", translation: "드디어 만났어" }
+    ],
+    variants: []
+  });
+  const session = createCorrectionMatchSession(
+    {
+      videoId: "video-1",
+      title: "Unrelated upload title",
+      author: "Channel",
+      durationSeconds: 240,
+      isLive: false
+    },
+    [song],
+    "ko"
+  );
+  const result = matchCorrectionSegment(
+    session,
+    {
+      id: "caption-1",
+      source: "youtubeTimedText",
+      startMs: 0,
+      endMs: 1000,
+      text: "青い風の中で"
+    },
+    true
+  );
+  assert.equal(result?.translatedText, "푸른 바람 속에서");
+  assert.equal(result?.provider, "사용자 교정");
+});
+
+test("cover profile overrides the original correction only for its registered video", () => {
+  const song = normalizeSongCorrection({
+    id: "song-2",
+    title: "Blue Wind",
+    artist: "Original Singer",
+    sourceLanguage: "ja",
+    targetLanguage: "ko",
+    videoIds: ["original-video"],
+    lines: [
+      { id: "base-line", source: "青い風の中で", translation: "푸른 바람 속에서" }
+    ],
+    variants: [
+      {
+        id: "cover-1",
+        name: "Acoustic Cover",
+        performer: "Cover Singer",
+        videoIds: ["cover-video"],
+        lineOverrides: [
+          {
+            id: "cover-line",
+            baseLineId: "base-line",
+            source: "蒼い風の中で",
+            translation: "푸르른 바람 속에서"
+          }
+        ]
+      }
+    ]
+  });
+  const session = createCorrectionMatchSession(
+    {
+      videoId: "cover-video",
+      title: "Acoustic Cover",
+      author: "Cover Singer",
+      durationSeconds: 250,
+      isLive: false
+    },
+    [song],
+    "ko"
+  );
+  const result = matchCorrectionSegment(
+    session,
+    {
+      id: "cover-caption",
+      source: "youtubeTimedText",
+      startMs: 0,
+      endMs: 1000,
+      text: "蒼い風の中で"
+    },
+    true
+  );
+  assert.equal(session?.variant?.id, "cover-1");
+  assert.equal(result?.translatedText, "푸르른 바람 속에서");
+});
+
+test("audio correction waits for two sequential lyric matches", () => {
+  const song = normalizeSongCorrection({
+    id: "song-3",
+    title: "Fast Song",
+    artist: "Singer",
+    sourceLanguage: "ja",
+    targetLanguage: "ko",
+    videoIds: ["audio-video"],
+    lines: [
+      { id: "a", source: "夜を越えて", translation: "밤을 넘어서" },
+      { id: "b", source: "また会おう", translation: "다시 만나자" }
+    ],
+    variants: []
+  });
+  const session = createCorrectionMatchSession(
+    { videoId: "audio-video", title: "Fast Song", author: "Singer", isLive: false },
+    [song],
+    "ko"
+  );
+  const segment = (id, text) => ({
+    id,
+    source: "audioStt",
+    startMs: 0,
+    endMs: 1000,
+    text
+  });
+  assert.equal(matchCorrectionSegment(session, segment("a", "夜を越えて"), true), undefined);
+  assert.equal(matchCorrectionSegment(session, segment("b", "また会おう"), true)?.translatedText, "다시 만나자");
+});
+
+test("correction library import validates its format and required translations", () => {
+  assert.throws(
+    () => normalizeCorrectionLibrary({ format: "other", version: 1, songs: [] }),
+    /지원하지 않는 교정 사전/
+  );
+  assert.throws(
+    () =>
+      normalizeSongCorrection({
+        title: "Song",
+        artist: "Singer",
+        lines: [{ source: "原文", translation: "" }]
+      }),
+    /교정 번역/
+  );
+});
+
+test("correction management is isolated from audio capture and player layout", () => {
+  assert.match(viteConfig, /corrections:\s*"corrections\.html"/);
+  assert.match(correctionsPage, /현재 영상 가져오기/);
+  assert.match(correctionsPage, /커버 프로필/);
+  assert.match(correctionStore, /youtube-live-translator-corrections/);
+  assert.match(popup, /chrome\.tabs\.create\(\{ url: chrome\.runtime\.getURL\("corrections\.html"\) \}\)/);
+  assert.match(options, /chrome\.tabs\.create\(\{ url: chrome\.runtime\.getURL\("corrections\.html"\) \}\)/);
+  assert.match(background, /const correction =[\s\S]*?matchUserCorrection[\s\S]*?translateAndRespond\(segment\)/);
+  assert.doesNotMatch(correctionsPage, /START_AUDIO_CAPTURE|RECONFIGURE_AUDIO_CAPTURE|requestFullscreen|exitFullscreen/);
+  assert.doesNotMatch(correctionStore, /chrome\.tabs|tabCapture|fullscreen/);
+});
+
+test("untrusted model labels and automatic pretranslation work are bounded", () => {
+  assert.match(popup, /function escapeHtml\(value: string\)/);
+  assert.match(popup, /escapeHtml\(translationModelLabel\(settings\)\)/);
+  assert.match(background, /const MAX_REMOTE_PRETRANSLATE_SEGMENTS = 500/);
+  assert.match(background, /const MAX_REMOTE_PRETRANSLATE_CHARACTERS = 100_000/);
+  assert.match(background, /pretranslateBudgets\.get\(jobKey\)/);
+  assert.match(background, /budget\.segments < MAX_REMOTE_PRETRANSLATE_SEGMENTS/);
 });

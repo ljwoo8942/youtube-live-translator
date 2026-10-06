@@ -3,8 +3,11 @@ from __future__ import annotations
 import unittest
 from collections import deque
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
+from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from local_stt import app
 
@@ -18,7 +21,96 @@ class FakeWhisperModel:
         return [], SimpleNamespace(language=kwargs.get("language"))
 
 
+class PlatformConfigurationTests(unittest.TestCase):
+    def test_macos_uses_cpu_without_querying_cuda(self) -> None:
+        with (
+            mock.patch.object(app.sys, "platform", "darwin"),
+            mock.patch("ctranslate2.get_cuda_device_count") as cuda_count,
+        ):
+            self.assertEqual(app._default_device(), "cpu")
+            self.assertEqual(app._candidate_cuda_dll_dirs(), [])
+        cuda_count.assert_not_called()
+
+    def test_cuda_is_used_only_when_available(self) -> None:
+        with mock.patch.object(app.sys, "platform", "win32"):
+            with mock.patch("ctranslate2.get_cuda_device_count", return_value=1):
+                self.assertEqual(app._default_device(), "cuda")
+            with mock.patch("ctranslate2.get_cuda_device_count", return_value=0):
+                self.assertEqual(app._default_device(), "cpu")
+
+
 class ModeConfigurationTests(unittest.TestCase):
+    def test_browser_origins_are_limited_to_chrome_extensions(self) -> None:
+        self.assertFalse(app._allowed_browser_origin(None))
+        self.assertTrue(app._allowed_browser_origin("chrome-extension://abcdefghijklmnopabcdefghijklmnop"))
+        self.assertFalse(app._allowed_browser_origin("https://example.com"))
+        response = TestClient(app.app).get(
+            "/missing",
+            headers={"Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop"},
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_untrusted_http_origin_is_rejected_before_model_loading(self) -> None:
+        with mock.patch.object(app, "_load_model") as load_model:
+            response = TestClient(app.app).get("/health", headers={"Origin": "https://example.com"})
+            missing_origin = TestClient(app.app).get("/health")
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(missing_origin.status_code, 403)
+        load_model.assert_not_called()
+
+    def test_requested_models_must_be_configured_or_cached(self) -> None:
+        with mock.patch.object(app, "_cached_models", return_value=["medium"]):
+            self.assertEqual(app._requested_model_name("medium"), "medium")
+            with self.assertRaises(ValueError):
+                app._requested_model_name("attacker/model")
+
+    def test_oversized_upload_is_rejected_before_model_loading(self) -> None:
+        with (
+            mock.patch.object(app, "MAX_UPLOAD_BYTES", 4),
+            mock.patch.object(app, "_load_model") as load_model,
+        ):
+            response = TestClient(app.app).post(
+                "/v1/audio/transcriptions",
+                files={"file": ("audio.webm", b"12345", "audio/webm")},
+                headers={"Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop"},
+            )
+
+        self.assertEqual(response.status_code, 413)
+        load_model.assert_not_called()
+
+    def test_decoded_audio_duration_is_bounded(self) -> None:
+        with mock.patch.object(app, "MAX_DECODED_AUDIO_SECONDS", 1):
+            with self.assertRaises(app.HTTPException) as raised:
+                app._validate_audio_length(np.zeros(app.STREAM_SAMPLE_RATE + 1, dtype=np.float32))
+
+        self.assertEqual(raised.exception.status_code, 413)
+
+    def test_untrusted_websocket_origin_is_rejected(self) -> None:
+        with self.assertRaises(WebSocketDisconnect) as raised:
+            with TestClient(app.app).websocket_connect(
+                "/v1/audio/stream",
+                headers={"Origin": "https://example.com"},
+            ):
+                pass
+
+        self.assertEqual(raised.exception.code, 1008)
+
+    def test_oversized_websocket_frame_is_rejected(self) -> None:
+        with (
+            mock.patch.object(app, "MAX_STREAM_CHUNK_BYTES", 4),
+            mock.patch.object(app, "_load_model", return_value=FakeWhisperModel()),
+            TestClient(app.app).websocket_connect(
+                "/v1/audio/stream",
+                headers={"Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop"},
+            ) as websocket,
+        ):
+            websocket.send_bytes(b"12345")
+            with self.assertRaises(WebSocketDisconnect) as raised:
+                websocket.receive_json()
+
+        self.assertEqual(raised.exception.code, 1009)
+
     def test_explicit_japanese_is_kept_for_lyrics(self) -> None:
         self.assertEqual(app._effective_language_for_mode("japanese", "lyrics"), "ja")
         self.assertFalse(app._multilingual_for_mode("ja", "lyrics"))
