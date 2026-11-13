@@ -194,9 +194,9 @@ label {
 
 .panel-switch {
   min-height: 46px;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: auto 1fr;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
 }
 
 .panel-switch input {

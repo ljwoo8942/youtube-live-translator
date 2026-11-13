@@ -274,12 +274,12 @@ function render(): void {
 
       <section class="quick-toggles" aria-label="자막 표시 설정">
         <label class="panel-switch">
-          <span>영상 미니 컨트롤</span>
           <input id="miniControlsEnabled" type="checkbox" />
+          <span>영상 미니 컨트롤</span>
         </label>
         <label class="panel-switch">
-          <span>사용자 교정 사전</span>
           <input id="correctionEnabled" type="checkbox" />
+          <span>사용자 교정 사전</span>
         </label>
       </section>
       <div class="actions primary-actions">
