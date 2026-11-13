@@ -67,6 +67,13 @@ function harness(song = { ...createEmptySongCorrection(), title: "Song One", art
   return c;
 }
 
+test("a loaded zero-duration song starts clean after the form normalizes optional metadata", () => {
+  const c = harness({ ...createEmptySongCorrection(), title: "Live song", artist: "Artist", durationSeconds: 0 });
+  c.resetEditor();
+  assert.equal(c.hasUnsavedChanges(), false);
+  assert.equal(c.getNode("#unsavedChanges").hidden, true);
+});
+
 test("metadata, lyric, cover and unapplied bulk drafts are all protected", () => {
   const c = harness();
   assert.equal(c.hasUnsavedChanges(), false);

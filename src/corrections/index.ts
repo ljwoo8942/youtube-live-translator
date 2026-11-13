@@ -217,6 +217,7 @@ function resetEditor(): void {
     if (node) node.value = "";
   }
   renderEditor();
+  syncMetadataFromForm();
   savedEditorState = JSON.stringify(selected);
   savedBulkState = bulkEditorState();
   updateDirtyState();
