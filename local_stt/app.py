@@ -9,6 +9,7 @@ import threading
 import time
 import wave
 import asyncio
+import gc
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -278,6 +279,54 @@ def _default_model() -> str:
 DEFAULT_MODEL = _default_model()
 
 
+class UploadBodyLimitMiddleware:
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http" or scope["method"] != "POST" or scope["path"].rstrip("/") != "/v1/audio/transcriptions":
+            await self.app(scope, receive, send)
+            return
+        # Bound multipart metadata too, before the parser can create temporary files.
+        limit = MAX_UPLOAD_BYTES + 64 * 1024
+        for name, value in scope.get("headers", []):
+            if name.lower() == b"content-length":
+                try:
+                    length = int(value)
+                    if length < 0:
+                        raise ValueError
+                except ValueError:
+                    await JSONResponse(status_code=400, content={"detail": "Invalid Content-Length."})(scope, receive, send)
+                    return
+                if length > limit:
+                    await JSONResponse(status_code=413, content={"detail": "Audio upload is too large."})(scope, receive, send)
+                    return
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            chunk = message.get("body", b"")
+            if len(body) + len(chunk) > limit:
+                await JSONResponse(status_code=413, content={"detail": "Audio upload is too large."})(scope, receive, send)
+                return
+            body.extend(chunk)
+            if not message.get("more_body", False):
+                break
+        payload = bytes(body)
+        del body
+        replayed = False
+
+        async def replay() -> Any:
+            nonlocal replayed
+            if replayed:
+                return await receive()
+            replayed = True
+            return {"type": "http.request", "body": payload, "more_body": False}
+
+        await self.app(scope, replay, send)
+
+
 app = FastAPI(title=APP_NAME)
 app.add_middleware(
     CORSMiddleware,
@@ -286,6 +335,7 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+app.add_middleware(UploadBodyLimitMiddleware)
 
 
 def _allowed_browser_origin(origin: str | None) -> bool:
@@ -679,6 +729,44 @@ def _audio_stats(audio: Any) -> tuple[float, float]:
 def _validate_audio_length(audio: Any) -> None:
     if getattr(audio, "size", 0) > STREAM_SAMPLE_RATE * MAX_DECODED_AUDIO_SECONDS:
         raise HTTPException(status_code=413, detail="Decoded audio is too long.")
+
+
+def _decode_audio(path: str) -> np.ndarray:
+    import av
+
+    max_samples = STREAM_SAMPLE_RATE * MAX_DECODED_AUDIO_SECONDS
+    resampler = av.audio.resampler.AudioResampler(format="s16", layout="mono", rate=STREAM_SAMPLE_RATE)
+    chunks: list[np.ndarray] = []
+    samples = 0
+
+    def append_frames(frames: Any) -> None:
+        nonlocal samples
+        for frame in frames:
+            samples += frame.samples
+            if samples > max_samples:
+                raise HTTPException(status_code=413, detail="Decoded audio is too long.")
+            chunks.append(frame.to_ndarray().reshape(-1))
+
+    try:
+        with av.open(path, mode="r", metadata_errors="ignore") as container:
+            frames = iter(container.decode(audio=0))
+            while True:
+                try:
+                    frame = next(frames)
+                except StopIteration:
+                    break
+                except av.error.InvalidDataError:
+                    continue
+                frame.pts = None
+                append_frames(resampler.resample(frame))
+            append_frames(resampler.resample(None))
+        if not chunks:
+            return np.empty(0, dtype=np.float32)
+        return np.concatenate(chunks).astype(np.float32) / 32768.0
+    finally:
+        # Match faster-whisper's PyAV resampler cleanup on repeated short uploads.
+        del resampler
+        gc.collect()
 
 
 def _append_stream_samples(
@@ -1102,10 +1190,10 @@ async def transcriptions(
     try:
         try:
             try:
-                from faster_whisper.audio import decode_audio
-
-                audio = decode_audio(str(temp_path), sampling_rate=16000)
+                audio = _decode_audio(str(temp_path))
                 _validate_audio_length(audio)
+            except HTTPException:
+                raise
             except Exception as exc:  # noqa: BLE001 - short browser chunks can occasionally be undecodable.
                 duration_ms = round((time.perf_counter() - started_at) * 1000)
                 print(f"audio decode failed: {exc}", file=sys.stderr, flush=True)
@@ -1163,6 +1251,8 @@ async def transcriptions(
                 print(f"filtered probable STT hallucination text={_safe_log_text(text, 80)}", flush=True)
                 text = ""
                 segment_list = []
+        except HTTPException:
+            raise
         except Exception as exc:  # noqa: BLE001
             print(f"local STT transcription failed: {exc}", file=sys.stderr, flush=True)
             raise HTTPException(status_code=503, detail=f"local STT transcription failed: {exc}") from exc
@@ -1254,60 +1344,84 @@ async def audio_stream(websocket: WebSocket) -> None:
     empty_decode_count = 0
     last_status_at = 0.0
     last_receive_log_at = 0.0
+    generation = 0
+    closed = False
+    audio_updated = asyncio.Event()
 
-    try:
-        while True:
-            message = await websocket.receive()
-            if message.get("type") == "websocket.disconnect":
-                break
-
-            chunk = message.get("bytes")
-            if chunk:
-                if len(chunk) > MAX_STREAM_CHUNK_BYTES:
-                    await websocket.close(code=1009)
+    async def receive_audio() -> None:
+        nonlocal buffered_samples, total_samples, last_receive_log_at, generation, closed
+        nonlocal last_decode_at, last_partial, last_final, partial_started_at, empty_decode_count, last_status_at
+        try:
+            while True:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
                     return
-                if len(chunk) % 2:
-                    chunk = chunk[:-1]
-                samples = np.frombuffer(chunk, dtype="<i2").astype(np.float32) / 32768.0
-                if samples.size:
-                    buffered_samples = _append_stream_samples(
-                        buffer_chunks,
-                        buffered_samples,
-                        samples,
-                        max_samples,
-                    )
-                    total_samples += int(samples.size)
-                    now_for_log = time.perf_counter()
-                    if now_for_log - last_receive_log_at >= 5.0:
-                        last_receive_log_at = now_for_log
-                        print(
-                            f"stream audio received total={round(total_samples / STREAM_SAMPLE_RATE, 1)}s "
-                            f"buffer={round(buffered_samples / STREAM_SAMPLE_RATE, 1)}s",
-                            flush=True,
+
+                chunk = message.get("bytes")
+                if chunk:
+                    if len(chunk) > MAX_STREAM_CHUNK_BYTES:
+                        await websocket.close(code=1009)
+                        return
+                    if len(chunk) % 2:
+                        chunk = chunk[:-1]
+                    samples = np.frombuffer(chunk, dtype="<i2").astype(np.float32) / 32768.0
+                    if samples.size:
+                        buffered_samples = _append_stream_samples(
+                            buffer_chunks,
+                            buffered_samples,
+                            samples,
+                            max_samples,
                         )
+                        total_samples += int(samples.size)
+                        now_for_log = time.perf_counter()
+                        if now_for_log - last_receive_log_at >= 5.0:
+                            last_receive_log_at = now_for_log
+                            print(
+                                f"stream audio received total={round(total_samples / STREAM_SAMPLE_RATE, 1)}s "
+                                f"buffer={round(buffered_samples / STREAM_SAMPLE_RATE, 1)}s",
+                                flush=True,
+                            )
 
-            text_message = message.get("text")
-            if text_message == "reset":
-                buffer_chunks.clear()
-                buffered_samples = 0
-                total_samples = 0
-                last_decode_at = 0.0
-                last_partial = ""
-                last_final = ""
-                partial_started_at = None
-                empty_decode_count = 0
-                last_status_at = 0.0
-                continue
-            if text_message == "flush":
-                last_decode_at = 0.0
+                text_message = message.get("text")
+                if text_message == "reset":
+                    generation += 1
+                    buffer_chunks.clear()
+                    buffered_samples = 0
+                    total_samples = 0
+                    last_decode_at = 0.0
+                    last_partial = ""
+                    last_final = ""
+                    partial_started_at = None
+                    empty_decode_count = 0
+                    last_status_at = 0.0
+                if text_message == "flush":
+                    last_decode_at = 0.0
+                audio_updated.set()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            closed = True
+            audio_updated.set()
 
+    receiver = asyncio.create_task(receive_audio())
+    try:
+        while not closed:
+            await audio_updated.wait()
+            audio_updated.clear()
+            delay = stream_decode_interval_seconds - (time.perf_counter() - last_decode_at)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if closed:
+                break
             now = time.perf_counter()
             required_samples = startup_min_samples if not last_final else min_samples
-            if buffered_samples < required_samples or now - last_decode_at < stream_decode_interval_seconds:
+            if buffered_samples < required_samples:
                 continue
             last_decode_at = now
 
             recent = _join_stream_samples(buffer_chunks)
+            decoded_total = total_samples
+            decoded_generation = generation
             try:
                 text, vad_used, beam_size = await asyncio.to_thread(
                     _stream_transcribe_text,
@@ -1319,8 +1433,12 @@ async def audio_stream(websocket: WebSocket) -> None:
                     requested_model,
                 )
             except Exception as exc:  # noqa: BLE001
+                if closed or generation != decoded_generation:
+                    continue
                 print(f"streaming transcription failed: {exc}", file=sys.stderr, flush=True)
                 await websocket.send_json({"type": "error", "text": f"streaming transcription failed: {exc}"})
+                continue
+            if closed or generation != decoded_generation:
                 continue
 
             normalized = _normalize_text(text)
@@ -1370,7 +1488,7 @@ async def audio_stream(websocket: WebSocket) -> None:
             last_partial = normalized
 
             sequence += 1
-            end_ms = round(total_samples * 1000 / STREAM_SAMPLE_RATE)
+            end_ms = round(decoded_total * 1000 / STREAM_SAMPLE_RATE)
             start_ms = max(0, end_ms - round(recent.size * 1000 / STREAM_SAMPLE_RATE))
             print(f"stream {message_type} seq={sequence} chars={len(text)}", flush=True)
             await websocket.send_json(
@@ -1386,17 +1504,21 @@ async def audio_stream(websocket: WebSocket) -> None:
                     "beam_size_used": beam_size,
                 }
             )
+            if closed or generation != decoded_generation:
+                continue
             if message_type == "final" and buffered_samples > overlap_samples:
+                # Keep audio received during inference as well as the decoded overlap.
+                keep_samples = min(buffered_samples, overlap_samples + total_samples - decoded_total)
+                remaining = _join_stream_samples(buffer_chunks)[-keep_samples:].copy() if keep_samples else None
                 buffer_chunks.clear()
-                if overlap_samples > 0:
-                    overlap = recent[-overlap_samples:].copy()
-                    buffer_chunks.append(overlap)
-                    buffered_samples = int(overlap.size)
-                else:
-                    buffered_samples = 0
+                if remaining is not None:
+                    buffer_chunks.append(remaining)
+                buffered_samples = keep_samples
                 last_partial = ""
     except WebSocketDisconnect:
         print("stream disconnected", flush=True)
         return
     finally:
+        receiver.cancel()
+        await asyncio.gather(receiver, return_exceptions=True)
         print("stream closed", flush=True)

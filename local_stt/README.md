@@ -75,6 +75,8 @@ When the extension sends `content_mode=lyrics`, the server switches to a song-fr
 
 The server accepts Chrome extension origins only. HTTP uploads are limited to 16 MiB and 60 seconds of decoded audio, WebSocket frames to 256 KiB, and CPU/GPU inference is serialized. Override these ceilings with `YT_TRANSLATOR_STT_MAX_UPLOAD_BYTES`, `YT_TRANSLATOR_STT_MAX_AUDIO_SECONDS`, and `YT_TRANSLATOR_STT_MAX_STREAM_CHUNK_BYTES` only when needed. The bundled health-check commands supply the required origin header.
 
+The HTTP request body is capped before multipart parsing, allowing 64 KiB of multipart metadata in addition to the file limit. Decoding stops at the audio duration limit and returns HTTP 413. Streaming audio reception continues during inference; only the latest bounded audio window is decoded, and reset/disconnect discards stale results.
+
 When the extension sends `content_mode=live`, the server uses a speech-first hybrid profile for streams that alternate between talking and singing:
 
 - VAD: enabled with a lower speech threshold and boundary padding; when the speech pass is empty, one song-aware, no-VAD lyrics pass checks for sung vocals

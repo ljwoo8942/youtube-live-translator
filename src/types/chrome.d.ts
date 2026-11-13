@@ -49,6 +49,9 @@ declare namespace chrome {
   }
 
   namespace tabs {
+    const onRemoved: {
+      addListener(callback: (tabId: number, removeInfo: { windowId: number; isWindowClosing: boolean }) => void): void;
+    };
     type OnActivatedInfo = {
       tabId: number;
       windowId: number;

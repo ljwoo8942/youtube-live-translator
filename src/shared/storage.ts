@@ -103,6 +103,11 @@ export function toContentSettings(settings: TranslatorSettings, translationConfi
 
 function translationConfigSignature(settings: TranslatorSettings): string {
   return JSON.stringify({
+    enabled: settings.enabled,
+    sourceLanguage: settings.sourceLanguage,
+    targetLanguage: settings.targetLanguage,
+    contentMode: settings.contentMode,
+    lyricsAssistEnabled: settings.lyricsAssistEnabled,
     provider: settings.translationProvider,
     openai: settings.openai,
     apiSttApiKey: settings.apiStt.apiKey,

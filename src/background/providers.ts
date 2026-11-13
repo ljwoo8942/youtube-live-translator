@@ -1,5 +1,6 @@
 import type { ApiAuthHeaderMode, CaptionSegment, TranslationProvider, TranslatorSettings } from "../shared/types";
 import type { CaptionTranslationEntry } from "../shared/messages";
+import { fetchWithTimeout } from "../shared/network";
 
 type JsonObject = Record<string, unknown>;
 type OpenAiCompatibleConfig = {
@@ -202,6 +203,13 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function throwIfCancelled(error: unknown, signal?: AbortSignal): void {
+  signal?.throwIfAborted();
+  if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {
+    throw error;
+  }
+}
+
 function isFetchNetworkError(error: unknown): boolean {
   return /failed to fetch|fetch failed|networkerror|load failed/i.test(getErrorMessage(error));
 }
@@ -246,9 +254,11 @@ function apiConnectionError(error: unknown, target: string, url: string): Error 
 }
 
 async function fetchForProvider(url: string, init: RequestInit | undefined, target: string): Promise<Response> {
+  init?.signal?.throwIfAborted();
   try {
-    return await fetch(url, init);
+    return await fetchWithTimeout(url, init, isLocalBaseUrl(url) ? 120_000 : 60_000);
   } catch (error) {
+    throwIfCancelled(error, init?.signal ?? undefined);
     throw apiConnectionError(error, target, url);
   }
 }
@@ -280,7 +290,8 @@ function openAiTranslationConfig(settings: TranslatorSettings): OpenAiCompatible
   };
 }
 
-async function fetchLmStudioModelIds(baseUrl: string): Promise<string[]> {
+async function fetchLmStudioModelIds(baseUrl: string, signal?: AbortSignal): Promise<string[]> {
+  signal?.throwIfAborted();
   const normalizedBaseUrl = normalizeOpenAiBaseUrl(baseUrl);
   const cached = lmStudioModelCache.get(normalizedBaseUrl);
   if (cached && Date.now() - cached.at < MODEL_DISCOVERY_CACHE_MS) {
@@ -291,7 +302,7 @@ async function fetchLmStudioModelIds(baseUrl: string): Promise<string[]> {
 
   try {
     const nativeUrl = joinUrl(lmStudioNativeBaseUrl(normalizedBaseUrl), "/models");
-    const response = await fetchForProvider(nativeUrl, undefined, "LM Studio 로컬 서버");
+    const response = await fetchForProvider(nativeUrl, { signal }, "LM Studio 로컬 서버");
     const loadedModels = extractModelIds(await readJson(response), true);
     if (loadedModels.length > 0) {
       const uniqueLoadedModels = uniqueStrings(loadedModels);
@@ -299,15 +310,17 @@ async function fetchLmStudioModelIds(baseUrl: string): Promise<string[]> {
       return uniqueLoadedModels;
     }
   } catch (error) {
+    throwIfCancelled(error, signal);
     errors.push(getErrorMessage(error));
   }
 
   const models: string[] = [];
   try {
     const modelsUrl = joinOpenAiUrl(normalizedBaseUrl, "/models");
-    const response = await fetchForProvider(modelsUrl, undefined, "LM Studio OpenAI-compatible API");
+    const response = await fetchForProvider(modelsUrl, { signal }, "LM Studio OpenAI-compatible API");
     models.push(...extractModelIds(await readJson(response)));
   } catch (error) {
+    throwIfCancelled(error, signal);
     errors.push(getErrorMessage(error));
   }
 
@@ -997,7 +1010,8 @@ async function translateWithOpenAiCompatible(
   text: string,
   config: OpenAiCompatibleConfig,
   contextText?: string,
-  qualityGuidance?: string
+  qualityGuidance?: string,
+  signal?: AbortSignal
 ): Promise<string> {
   if (!config.baseUrl.trim()) {
     throw new Error("AI API Base URL이 설정되지 않았습니다.");
@@ -1043,6 +1057,7 @@ async function translateWithOpenAiCompatible(
     url,
     {
       method: "POST",
+      signal,
       headers: {
         "Content-Type": "application/json",
         ...authHeaders(config.apiKey, config.authHeaderMode)
@@ -1058,7 +1073,8 @@ async function translateWithOpenAiCompatible(
 async function translateBatchWithOpenAiCompatible(
   settings: TranslatorSettings,
   segments: CaptionSegment[],
-  config: OpenAiCompatibleConfig
+  config: OpenAiCompatibleConfig,
+  signal?: AbortSignal
 ): Promise<CaptionTranslationEntry[]> {
   if (!config.baseUrl.trim()) {
     throw new Error("AI API Base URL이 설정되지 않았습니다.");
@@ -1104,6 +1120,7 @@ async function translateBatchWithOpenAiCompatible(
     url,
     {
       method: "POST",
+      signal,
       headers: {
         "Content-Type": "application/json",
         ...authHeaders(config.apiKey, config.authHeaderMode)
@@ -1120,7 +1137,8 @@ async function translateWithLmStudio(
   settings: TranslatorSettings,
   text: string,
   contextText?: string,
-  qualityGuidance?: string
+  qualityGuidance?: string,
+  signal?: AbortSignal
 ): Promise<string> {
   const baseConfig = {
     ...settings.lmStudio,
@@ -1130,13 +1148,14 @@ async function translateWithLmStudio(
   let model = baseConfig.model.trim();
 
   if (isPlaceholderModel(model)) {
-    const discoveredModels = await fetchLmStudioModelIds(baseConfig.baseUrl);
+    const discoveredModels = await fetchLmStudioModelIds(baseConfig.baseUrl, signal);
     model = preferTranslationModel(discoveredModels, model);
   }
 
   try {
-    return await translateWithOpenAiCompatible(settings, text, { ...baseConfig, model }, contextText, qualityGuidance);
+    return await translateWithOpenAiCompatible(settings, text, { ...baseConfig, model }, contextText, qualityGuidance, signal);
   } catch (error) {
+    throwIfCancelled(error, signal);
     throw new Error(`LM Studio 번역 실패: ${getErrorMessage(error)}`);
   }
 }
@@ -1145,7 +1164,8 @@ async function translateWithOllama(
   settings: TranslatorSettings,
   text: string,
   contextText?: string,
-  qualityGuidance?: string
+  qualityGuidance?: string,
+  signal?: AbortSignal
 ): Promise<string> {
   if (!settings.ollama.model) {
     throw new Error("Ollama 모델 이름이 설정되지 않았습니다.");
@@ -1166,6 +1186,7 @@ async function translateWithOllama(
     ollamaUrl,
     {
       method: "POST",
+      signal,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model: settings.ollama.model,
@@ -1193,7 +1214,11 @@ async function translateWithOllama(
   throw new Error("Ollama 응답에서 번역문을 찾을 수 없습니다.");
 }
 
-async function translateBatchWithOllama(settings: TranslatorSettings, segments: CaptionSegment[]): Promise<CaptionTranslationEntry[]> {
+async function translateBatchWithOllama(
+  settings: TranslatorSettings,
+  segments: CaptionSegment[],
+  signal?: AbortSignal
+): Promise<CaptionTranslationEntry[]> {
   if (!settings.ollama.model) {
     throw new Error("Ollama 모델 이름이 설정되지 않았습니다.");
   }
@@ -1213,6 +1238,7 @@ async function translateBatchWithOllama(settings: TranslatorSettings, segments: 
     ollamaUrl,
     {
       method: "POST",
+      signal,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model: settings.ollama.model,
@@ -1241,8 +1267,10 @@ async function translateBatchWithOllama(settings: TranslatorSettings, segments: 
 export async function translateSegment(
   settings: TranslatorSettings,
   segment: CaptionSegment,
-  qualityGuidance?: string
+  qualityGuidance?: string,
+  signal?: AbortSignal
 ): Promise<{ translatedText: string; provider: TranslationProvider }> {
+  signal?.throwIfAborted();
   const text = segment.text.trim();
   if (!text) {
     throw new Error("번역할 자막 내용이 없습니다.");
@@ -1256,18 +1284,19 @@ export async function translateSegment(
           text,
           openAiTranslationConfig(settings),
           segment.contextText,
-          qualityGuidance
+          qualityGuidance,
+          signal
         ),
         provider: "openai"
       };
     case "ollama":
       return {
-        translatedText: await translateWithOllama(settings, text, segment.contextText, qualityGuidance),
+        translatedText: await translateWithOllama(settings, text, segment.contextText, qualityGuidance, signal),
         provider: "ollama"
       };
     case "lmStudio":
       return {
-        translatedText: await translateWithLmStudio(settings, text, segment.contextText, qualityGuidance),
+        translatedText: await translateWithLmStudio(settings, text, segment.contextText, qualityGuidance, signal),
         provider: "lmStudio"
       };
     default:
@@ -1277,12 +1306,13 @@ export async function translateSegment(
 
 async function translateSegmentsOneByOne(
   settings: TranslatorSettings,
-  segments: CaptionSegment[]
+  segments: CaptionSegment[],
+  signal?: AbortSignal
 ): Promise<{ translations: CaptionTranslationEntry[]; provider: TranslationProvider | "openai" }> {
   const translations: CaptionTranslationEntry[] = [];
   let provider: TranslationProvider | "openai" = settings.translationProvider;
   for (const segment of segments) {
-    const result = await translateSegment(settings, segment);
+    const result = await translateSegment(settings, segment, undefined, signal);
     provider = result.provider;
     translations.push({ id: segment.id, translatedText: result.translatedText });
   }
@@ -1291,8 +1321,10 @@ async function translateSegmentsOneByOne(
 
 export async function translateSegments(
   settings: TranslatorSettings,
-  segments: CaptionSegment[]
+  segments: CaptionSegment[],
+  signal?: AbortSignal
 ): Promise<{ translations: CaptionTranslationEntry[]; provider: TranslationProvider | "openai" }> {
+  signal?.throwIfAborted();
   const nonEmptySegments = segments.filter((segment) => segment.text.trim());
   if (nonEmptySegments.length === 0) {
     return { translations: [], provider: settings.translationProvider };
@@ -1302,19 +1334,20 @@ export async function translateSegments(
     switch (settings.translationProvider) {
       case "openai":
         return {
-          translations: await translateBatchWithOpenAiCompatible(settings, nonEmptySegments, openAiTranslationConfig(settings)),
+          translations: await translateBatchWithOpenAiCompatible(settings, nonEmptySegments, openAiTranslationConfig(settings), signal),
           provider: "openai"
         };
       case "ollama":
-        return { translations: await translateBatchWithOllama(settings, nonEmptySegments), provider: "ollama" };
+        return { translations: await translateBatchWithOllama(settings, nonEmptySegments, signal), provider: "ollama" };
       case "lmStudio":
-        return translateSegmentsOneByOne(settings, nonEmptySegments);
+        return translateSegmentsOneByOne(settings, nonEmptySegments, signal);
       default:
         throw new Error("지원하지 않는 번역 provider입니다.");
     }
   } catch (error) {
+    throwIfCancelled(error, signal);
     console.warn("Batch translation failed; falling back to single segment translation.", error);
-    return translateSegmentsOneByOne(settings, nonEmptySegments);
+    return translateSegmentsOneByOne(settings, nonEmptySegments, signal);
   }
 }
 
@@ -1376,7 +1409,9 @@ async function transcribeOpenAiCompatible(config: {
   mimeType: string;
   sourceLanguage: string;
   contentMode?: string;
+  signal?: AbortSignal;
 }): Promise<string> {
+  config.signal?.throwIfAborted();
   const form = new FormData();
   const blob = new Blob([config.audioBuffer], { type: config.mimeType || "audio/webm" });
   form.append("file", blob, "youtube-audio.webm");
@@ -1395,12 +1430,14 @@ async function transcribeOpenAiCompatible(config: {
   const sttUrl = joinOpenAiUrl(config.baseUrl, config.endpoint);
   let response: Response;
   try {
-    response = await fetch(sttUrl, {
+    response = await fetchWithTimeout(sttUrl, {
       method: "POST",
+      signal: config.signal,
       headers: authHeaders(config.apiKey, config.authHeaderMode),
       body: form
-    });
+    }, isLocalBaseUrl(config.baseUrl) ? 120_000 : 60_000);
   } catch (error) {
+    throwIfCancelled(error, config.signal);
     if (isLocalBaseUrl(config.baseUrl)) {
       throw localSttConnectionError(error);
     }
@@ -1416,7 +1453,12 @@ async function transcribeOpenAiCompatible(config: {
   throw new Error("STT 응답에서 transcript를 찾을 수 없습니다.");
 }
 
-async function transcribeWithWhisperSettings(settings: TranslatorSettings, audioBuffer: ArrayBuffer, mimeType: string): Promise<string> {
+async function transcribeWithWhisperSettings(
+  settings: TranslatorSettings,
+  audioBuffer: ArrayBuffer,
+  mimeType: string,
+  signal?: AbortSignal
+): Promise<string> {
   return transcribeOpenAiCompatible({
     baseUrl: settings.whisper.baseUrl,
     endpoint: settings.whisper.endpoint,
@@ -1425,11 +1467,18 @@ async function transcribeWithWhisperSettings(settings: TranslatorSettings, audio
     audioBuffer,
     mimeType,
     sourceLanguage: settings.sourceLanguage,
-    contentMode: settings.contentMode
+    contentMode: settings.contentMode,
+    signal
   });
 }
 
-export async function transcribeAudio(settings: TranslatorSettings, audioBuffer: ArrayBuffer, mimeType: string): Promise<string> {
+export async function transcribeAudio(
+  settings: TranslatorSettings,
+  audioBuffer: ArrayBuffer,
+  mimeType: string,
+  signal?: AbortSignal
+): Promise<string> {
+  signal?.throwIfAborted();
   if (settings.sttProvider === "openai") {
     const apiKey = settings.apiStt.apiKey || settings.openai.apiKey;
     if (!apiKey && settings.apiStt.authHeaderMode !== "none") {
@@ -1444,7 +1493,8 @@ export async function transcribeAudio(settings: TranslatorSettings, audioBuffer:
       audioBuffer,
       mimeType,
       sourceLanguage: settings.sourceLanguage,
-      contentMode: settings.contentMode
+      contentMode: settings.contentMode,
+      signal
     });
   }
 
@@ -1460,16 +1510,18 @@ export async function transcribeAudio(settings: TranslatorSettings, audioBuffer:
           audioBuffer,
           mimeType,
           sourceLanguage: settings.sourceLanguage,
-          contentMode: settings.contentMode
+          contentMode: settings.contentMode,
+          signal
         });
       } catch (error) {
+        throwIfCancelled(error, signal);
         console.warn("LM Studio STT failed; falling back to Whisper-compatible provider.", error);
       }
     }
-    return transcribeWithWhisperSettings(settings, audioBuffer, mimeType);
+    return transcribeWithWhisperSettings(settings, audioBuffer, mimeType, signal);
   }
 
-  return transcribeWithWhisperSettings(settings, audioBuffer, mimeType);
+  return transcribeWithWhisperSettings(settings, audioBuffer, mimeType, signal);
 }
 
 function localHealthUrl(baseUrl: string): string | undefined {
@@ -1488,21 +1540,8 @@ function localHealthUrl(baseUrl: string): string | undefined {
   }
 }
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timeoutId = globalThis.setTimeout(() => {
-      reject(new Error(message));
-    }, timeoutMs);
-
-    promise
-      .then(resolve, reject)
-      .finally(() => {
-        globalThis.clearTimeout(timeoutId);
-      });
-  });
-}
-
-export async function assertTranscriptionReady(settings: TranslatorSettings): Promise<void> {
+export async function assertTranscriptionReady(settings: TranslatorSettings, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
   if (settings.sttProvider === "openai") {
     const apiKey = settings.apiStt.apiKey || settings.openai.apiKey;
     if (!apiKey && settings.apiStt.authHeaderMode !== "none") {
@@ -1529,8 +1568,9 @@ export async function assertTranscriptionReady(settings: TranslatorSettings): Pr
 
   let response: Response;
   try {
-    response = await withTimeout(fetch(healthUrl), 45_000, "로컬 STT 서버 health 응답이 지연되고 있습니다.");
+    response = await fetchWithTimeout(healthUrl, { signal }, 45_000);
   } catch (error) {
+    throwIfCancelled(error, signal);
     throw localSttConnectionError(error);
   }
   const text = await response.text();

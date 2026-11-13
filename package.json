@@ -10,7 +10,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
-    "test:contracts": "node --test tests/layout-audio-contract.test.mjs",
+    "test:contracts": "node --test tests/*.test.mjs",
     "preview": "vite preview",
     "stt:setup": "uv python install 3.11 && uv venv --allow-existing --python 3.11 .venv-stt && uv pip install --python .venv-stt -r local_stt/requirements.txt",
     "stt:start": "uv run --no-project --python .venv-stt python -m uvicorn local_stt.app:app --host 127.0.0.1 --port 8765",
@@ -22,6 +22,6 @@
   },
   "devDependencies": {
     "typescript": "^5.8.3",
-    "vite": "^6.3.5"
+    "vite": "^6.4.6"
   }
 }

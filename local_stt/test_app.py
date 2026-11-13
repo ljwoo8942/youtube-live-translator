@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import unittest
+import asyncio
+import io
+import threading
+import wave
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -13,6 +17,16 @@ from starlette.websockets import WebSocketDisconnect
 
 from local_stt import app
 from local_stt.mlx_backend import MlxWhisperModel
+
+
+def wav_bytes(seconds: float) -> bytes:
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(np.full(int(16000 * seconds), 3000, dtype="<i2").tobytes())
+    return output.getvalue()
 
 
 class FakeWhisperModel:
@@ -94,6 +108,83 @@ class ModeConfigurationTests(unittest.TestCase):
                 app._validate_audio_length(np.zeros(app.STREAM_SAMPLE_RATE + 1, dtype=np.float32))
 
         self.assertEqual(raised.exception.status_code, 413)
+
+    def test_request_limit_rejects_known_and_chunked_bodies_before_multipart_parsing(self) -> None:
+        for encoding in ("known", "chunked", "misdeclared"):
+            with (
+                self.subTest(encoding=encoding),
+                mock.patch.object(app, "MAX_UPLOAD_BYTES", 1024),
+                mock.patch("starlette.formparsers.SpooledTemporaryFile") as spool,
+                mock.patch.object(app, "_load_model") as load_model,
+            ):
+                data = b"x" * (66 * 1024)
+                headers = {
+                    "Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+                    "Content-Type": "multipart/form-data; boundary=example",
+                }
+                if encoding == "misdeclared":
+                    headers["Content-Length"] = "1"
+                response = TestClient(app.app).post(
+                    "/v1/audio/transcriptions",
+                    content=iter([data[:33000], data[33000:]]) if encoding == "chunked" else data,
+                    headers=headers,
+                )
+                self.assertEqual(response.status_code, 413)
+                spool.assert_not_called()
+                load_model.assert_not_called()
+
+    def test_decoded_limit_returns_413_and_valid_audio_still_transcribes(self) -> None:
+        model = FakeWhisperModel()
+        with (
+            mock.patch.object(app, "MAX_DECODED_AUDIO_SECONDS", 1),
+            mock.patch.object(app, "_load_model", return_value=model),
+        ):
+            client = TestClient(app.app)
+            for seconds, status in ((2, 413), (0.5, 200)):
+                with self.subTest(seconds=seconds):
+                    response = client.post(
+                        "/v1/audio/transcriptions",
+                        files={"file": ("test.wav", wav_bytes(seconds), "audio/wav")},
+                        headers={"Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop"},
+                    )
+                    self.assertEqual(response.status_code, status)
+                    if status == 413:
+                        self.assertFalse(model.kwargs)
+                    else:
+                        self.assertEqual(response.json()["text"], "")
+                        self.assertTrue(model.kwargs)
+
+    def test_malformed_short_audio_keeps_empty_success_response(self) -> None:
+        with mock.patch.object(app, "_load_model", return_value=FakeWhisperModel()):
+            response = TestClient(app.app).post(
+                "/v1/audio/transcriptions",
+                files={"file": ("test.webm", b"undecodable", "audio/webm")},
+                headers={"Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop"},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["text"], "")
+        self.assertTrue(response.json()["decode_error"])
+
+    def test_decoder_checks_resampled_frames_before_allocating_arrays_including_flush(self) -> None:
+        for overflow_in_flush in (False, True):
+            with self.subTest(overflow_in_flush=overflow_in_flush):
+                first = SimpleNamespace(
+                    samples=16000 if overflow_in_flush else 16001,
+                    to_ndarray=mock.Mock(return_value=np.zeros((1, 16000), dtype=np.int16)),
+                )
+                tail = SimpleNamespace(samples=1, to_ndarray=mock.Mock())
+                resampler = SimpleNamespace(resample=mock.Mock(side_effect=[[first], [tail]]))
+                container = SimpleNamespace(decode=mock.Mock(return_value=iter([SimpleNamespace(pts=1)])))
+                with (
+                    mock.patch.object(app, "MAX_DECODED_AUDIO_SECONDS", 1),
+                    mock.patch("av.open", return_value=nullcontext(container)),
+                    mock.patch("av.audio.resampler.AudioResampler", return_value=resampler),
+                ):
+                    with self.assertRaises(app.HTTPException) as raised:
+                        app._decode_audio("test.wav")
+                self.assertEqual(raised.exception.status_code, 413)
+                self.assertEqual(first.to_ndarray.call_count, 1 if overflow_in_flush else 0)
+                tail.to_ndarray.assert_not_called()
 
     def test_untrusted_websocket_origin_is_rejected(self) -> None:
         with self.assertRaises(WebSocketDisconnect) as raised:
@@ -405,7 +496,7 @@ class MlxBackendTests(unittest.TestCase):
             mock.patch.object(app, "DEFAULT_DEVICE", "mlx"),
             mock.patch.object(app, "DEFAULT_VAD", False),
             mock.patch.object(app, "_load_model", return_value=self.model),
-            mock.patch("faster_whisper.audio.decode_audio", return_value=np.full(32000, 0.1, dtype=np.float32)),
+            mock.patch.object(app, "_decode_audio", return_value=np.full(32000, 0.1, dtype=np.float32)),
         ):
             response = TestClient(app.app).post(
                 "/v1/audio/transcriptions",
@@ -453,6 +544,151 @@ class StreamBufferTests(unittest.TestCase):
             app._join_stream_samples(chunks),
             np.asarray([2.0, 3.0, 4.0, 5.0, 6.0], dtype=np.float32),
         )
+
+
+class FakeStreamSocket:
+    headers = {"origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop"}
+    query_params: dict[str, str] = {}
+
+    def __init__(self, expected_results: int) -> None:
+        self.incoming: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        self.sent: list[dict[str, object]] = []
+        self.expected_results = expected_results
+
+    async def accept(self) -> None:
+        pass
+
+    async def receive(self) -> dict[str, object]:
+        message = await self.incoming.get()
+        self.incoming.task_done()
+        return message
+
+    async def send_json(self, message: dict[str, object]) -> None:
+        self.sent.append(message)
+        if len(self.sent) >= self.expected_results:
+            self.incoming.put_nowait({"type": "websocket.disconnect"})
+
+    def audio(self, value: int, samples: int = 800) -> None:
+        self.incoming.put_nowait({"bytes": np.full(samples, value, dtype="<i2").tobytes()})
+
+
+class StreamSchedulingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_finalization_retains_audio_received_while_inference_is_running(self) -> None:
+        socket = FakeStreamSocket(3)
+        started = [threading.Event(), threading.Event()]
+        release = [threading.Event(), threading.Event()]
+        windows: list[np.ndarray] = []
+
+        def infer(_model: object, audio: np.ndarray, *_args: object) -> tuple[str, bool, int]:
+            index = len(windows)
+            windows.append(audio.copy())
+            if index < 2:
+                started[index].set()
+                self.assertTrue(release[index].wait(3))
+            return "same spoken line" if index < 2 else "next spoken line", False, 1
+
+        with (
+            mock.patch.object(app, "_load_model", return_value=object()),
+            mock.patch.object(app, "_stream_profile_for_model", return_value=(1, 0, 0.01, 100, 0)),
+            mock.patch.object(app, "_startup_stream_timing", return_value=(0.01, 100)),
+            mock.patch.object(app, "_stream_transcribe_text", side_effect=infer),
+        ):
+            socket.audio(1)
+            task = asyncio.create_task(app.audio_stream(socket))
+            try:
+                for index in range(2):
+                    self.assertTrue(await asyncio.to_thread(started[index].wait, 2))
+                    socket.audio(index + 2)
+                    await asyncio.wait_for(socket.incoming.join(), 2)
+                    release[index].set()
+                await asyncio.wait_for(task, 3)
+            finally:
+                for event in release:
+                    event.set()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual([message["type"] for message in socket.sent], ["partial", "final", "partial"])
+        self.assertEqual([window.size for window in windows], [800, 1600, 800])
+        self.assertAlmostEqual(float(windows[2][0]), 3 / 32768)
+
+    async def test_slow_inference_reads_latest_bounded_window_without_frame_backlog(self) -> None:
+        socket = FakeStreamSocket(2)
+        started, release = threading.Event(), threading.Event()
+        windows: list[np.ndarray] = []
+
+        def infer(_model: object, audio: np.ndarray, *_args: object) -> tuple[str, bool, int]:
+            windows.append(audio.copy())
+            if len(windows) == 1:
+                started.set()
+                self.assertTrue(release.wait(3))
+            return f"fresh speech {len(windows)}", False, 1
+
+        with (
+            mock.patch.object(app, "_load_model", return_value=object()),
+            mock.patch.object(app, "_stream_profile_for_model", return_value=(1, 0, 0.01, 100, 0)),
+            mock.patch.object(app, "_startup_stream_timing", return_value=(0.01, 100)),
+            mock.patch.object(app, "_stream_transcribe_text", side_effect=infer),
+        ):
+            socket.audio(1)
+            task = asyncio.create_task(app.audio_stream(socket))
+            try:
+                self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                for value in range(2, 42):
+                    socket.audio(value)
+                await asyncio.wait_for(socket.incoming.join(), 2)
+                release.set()
+                await asyncio.wait_for(task, 3)
+            finally:
+                release.set()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(len(windows), 2)
+        self.assertEqual(windows[1].size, 16000)
+        self.assertAlmostEqual(float(windows[1][-1]), 41 / 32768)
+        self.assertEqual([result["end_ms"] for result in socket.sent], [50, 2050])
+
+    async def test_reset_drops_in_flight_result_and_disconnect_drops_pending_work(self) -> None:
+        for disconnect in (False, True):
+            with self.subTest(disconnect=disconnect):
+                socket = FakeStreamSocket(1)
+                started, release = threading.Event(), threading.Event()
+                windows: list[np.ndarray] = []
+
+                def infer(_model: object, audio: np.ndarray, *_args: object) -> tuple[str, bool, int]:
+                    windows.append(audio.copy())
+                    if len(windows) == 1:
+                        started.set()
+                        self.assertTrue(release.wait(3))
+                    return f"fresh speech {len(windows)}", False, 1
+
+                with (
+                    mock.patch.object(app, "_load_model", return_value=object()),
+                    mock.patch.object(app, "_stream_profile_for_model", return_value=(1, 0, 0.01, 100, 0)),
+                    mock.patch.object(app, "_startup_stream_timing", return_value=(0.01, 100)),
+                    mock.patch.object(app, "_stream_transcribe_text", side_effect=infer),
+                ):
+                    socket.audio(1)
+                    task = asyncio.create_task(app.audio_stream(socket))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                        socket.incoming.put_nowait({"type": "websocket.disconnect"} if disconnect else {"text": "reset"})
+                        if not disconnect:
+                            socket.audio(9)
+                        await asyncio.wait_for(socket.incoming.join(), 2)
+                        release.set()
+                        await asyncio.wait_for(task, 3)
+                    finally:
+                        release.set()
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                if disconnect:
+                    self.assertEqual(socket.sent, [])
+                    self.assertEqual(len(windows), 1)
+                else:
+                    self.assertEqual(len(socket.sent), 1)
+                    self.assertEqual(socket.sent[0]["text"], "fresh speech 2")
+                    self.assertEqual(socket.sent[0]["end_ms"], 50)
+                    self.assertAlmostEqual(float(windows[1][0]), 9 / 32768)
 
 
 if __name__ == "__main__":

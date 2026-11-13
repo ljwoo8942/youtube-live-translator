@@ -67,7 +67,12 @@ let startingAudioCapture:
   | undefined;
 let audioLifecycleQueue: Promise<void> = Promise.resolve();
 const translationCache = new Map<string, string>();
-const translationInFlight = new Map<string, Promise<MessageResponse<{ translatedText: string; provider: string }>>>();
+type TranslationRequest = {
+  promise: Promise<MessageResponse<{ translatedText: string; provider: string }>>;
+  controller: AbortController;
+  users: number;
+};
+const translationInFlight = new Map<string, TranslationRequest>();
 type AudioChunkMessage = Extract<RuntimeMessage, { type: "AUDIO_CHUNK" }>;
 type AudioQueueState = { videoId: string; processing: boolean; pending?: AudioChunkMessage };
 const audioQueues = new Map<number, AudioQueueState>();
@@ -76,7 +81,16 @@ const audioNoSpeechNotices = new Map<number, number>();
 const audioLastProcessedAt = new Map<number, number>();
 const lastFinalTranscriptByTab = new Map<number, { text: string; at: number }>();
 const lastPartialTranslationByTab = new Map<number, { text: string; at: number }>();
-const streamTranslationGenerationByTab = new Map<number, number>();
+type StreamTranslationQueue = {
+  videoId: string;
+  controller: AbortController;
+  pending?: { segment: CaptionSegment; isFinal: boolean; revision: number };
+  pendingFinal?: { segment: CaptionSegment; isFinal: boolean; revision: number };
+};
+const streamTranslationQueuesByTab = new Map<number, StreamTranslationQueue>();
+const audioRequestControllers = new Map<number, AbortController>();
+const captionRequestControllers = new Map<number, AbortController>();
+let lastTranslationConfigRevision: number | undefined;
 const audioContextByTab = new Map<number, string[]>();
 const lyricsAssistByTab = new Map<number, LyricsAssistSession>();
 type CaptionLyricsAssistState = {
@@ -100,6 +114,7 @@ void chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" }).ca
 type PretranslateJob = {
   cancelled: boolean;
   currentTimeMs: number;
+  controller: AbortController;
 };
 type PretranslateBudget = { segments: number; characters: number };
 
@@ -1610,13 +1625,16 @@ function shouldStopCaptureAfterApiError(error: string): boolean {
 }
 
 function clearAudioQueue(tabId: number): void {
+  audioRequestControllers.get(tabId)?.abort();
+  audioRequestControllers.delete(tabId);
+  streamTranslationQueuesByTab.get(tabId)?.controller.abort();
+  streamTranslationQueuesByTab.delete(tabId);
   audioQueues.delete(tabId);
   audioFailureCooldowns.delete(tabId);
   audioNoSpeechNotices.delete(tabId);
   audioLastProcessedAt.delete(tabId);
   lastFinalTranscriptByTab.delete(tabId);
   lastPartialTranslationByTab.delete(tabId);
-  streamTranslationGenerationByTab.delete(tabId);
   audioContextByTab.delete(tabId);
   lyricsAssistByTab.delete(tabId);
   correctionSessionsByTab.delete(tabId);
@@ -1624,6 +1642,24 @@ function clearAudioQueue(tabId: number): void {
 
 function isActiveAudioSession(tabId: number, videoId: string): boolean {
   return tabId === activeAudioTabId && videoId === activeAudioVideoId;
+}
+
+function captionRequestController(tabId: number): AbortController {
+  let controller = captionRequestControllers.get(tabId);
+  if (!controller || controller.signal.aborted) {
+    controller = new AbortController();
+    captionRequestControllers.set(tabId, controller);
+  }
+  return controller;
+}
+
+function audioRequestController(tabId: number): AbortController {
+  let controller = audioRequestControllers.get(tabId);
+  if (!controller) {
+    controller = new AbortController();
+    audioRequestControllers.set(tabId, controller);
+  }
+  return controller;
 }
 
 async function stopAudioCaptureAfterFatalError(tabId: number, videoId: string, error: string): Promise<void> {
@@ -1636,8 +1672,13 @@ async function stopAudioCaptureAfterFatalError(tabId: number, videoId: string, e
   setAudioFailureCooldown(tabId, error, videoId);
 }
 
-async function translateAndRespond(segment: CaptionSegment): Promise<MessageResponse<{ translatedText: string; provider: string }>> {
-  const settings = await loadSettings();
+async function translateAndRespond(
+  segment: CaptionSegment,
+  signal?: AbortSignal,
+  settings?: TranslatorSettings
+): Promise<MessageResponse<{ translatedText: string; provider: string }>> {
+  settings ??= await loadSettings();
+  signal?.throwIfAborted();
   const effectiveSettings =
     segment.detectedContentMode && segment.detectedContentMode !== settings.contentMode
       ? { ...settings, contentMode: segment.detectedContentMode }
@@ -1655,37 +1696,55 @@ async function translateAndRespond(segment: CaptionSegment): Promise<MessageResp
     return { ok: true, translatedText: cached, provider: "cache" };
   }
 
-  const inFlight = translationInFlight.get(key);
-  if (inFlight) {
-    return inFlight;
-  }
-
-  const translationPromise: Promise<MessageResponse<{ translatedText: string; provider: string }>> = (async () => {
-    try {
-      let result = await translateSegment(effectiveSettings, segment);
-      let translatedText = sanitizeTranslatedSubtitle(segment, result.translatedText, effectiveSettings);
-      if (!translatedText) {
-        const correctionGuidance = translationCorrectionGuidance(segment, result.translatedText, effectiveSettings);
-        if (correctionGuidance) {
-          result = await translateSegment(effectiveSettings, segment, correctionGuidance);
-          translatedText = sanitizeTranslatedSubtitle(segment, result.translatedText, effectiveSettings);
+  let request = translationInFlight.get(key);
+  if (!request) {
+    const controller = new AbortController();
+    const translationPromise: TranslationRequest["promise"] = (async () => {
+      try {
+        let result = await translateSegment(effectiveSettings, segment, undefined, controller.signal);
+        let translatedText = sanitizeTranslatedSubtitle(segment, result.translatedText, effectiveSettings);
+        if (!translatedText) {
+          const correctionGuidance = translationCorrectionGuidance(segment, result.translatedText, effectiveSettings);
+          if (correctionGuidance) {
+            controller.signal.throwIfAborted();
+            result = await translateSegment(effectiveSettings, segment, correctionGuidance, controller.signal);
+            translatedText = sanitizeTranslatedSubtitle(segment, result.translatedText, effectiveSettings);
+          }
         }
-      }
-      if (!translatedText) {
-        return { ok: false as const, error: BLOCKED_HALLUCINATION_ERROR };
-      }
-      rememberTranslation(key, translatedText);
+        if (!translatedText) {
+          return { ok: false as const, error: BLOCKED_HALLUCINATION_ERROR };
+        }
+        controller.signal.throwIfAborted();
+        rememberTranslation(key, translatedText);
 
-      return { ok: true as const, translatedText, provider: result.provider };
-    } catch (error) {
-      return { ok: false as const, error: getErrorMessage(error) };
+        return { ok: true as const, translatedText, provider: result.provider };
+      } catch (error) {
+        return { ok: false as const, error: getErrorMessage(error) };
+      }
+    })().finally(() => {
+      if (translationInFlight.get(key) === request) translationInFlight.delete(key);
+    });
+    request = { promise: translationPromise, controller, users: 0 };
+    translationInFlight.set(key, request);
+  }
+  request.users += 1;
+  let cancel: (() => void) | undefined;
+  try {
+    return await new Promise((resolve, reject) => {
+      cancel = () => reject(signal?.reason);
+      signal?.addEventListener("abort", cancel, { once: true });
+      if (signal?.aborted) cancel();
+      request.promise.then(resolve, reject);
+    });
+  } finally {
+    if (cancel) signal?.removeEventListener("abort", cancel);
+    request.users -= 1;
+    // A visible caption may still need a request whose pretranslation consumer was cancelled.
+    if (request.users === 0) {
+      request.controller.abort();
+      if (translationInFlight.get(key) === request) translationInFlight.delete(key);
     }
-  })().finally(() => {
-    translationInFlight.delete(key);
-  });
-
-  translationInFlight.set(key, translationPromise);
-  return translationPromise;
+  }
 }
 
 function entriesFromCache(segments: CaptionSegment[], cached: Map<string, string>): CaptionTranslationEntry[] {
@@ -1715,6 +1774,7 @@ function cancelTabPretranslationJobs(tabId: number, exceptKey?: string, keepVide
   for (const [key, job] of pretranslateJobs.entries()) {
     if (key.startsWith(prefix) && key !== exceptKey && (!keepVideoId || !key.startsWith(`${prefix}${keepVideoId}|`))) {
       job.cancelled = true;
+      job.controller.abort();
       pretranslateJobs.delete(key);
     }
   }
@@ -1844,8 +1904,15 @@ async function handlePretranslateCaptions(
     return { ok: false, error: "선번역을 요청한 YouTube 탭을 찾지 못했습니다." };
   }
 
-  const settings = await loadSettings();
+  const admission = captionRequestController(tabId);
+  const snapshot = await loadSettingsSnapshot();
+  const settings = snapshot.settings;
+  lastTranslationConfigRevision ??= snapshot.translationConfigRevision;
+  if (admission.signal.aborted || message.translationConfigRevision !== snapshot.translationConfigRevision) {
+    return { ok: false, error: "번역 설정이 변경되어 선번역을 취소했습니다." };
+  }
   const lyricsAssistedSegments = await addCaptionLyricsAssist(tabId, message.videoId, settings, message.segments, true);
+  if (admission.signal.aborted) return { ok: false, error: "선번역 요청이 취소되었습니다." };
   const segments = addCaptionContext(lyricsAssistedSegments, lyricsAssistedSegments, settings);
   const assistedMessage = { ...message, segments };
   const context = createCaptionCacheContext(settings, message.videoId, message.captionHash, message.trackLanguage);
@@ -1866,7 +1933,9 @@ async function handlePretranslateCaptions(
     });
   }
 
-  if (!settings.enabled || !settings.pretranslateEnabled || segments.length === 0) {
+  const current = await loadSettingsSnapshot();
+  if (admission.signal.aborted || current.translationConfigRevision !== snapshot.translationConfigRevision ||
+      !current.settings.enabled || !current.settings.pretranslateEnabled || segments.length === 0) {
     return { ok: true, translations: cachedEntries, total: segments.length, cached: cachedEntries.length };
   }
 
@@ -1886,13 +1955,14 @@ async function handlePretranslateCaptions(
   }
 
   cancelTabPretranslationJobs(tabId, jobKey);
-  const job: PretranslateJob = { cancelled: false, currentTimeMs: message.currentTimeMs };
+  const job: PretranslateJob = { cancelled: false, currentTimeMs: message.currentTimeMs, controller: new AbortController() };
   pretranslateJobs.set(jobKey, job);
 
   void runPretranslationJob(tabId, jobKey, job, context, settings, assistedMessage, cachedMap).catch(async (error) => {
     if (pretranslateJobs.get(jobKey) === job) {
       pretranslateJobs.delete(jobKey);
     }
+    if (job.cancelled) return;
     await notifyTab(tabId, {
       type: "PRETRANSLATE_PROGRESS",
       videoId: message.videoId,
@@ -1963,7 +2033,7 @@ async function runPretranslationJob(
     }
     budget.segments += batch.length;
     budget.characters += batch.reduce((total, segment) => total + segment.text.length, 0);
-    const result = await translatePretranslationBatch(settings, batch);
+    const result = await translatePretranslationBatch(settings, batch, job.controller.signal);
     if (job.cancelled) {
       break;
     }
@@ -2023,12 +2093,13 @@ async function runPretranslationJob(
 
 async function translatePretranslationBatch(
   settings: Awaited<ReturnType<typeof loadSettings>>,
-  batch: CaptionSegment[]
+  batch: CaptionSegment[],
+  signal?: AbortSignal
 ): Promise<{ translations: CaptionTranslationEntry[]; provider: string }> {
   if (batch.length === 1) {
     // Near the playback position, reuse the same high-quality single-subtitle
     // request as the visible overlay instead of making it compete with a JSON batch.
-    const response = await translateAndRespond(batch[0]);
+    const response = await translateAndRespond(batch[0], signal, settings);
     if (!response.ok) {
       if (isBlockedHallucinationError(response.error)) {
         return { translations: [], provider: settings.translationProvider };
@@ -2047,7 +2118,7 @@ async function translatePretranslationBatch(
       // The visible-caption request and the pretranslation job often arrive together.
       // Reuse the same in-flight LM Studio request so a single local model does not
       // spend two turns translating the same subtitle line.
-      const response = await translateAndRespond(segment);
+      const response = await translateAndRespond(segment, signal, settings);
       if (!response.ok) {
         if (isBlockedHallucinationError(response.error)) {
           continue;
@@ -2059,7 +2130,7 @@ async function translatePretranslationBatch(
     return { translations, provider: "lmStudio" };
   }
 
-  return translateSegments(settings, batch);
+  return translateSegments(settings, batch, signal);
 }
 
 function audioTransportConfig(settings: TranslatorSettings): {
@@ -2404,6 +2475,17 @@ async function broadcastContentSettings(settings: TranslatorSettings, revision: 
     return;
   }
   lastBroadcastSettingsRevision = revision;
+  if (lastTranslationConfigRevision !== translationConfigRevision || !settings.enabled) {
+    for (const [tabId] of audioRequestControllers) clearAudioQueue(tabId);
+    for (const controller of captionRequestControllers.values()) controller.abort();
+    captionRequestControllers.clear();
+    for (const job of pretranslateJobs.values()) {
+      job.cancelled = true;
+      job.controller.abort();
+    }
+    pretranslateJobs.clear();
+  }
+  lastTranslationConfigRevision = translationConfigRevision;
   const tabs = await chrome.tabs.query({ url: ["*://www.youtube.com/*", "*://m.youtube.com/*"] });
   const message: RuntimeMessage = {
     type: "SETTINGS_UPDATED",
@@ -2415,6 +2497,13 @@ async function broadcastContentSettings(settings: TranslatorSettings, revision: 
 
 async function saveSettingsPatch(patch: Partial<TranslatorSettings>) {
   const snapshot = await patchSettings(patch);
+  if (!snapshot.settings.enabled || !snapshot.settings.pretranslateEnabled) {
+    for (const job of pretranslateJobs.values()) {
+      job.cancelled = true;
+      job.controller.abort();
+    }
+    pretranslateJobs.clear();
+  }
   if ("targetLanguage" in patch) {
     correctionSessionsByTab.clear();
   }
@@ -2450,6 +2539,11 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   const tabUrl = changeInfo.url ?? tab.url;
+  if (changeInfo.url) {
+    captionRequestControllers.get(tabId)?.abort();
+    captionRequestControllers.delete(tabId);
+    cancelTabPretranslationJobs(tabId);
+  }
   if (changeInfo.url || changeInfo.status === "loading") {
     void stopAudioCaptureOutsideYouTube(tabId, tabUrl);
   }
@@ -2459,6 +2553,13 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 void initializeActionAvailability();
+chrome.tabs.onRemoved.addListener((tabId) => {
+  captionRequestControllers.get(tabId)?.abort();
+  captionRequestControllers.delete(tabId);
+  cancelTabPretranslationJobs(tabId);
+  clearAudioQueue(tabId);
+  if (activeAudioTabId === tabId) void stopAudioCapture(tabId);
+});
 void stopStaleAudioCaptureOnStartup();
 
 function segmentWithAudioContext(tabId: number, segment: CaptionSegment): CaptionSegment {
@@ -2504,14 +2605,14 @@ async function handleAudioChunk(message: AudioChunkMessage): Promise<MessageResp
   audioQueues.set(message.tabId, queue);
 
   void processQueuedAudio(message.tabId, message, queue).catch(async (error) => {
-    if (audioQueues.get(message.tabId) === queue) {
-      audioQueues.delete(message.tabId);
-    }
+    if (audioQueues.get(message.tabId) !== queue) return;
+    audioQueues.delete(message.tabId);
     if (!isActiveAudioSession(message.tabId, message.videoId)) {
       return;
     }
     await notifyTab(message.tabId, {
       type: "TRANSLATION_ERROR",
+      translationConfigRevision: (await loadSettingsSnapshot()).translationConfigRevision,
       error: getErrorMessage(error),
       videoId: message.videoId
     });
@@ -2555,7 +2656,9 @@ async function processQueuedAudio(
 }
 
 async function processAudioChunk(message: Extract<RuntimeMessage, { type: "AUDIO_CHUNK" }>): Promise<void> {
-  const settings = await loadSettings();
+  const controller = audioRequestController(message.tabId);
+  const { settings, translationConfigRevision } = await loadSettingsSnapshot();
+  lastTranslationConfigRevision ??= translationConfigRevision;
   if (!settings.enabled || message.tabId !== activeAudioTabId || message.videoId !== activeAudioVideoId) {
     return;
   }
@@ -2564,19 +2667,20 @@ async function processAudioChunk(message: Extract<RuntimeMessage, { type: "AUDIO
   try {
     audioLastProcessedAt.set(message.tabId, Date.now());
     transcript = sanitizeAudioTranscript(
-      await transcribeAudio(settings, base64ToArrayBuffer(message.audioBase64), message.mimeType),
+      await transcribeAudio(settings, base64ToArrayBuffer(message.audioBase64), message.mimeType, controller.signal),
       settings.contentMode === "lyrics" ||
         (settings.lyricsAssistEnabled && settings.contentMode !== "spoken")
     );
     audioFailureCooldowns.delete(message.tabId);
   } catch (error) {
-    if (!isActiveAudioSession(message.tabId, message.videoId)) {
+    if (controller.signal.aborted || !isActiveAudioSession(message.tabId, message.videoId)) {
       return;
     }
     const errorMessage = getErrorMessage(error);
     setAudioFailureCooldown(message.tabId, errorMessage, message.videoId);
     await notifyTab(message.tabId, {
       type: "TRANSLATION_ERROR",
+      translationConfigRevision,
       error: `STT 오류: ${errorMessage}`,
       videoId: message.videoId
     });
@@ -2585,7 +2689,7 @@ async function processAudioChunk(message: Extract<RuntimeMessage, { type: "AUDIO
     }
     return;
   }
-  if (message.tabId !== activeAudioTabId || message.videoId !== activeAudioVideoId) {
+  if (controller.signal.aborted || message.tabId !== activeAudioTabId || message.videoId !== activeAudioVideoId) {
     return;
   }
 
@@ -2621,10 +2725,11 @@ async function processAudioChunk(message: Extract<RuntimeMessage, { type: "AUDIO
 
   const correction = await matchUserCorrection(message.tabId, message.videoId, segment, true);
   if (correction) {
-    if (isActiveAudioSession(message.tabId, message.videoId)) {
+    if (!controller.signal.aborted && isActiveAudioSession(message.tabId, message.videoId)) {
       rememberAudioContext(message.tabId, segment.text);
       await notifyTab(message.tabId, {
         type: "TRANSLATION_READY",
+        translationConfigRevision,
         segment,
         translatedText: correction.translatedText,
         provider: correction.provider,
@@ -2634,14 +2739,16 @@ async function processAudioChunk(message: Extract<RuntimeMessage, { type: "AUDIO
     return;
   }
 
-  const translation = await translateAndRespond(segmentWithAudioContext(message.tabId, segment));
-  if (!isActiveAudioSession(message.tabId, message.videoId)) {
+  if (controller.signal.aborted) return;
+  const translation = await translateAndRespond(segmentWithAudioContext(message.tabId, segment), controller.signal, settings);
+  if (controller.signal.aborted || !isActiveAudioSession(message.tabId, message.videoId)) {
     return;
   }
   if (translation.ok) {
     rememberAudioContext(message.tabId, segment.text);
     await notifyTab(message.tabId, {
       type: "TRANSLATION_READY",
+      translationConfigRevision,
       segment,
       translatedText: translation.translatedText,
       provider: translation.provider,
@@ -2651,7 +2758,7 @@ async function processAudioChunk(message: Extract<RuntimeMessage, { type: "AUDIO
     if (isBlockedHallucinationError(translation.error)) {
       return;
     }
-    await notifyTab(message.tabId, { type: "TRANSLATION_ERROR", segment, error: translation.error, videoId: message.videoId });
+    await notifyTab(message.tabId, { type: "TRANSLATION_ERROR", segment, error: translation.error, videoId: message.videoId, translationConfigRevision });
     if (shouldStopCaptureAfterApiError(translation.error)) {
       await stopAudioCaptureAfterFatalError(message.tabId, message.videoId, translation.error);
     }
@@ -2659,7 +2766,8 @@ async function processAudioChunk(message: Extract<RuntimeMessage, { type: "AUDIO
 }
 
 async function processStreamTranscript(message: Extract<RuntimeMessage, { type: "STREAM_STT_TRANSCRIPT" }>): Promise<void> {
-  const settings = await loadSettings();
+  const { settings, translationConfigRevision } = await loadSettingsSnapshot();
+  lastTranslationConfigRevision ??= translationConfigRevision;
   if (!settings.enabled || message.tabId !== activeAudioTabId || message.videoId !== activeAudioVideoId) {
     return;
   }
@@ -2685,7 +2793,7 @@ async function processStreamTranscript(message: Extract<RuntimeMessage, { type: 
   if (!message.isFinal) {
     await notifyTab(message.tabId, { ...message, segment });
     if (settings.translationProvider === "openai" && shouldTranslateStreamPartial(message.tabId, segment)) {
-      void translateStreamSegment(message.tabId, message.videoId, segment, false);
+      void translateStreamSegment(message.tabId, message.videoId, segment, false, translationConfigRevision);
     }
     return;
   }
@@ -2707,7 +2815,7 @@ async function processStreamTranscript(message: Extract<RuntimeMessage, { type: 
 
   await notifyTab(message.tabId, { type: "AUDIO_TRANSCRIPT", tabId: message.tabId, videoId: message.videoId, segment });
 
-  await translateStreamSegment(message.tabId, message.videoId, segment, true);
+  await translateStreamSegment(message.tabId, message.videoId, segment, true, translationConfigRevision);
 }
 
 function shouldTranslateStreamPartial(tabId: number, segment: CaptionSegment): boolean {
@@ -2726,14 +2834,46 @@ function shouldTranslateStreamPartial(tabId: number, segment: CaptionSegment): b
   return true;
 }
 
-async function translateStreamSegment(tabId: number, videoId: string, segment: CaptionSegment, isFinal: boolean): Promise<void> {
-  const generation = (streamTranslationGenerationByTab.get(tabId) ?? 0) + 1;
-  streamTranslationGenerationByTab.set(tabId, generation);
+async function translateStreamSegment(tabId: number, videoId: string, segment: CaptionSegment, isFinal: boolean, revision: number): Promise<void> {
+  const work = { segment, isFinal, revision };
+  const existing = streamTranslationQueuesByTab.get(tabId);
+  if (existing?.videoId === videoId && !existing.controller.signal.aborted) {
+    if (isFinal) {
+      existing.pendingFinal = work;
+      existing.pending = undefined;
+    } else {
+      existing.pending = work;
+    }
+    return;
+  }
+  const queue: StreamTranslationQueue = { videoId, controller: audioRequestController(tabId) };
+  streamTranslationQueuesByTab.set(tabId, queue);
+  try {
+    let current: typeof work | undefined = work;
+    while (current && streamTranslationQueuesByTab.get(tabId) === queue && !queue.controller.signal.aborted) {
+      await translateQueuedStreamSegment(tabId, videoId, current.segment, current.isFinal, current.revision, queue);
+      current = queue.pendingFinal ?? queue.pending;
+      if (queue.pendingFinal) queue.pendingFinal = undefined;
+      else queue.pending = undefined;
+    }
+  } catch (error) {
+    if (!queue.controller.signal.aborted) throw error;
+  } finally {
+    if (streamTranslationQueuesByTab.get(tabId) === queue) streamTranslationQueuesByTab.delete(tabId);
+  }
+}
+
+async function translateQueuedStreamSegment(
+  tabId: number, videoId: string, segment: CaptionSegment, isFinal: boolean,
+  translationConfigRevision: number, queue: StreamTranslationQueue
+): Promise<void> {
+  const snapshot = await loadSettingsSnapshot();
+  if (snapshot.translationConfigRevision !== translationConfigRevision || queue.controller.signal.aborted) return;
 
   const correction = await matchUserCorrection(tabId, videoId, segment, isFinal);
   if (
     correction &&
-    streamTranslationGenerationByTab.get(tabId) === generation &&
+    streamTranslationQueuesByTab.get(tabId) === queue && !queue.controller.signal.aborted &&
     tabId === activeAudioTabId &&
     videoId === activeAudioVideoId
   ) {
@@ -2742,6 +2882,7 @@ async function translateStreamSegment(tabId: number, videoId: string, segment: C
     }
     await notifyTab(tabId, {
       type: "TRANSLATION_READY",
+      translationConfigRevision,
       segment,
       translatedText: correction.translatedText,
       provider: isFinal ? correction.provider : `${correction.provider} (partial)`,
@@ -2750,9 +2891,10 @@ async function translateStreamSegment(tabId: number, videoId: string, segment: C
     return;
   }
 
-  const translation = await translateAndRespond(segmentWithAudioContext(tabId, segment));
+  if (queue.controller.signal.aborted) return;
+  const translation = await translateAndRespond(segmentWithAudioContext(tabId, segment), queue.controller.signal, snapshot.settings);
   if (
-    streamTranslationGenerationByTab.get(tabId) !== generation ||
+    streamTranslationQueuesByTab.get(tabId) !== queue || queue.controller.signal.aborted ||
     tabId !== activeAudioTabId ||
     videoId !== activeAudioVideoId
   ) {
@@ -2764,6 +2906,7 @@ async function translateStreamSegment(tabId: number, videoId: string, segment: C
     }
     await notifyTab(tabId, {
       type: "TRANSLATION_READY",
+      translationConfigRevision,
       segment,
       translatedText: translation.translatedText,
       provider: isFinal ? translation.provider : `${translation.provider} (partial)`,
@@ -2774,7 +2917,7 @@ async function translateStreamSegment(tabId: number, videoId: string, segment: C
       return;
     }
     if (isFinal) {
-      await notifyTab(tabId, { type: "TRANSLATION_ERROR", segment, error: translation.error, videoId });
+      await notifyTab(tabId, { type: "TRANSLATION_ERROR", segment, error: translation.error, videoId, translationConfigRevision });
       if (shouldStopCaptureAfterApiError(translation.error)) {
         await stopAudioCaptureAfterFatalError(tabId, videoId, translation.error);
       }
@@ -2810,6 +2953,7 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
         invalidateCorrectionLibrary();
         for (const job of pretranslateJobs.values()) {
           job.cancelled = true;
+          job.controller.abort();
         }
         pretranslateJobs.clear();
         await broadcastCorrectionLibraryUpdated();
@@ -2821,6 +2965,7 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
         invalidateCorrectionLibrary();
         for (const job of pretranslateJobs.values()) {
           job.cancelled = true;
+          job.controller.abort();
         }
         pretranslateJobs.clear();
         await broadcastCorrectionLibraryUpdated();
@@ -2874,13 +3019,17 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
       if (message.type === "CAPTION_SEGMENT") {
         const tabId = sender.tab?.id;
         const videoId = youtubeVideoIdFromUrl(sender.tab?.url);
-        const settings = await loadSettings();
+        const controller = tabId ? captionRequestController(tabId) : new AbortController();
+        const snapshot = await loadSettingsSnapshot();
+        const settings = snapshot.settings;
+        lastTranslationConfigRevision ??= snapshot.translationConfigRevision;
         const [segment] =
           tabId && videoId
             ? await addCaptionLyricsAssist(tabId, videoId, settings, [message.segment])
             : [message.segment];
         const correction =
           settings.enabled && tabId && videoId ? await matchUserCorrection(tabId, videoId, segment, true) : undefined;
+        controller.signal.throwIfAborted();
         if (correction) {
           sendResponse({
             ok: true,
@@ -2889,7 +3038,7 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
           });
           return;
         }
-        sendResponse(await translateAndRespond(segment));
+        sendResponse(await translateAndRespond(segment, controller.signal, settings));
         return;
       }
 
@@ -2928,6 +3077,7 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
           sendResponse({ ok: true });
           return;
         }
+        clearAudioQueue(tabId);
         const response = await chrome.runtime.sendMessage<MessageResponse>({
           type: "RESET_AUDIO_CAPTURE_BUFFER",
           target: "offscreen",
@@ -3019,7 +3169,7 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
     } catch (error) {
       const errorMessage = getErrorMessage(error);
       if (message.type === "AUDIO_CHUNK") {
-        await notifyTab(message.tabId, { type: "TRANSLATION_ERROR", error: errorMessage });
+        await notifyTab(message.tabId, { type: "TRANSLATION_ERROR", error: errorMessage, translationConfigRevision: (await loadSettingsSnapshot()).translationConfigRevision });
       }
       sendResponse({ ok: false, error: errorMessage });
     }

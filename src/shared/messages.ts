@@ -13,8 +13,8 @@ export type CaptionTranslationEntry = {
 
 export type RuntimeMessage =
   | { type: "CAPTION_SEGMENT"; segment: CaptionSegment }
-  | { type: "TRANSLATION_READY"; segment: CaptionSegment; translatedText: string; provider: string; videoId?: string }
-  | { type: "TRANSLATION_ERROR"; segment?: CaptionSegment; error: string; videoId?: string }
+  | { type: "TRANSLATION_READY"; segment: CaptionSegment; translatedText: string; provider: string; videoId?: string; translationConfigRevision: number }
+  | { type: "TRANSLATION_ERROR"; segment?: CaptionSegment; error: string; videoId?: string; translationConfigRevision: number }
   | {
       type: "PRETRANSLATE_CAPTIONS";
       videoId: string;

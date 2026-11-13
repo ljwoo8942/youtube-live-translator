@@ -45,6 +45,29 @@ export type CorrectionPreferences = {
   enabled: boolean;
 };
 
+export function mergeBulkCorrectionLines(previous: CorrectionLine[], sources: string[], translations: string[]): CorrectionLine[] {
+  const entries = sources
+    .map((source, index) => ({ source: source.trim(), translation: translations[index]?.trim() ?? "" }))
+    .filter((entry) => entry.source);
+  const unused = new Set(previous.map((_, index) => index));
+  const matches: Array<CorrectionLine | undefined> = entries.map(() => undefined);
+  // Reserve unchanged duplicate lines before matching edited translations.
+  for (const exact of [true, false]) {
+    entries.forEach((entry, index) => {
+      if (matches[index]) return;
+      const match = [...unused].find((candidate) =>
+        previous[candidate].source.trim() === entry.source &&
+        (!exact || previous[candidate].translation.trim() === entry.translation)
+      );
+      if (match !== undefined) {
+        matches[index] = previous[match];
+        unused.delete(match);
+      }
+    });
+  }
+  return entries.map((entry, index) => ({ ...matches[index], id: matches[index]?.id ?? crypto.randomUUID(), ...entry }));
+}
+
 export type CorrectionLibraryExport = {
   format: "youtube-live-translator-corrections";
   version: 1;

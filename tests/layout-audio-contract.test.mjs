@@ -1039,7 +1039,7 @@ test("correction management is isolated from audio capture and player layout", (
   assert.match(correctionStore, /youtube-live-translator-corrections/);
   assert.match(popup, /chrome\.tabs\.create\(\{ url: chrome\.runtime\.getURL\("corrections\.html"\) \}\)/);
   assert.match(options, /chrome\.tabs\.create\(\{ url: chrome\.runtime\.getURL\("corrections\.html"\) \}\)/);
-  assert.match(background, /const correction =[\s\S]*?matchUserCorrection[\s\S]*?translateAndRespond\(segment\)/);
+  assert.match(background, /const correction =[\s\S]*?matchUserCorrection[\s\S]*?translateAndRespond\(segment[,)]/);
   assert.doesNotMatch(correctionsPage, /START_AUDIO_CAPTURE|RECONFIGURE_AUDIO_CAPTURE|requestFullscreen|exitFullscreen/);
   assert.doesNotMatch(correctionStore, /chrome\.tabs|tabCapture|fullscreen/);
 });

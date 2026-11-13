@@ -1,5 +1,7 @@
 import { DEFAULT_SETTINGS } from "../shared/defaults";
 import { diffSettings, loadSettings } from "../shared/storage";
+import { requestProviderPermissions } from "../shared/providerPermissions";
+import { fetchWithTimeout } from "../shared/network";
 import type {
   ApiAuthHeaderMode,
   AiEndpointMode,
@@ -288,7 +290,7 @@ async function fetchText(
   hint: string
 ): Promise<{ response: Response; text: string }> {
   try {
-    const response = await fetch(url, init);
+    const response = await fetchWithTimeout(url, init, isLocalBaseUrl(url) ? 120_000 : 60_000);
     return { response, text: await response.text() };
   } catch (error) {
     throw new Error(localFetchErrorMessage(error, target, hint));
@@ -458,6 +460,24 @@ function runAction(action: () => Promise<void>): void {
   void action().catch((error) => {
     setStatus(getErrorMessage(error));
   });
+}
+
+function runProviderAction(action: () => Promise<void>, urls: string[], streamingUrl?: string): void {
+  runAction(async () => {
+    await requestProviderPermissions(urls, streamingUrl);
+    await action();
+  });
+}
+
+function runSettingsAction(action: () => Promise<void>): void {
+  const next = collectSettings();
+  const urls = [next[next.translationProvider].baseUrl];
+  urls.push(next.sttProvider === "openai" ? next.apiStt.baseUrl : next[next.sttProvider].baseUrl);
+  if (next.sttProvider === "lmStudio") urls.push(next.whisper.baseUrl);
+  const streamingUrl = next.sttProvider === "whisper" && next.streamingSttEnabled
+    ? next.streamingSttEndpoint
+    : undefined;
+  runProviderAction(action, urls, streamingUrl);
 }
 
 function setInput(id: string, value: string | number | boolean): void {
@@ -1208,7 +1228,6 @@ function createSilentWavBlob(seconds = 1): Blob {
 }
 
 async function testLocalPipeline(): Promise<void> {
-  applyLocalGpuPreset();
   await probeFasterWhisper();
   await saveCurrentSettings();
   setStatus("로컬 STT와 AI API 번역을 함께 테스트하는 중입니다...");
@@ -1492,7 +1511,7 @@ async function loadOpenAiModels(): Promise<void> {
 
 function bindActions(): void {
   byId<HTMLButtonElement>("save").addEventListener("click", () => {
-    runAction(saveCurrentSettings);
+    runSettingsAction(saveCurrentSettings);
   });
 
   byId<HTMLButtonElement>("heroLocalPreset").addEventListener("click", () => {
@@ -1514,11 +1533,12 @@ function bindActions(): void {
   });
 
   byId<HTMLButtonElement>("heroPipelineTest").addEventListener("click", () => {
-    runAction(testLocalPipeline);
+    applyLocalGpuPreset();
+    runSettingsAction(testLocalPipeline);
   });
 
   byId<HTMLButtonElement>("test").addEventListener("click", () => {
-    runAction(testTranslation);
+    runSettingsAction(testTranslation);
   });
 
   byId<HTMLSelectElement>("openaiGatewayPreset").addEventListener("change", () => {
@@ -1532,7 +1552,7 @@ function bindActions(): void {
   });
 
   byId<HTMLButtonElement>("loadOpenAiModels").addEventListener("click", () => {
-    runAction(loadOpenAiModels);
+    runProviderAction(loadOpenAiModels, [inputValue("openaiBaseUrl", DEFAULT_SETTINGS.openai.baseUrl)]);
   });
 
   byId<HTMLSelectElement>("openaiModelPicker").addEventListener("change", (event) => {
@@ -1563,19 +1583,23 @@ function bindActions(): void {
   });
 
   byId<HTMLButtonElement>("apiSttTest").addEventListener("click", () => {
-    runAction(testApiStt);
+    runProviderAction(testApiStt, [inputValue("apiSttBaseUrl", DEFAULT_SETTINGS.apiStt.baseUrl)]);
   });
 
   byId<HTMLButtonElement>("apiPipelineTest").addEventListener("click", () => {
-    runAction(testApiAudioPipeline);
+    setInput("inputMode", "captionsThenAudio");
+    setInput("translationProvider", "openai");
+    setInput("sttProvider", "openai");
+    runSettingsAction(testApiAudioPipeline);
   });
 
   byId<HTMLButtonElement>("loadLmStudioModels").addEventListener("click", () => {
-    runAction(loadLmStudioModels);
+    runProviderAction(loadLmStudioModels, [inputValue("lmStudioBaseUrl", DEFAULT_SETTINGS.lmStudio.baseUrl)]);
   });
 
   byId<HTMLButtonElement>("lmStudioProbe").addEventListener("click", () => {
-    runAction(testLmStudioTranslation);
+    setInput("translationProvider", "lmStudio");
+    runSettingsAction(testLmStudioTranslation);
   });
 
   byId<HTMLButtonElement>("localGpuPreset").addEventListener("click", () => {
@@ -1587,11 +1611,12 @@ function bindActions(): void {
   });
 
   byId<HTMLButtonElement>("fasterWhisperProbe").addEventListener("click", () => {
-    runAction(probeFasterWhisper);
+    runProviderAction(probeFasterWhisper, [inputValue("whisperBaseUrl", DEFAULT_SETTINGS.whisper.baseUrl)]);
   });
 
   byId<HTMLButtonElement>("localPipelineTest").addEventListener("click", () => {
-    runAction(testLocalPipeline);
+    applyLocalGpuPreset();
+    runSettingsAction(testLocalPipeline);
   });
 
   byId<HTMLButtonElement>("restore").addEventListener("click", () => {

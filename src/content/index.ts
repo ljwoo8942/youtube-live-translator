@@ -15,7 +15,7 @@ import {
 } from "./youtubeCaptions";
 const SETTINGS_KEY = "translatorSettings";
 const BLOCKED_HALLUCINATION_ERROR = "환각 의심 번역 결과를 차단했습니다.";
-const CONTENT_SCRIPT_VERSION = 28;
+const CONTENT_SCRIPT_VERSION = 29;
 const CONTENT_BOOTSTRAP_FLAG = "__yt_live_translator_content_bootstrapped__";
 const overlay = new TranslatorOverlay();
 const AUDIO_FALLBACK_INITIAL_WAIT_MS = 2200;
@@ -103,7 +103,7 @@ function segmentKey(text: string): string {
 }
 
 function captionRequestKey(segment: CaptionSegment): string {
-  return `${activeVideoId}:${segment.source}:${segment.id}:${segmentKey(segment.text)}`;
+  return `${activeVideoId}:${settings.translationConfigRevision}:${segment.source}:${segment.id}:${segmentKey(segment.text)}`;
 }
 
 function translatedSegmentDisplayKey(segment: CaptionSegment, translatedText: string): string {
@@ -552,6 +552,11 @@ async function requestPretranslation(): Promise<void> {
       overlay.showError(response.error, settings);
     }
   } catch (error) {
+    if (
+      requestVideoId !== timedTextVideoId ||
+      requestCaptionHash !== timedTextCaptionHash ||
+      requestTranslationConfigRevision !== settings.translationConfigRevision
+    ) return;
     pretranslateRequestKey = "";
     pretranslateRetryBlockedUntil = Date.now() + PRETRANSLATE_RETRY_COOLDOWN_MS;
     console.debug("Caption pretranslation request failed", error);
@@ -688,8 +693,13 @@ async function sendSegment(
   segment: RuntimeMessage & { type: "CAPTION_SEGMENT" }
 ): Promise<"success" | "blocked" | "retry"> {
   const requestVideoId = activeVideoId;
+  const requestTranslationConfigRevision = settings.translationConfigRevision;
   const response = await chrome.runtime.sendMessage<MessageResponse<{ translatedText: string; provider: string }>>(segment);
-  if (requestVideoId !== activeVideoId || requestVideoId !== currentWatchVideoId()) {
+  if (
+    requestVideoId !== activeVideoId ||
+    requestVideoId !== currentWatchVideoId() ||
+    requestTranslationConfigRevision !== settings.translationConfigRevision
+  ) {
     return "blocked";
   }
   if (response?.ok) {
@@ -731,6 +741,7 @@ async function processCaptionSegment(segment: Parameters<typeof overlay.showTran
   captionRequestsInFlight.add(key);
   try {
     const result = await sendSegment({ type: "CAPTION_SEGMENT", segment });
+    if (key !== captionRequestKey(segment)) return;
     if (result === "blocked") {
       blockedCaptionRequestKeys.add(key);
     } else if (result === "retry") {
@@ -739,6 +750,7 @@ async function processCaptionSegment(segment: Parameters<typeof overlay.showTran
       captionRequestRetryAfter.delete(key);
     }
   } catch (error) {
+    if (key !== captionRequestKey(segment)) return;
     captionRequestRetryAfter.set(key, Date.now() + CAPTION_TRANSLATION_RETRY_MS);
     overlay.showError(getErrorMessage(error), settings);
   } finally {
@@ -1483,6 +1495,7 @@ function installObservers(): void {
     if (message.type === "TRANSLATION_READY") {
       if (
         settings.enabled &&
+        message.translationConfigRevision === settings.translationConfigRevision &&
         shouldAcceptAudioSegment(message.segment) &&
         (!message.videoId || message.videoId === activeVideoId)
       ) {
@@ -1499,6 +1512,7 @@ function installObservers(): void {
     if (message.type === "TRANSLATION_ERROR") {
       if (
         settings.enabled &&
+        message.translationConfigRevision === settings.translationConfigRevision &&
         shouldAcceptAudioSegment(message.segment) &&
         (!message.videoId || message.videoId === activeVideoId)
       ) {

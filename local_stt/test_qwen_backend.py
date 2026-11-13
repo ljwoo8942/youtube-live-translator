@@ -136,7 +136,7 @@ class QwenMlxTests(unittest.TestCase):
             mock.patch.object(app, "_model", None),
             mock.patch.object(app, "_model_name", None),
             mock.patch.object(app, "DEFAULT_DEVICE", "mlx"),
-            mock.patch("faster_whisper.audio.decode_audio", return_value=np.full(32000, 0.1, dtype=np.float32)),
+            mock.patch.object(app, "_decode_audio", return_value=np.full(32000, 0.1, dtype=np.float32)),
         ):
             client = TestClient(app.app)
             headers = {"Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop"}

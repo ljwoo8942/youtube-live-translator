@@ -1,6 +1,7 @@
 import type { MessageResponse } from "../shared/messages";
 import {
   createEmptySongCorrection,
+  mergeBulkCorrectionLines,
   normalizeCorrectionLibrary,
   type CorrectionLine,
   type CorrectionMediaContext,
@@ -557,18 +558,24 @@ function bindEvents(): void {
     const translationLines = inputValue("bulkTranslation").split(/\r?\n/);
     while (sourceLines.at(-1)?.trim() === "") sourceLines.pop();
     while (translationLines.at(-1)?.trim() === "") translationLines.pop();
-    selected.lines = sourceLines
-      .map((source, index): CorrectionLine | undefined => {
-        const sourceText = source.trim();
-        if (!sourceText) return undefined;
-        return {
-          id: selected.lines[index]?.id ?? crypto.randomUUID(),
-          source: sourceText,
-          translation: translationLines[index]?.trim() ?? ""
-        };
-      })
-      .filter((line): line is CorrectionLine => Boolean(line));
+    const nextLines = mergeBulkCorrectionLines(selected.lines, sourceLines, translationLines);
+    const retainedIds = new Set(nextLines.map((line) => line.id));
+    const removedMetadata = selected.lines.filter((line) =>
+      !retainedIds.has(line.id) && (line.startMs !== undefined || line.endMs !== undefined || line.note)
+    );
+    if (removedMetadata.length > 0 && !window.confirm(
+      `원문이 변경되거나 삭제된 ${removedMetadata.length}줄의 시간·메모가 제거됩니다. 적용할까요?`
+    )) return;
+    selected.lines = nextLines;
+    for (const variant of selected.variants) {
+      for (const override of variant.lineOverrides) {
+        if (override.baseLineId && !retainedIds.has(override.baseLineId)) {
+          override.baseLineId = undefined;
+        }
+      }
+    }
     renderLines();
+    renderVariants();
     setStatus(
       sourceLines.length === translationLines.length
         ? `${selected.lines.length}개 줄을 반영했습니다.`
