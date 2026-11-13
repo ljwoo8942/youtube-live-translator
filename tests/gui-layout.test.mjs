@@ -4,6 +4,24 @@ import vm from "node:vm";
 import test from "node:test";
 import { setImmediate } from "node:timers/promises";
 import ts from "typescript";
+import postcss from "postcss";
+
+test("popup supplies a readable intrinsic width before asynchronous settings render", () => {
+  const css = postcss.parse(readFileSync(new URL("../src/popup/style.css", import.meta.url), "utf8"));
+  for (const selector of ["html", "body"]) {
+    const sizing = {};
+    css.walkRules((rule) => {
+      if (rule.selector.split(",").map((part) => part.trim()).includes(selector)) {
+        rule.walkDecls((declaration) => { sizing[declaration.prop] = declaration.value; });
+      }
+    });
+    for (const property of ["width", "min-width"]) {
+      assert.match(sizing[property] ?? "", /^\d+px$/, `${selector} ${property} must not shrink with the initial popup viewport`);
+      const pixels = Number.parseInt(sizing[property], 10);
+      assert.ok(pixels >= 360 && pixels <= 800, `${selector} ${property} must fit readable controls and Chrome's popup limit`);
+    }
+  }
+});
 
 function popupFunctions(names, context) {
   const path = "src/popup/index.ts";

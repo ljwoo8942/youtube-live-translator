@@ -14,8 +14,14 @@
   box-sizing: border-box;
 }
 
+/* Chrome sizes action popups from their contents, so width must not depend on the initial viewport. */
+html,
 body {
-  width: min(400px, 100vw);
+  width: 400px;
+  min-width: 400px;
+}
+
+body {
   margin: 0;
   color: var(--color-ink);
   background: var(--color-parchment);
