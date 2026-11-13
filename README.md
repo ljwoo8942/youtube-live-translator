@@ -117,7 +117,11 @@ npm run stt:start
 
 서버의 시작 모델도 Qwen으로 바꾸려면 Mac에서 `YT_TRANSLATOR_STT_MODEL=qwen3-asr-0.6b npm run stt:start`를 사용하세요. Windows PowerShell에서는 `$env:YT_TRANSLATOR_STT_MODEL = 'qwen3-asr-0.6b'` 실행 후 `npm run stt:start`를 실행합니다. 1.7B도 같은 방식으로 지정합니다.
 
-Windows는 CUDA가 활성화된 PyTorch이면 GPU/float16, 그렇지 않으면 경고를 표시하고 CPU/float32를 사용합니다. GPU를 사용하려면 [PyTorch 공식 설치 안내](https://pytorch.org/get-started/locally/)에서 현재 드라이버에 맞는 CUDA 빌드를 설치하세요. `npm run stt:health`의 `loaded_model`, `backend`, `device`, `compute_type`으로 실제 실행 경로를 확인할 수 있습니다. 1.7B CPU 실행은 느릴 수 있습니다.
+Windows에서 `npm run stt:setup`은 NVIDIA GPU를 감지하면 프로젝트 가상환경의 CPU 전용 PyTorch를 공식 `torch 2.15.0+cu132`로 교체하고 실제 CUDA FP16 연산까지 검사합니다. CUDA 13.2와 호환되는 NVIDIA 드라이버와 PyTorch가 지원하는 Turing(`sm_75`) 이상 GPU가 필요하며, 기존 서버를 종료한 뒤 설치 명령을 실행하세요. 패키지와 다운로드 캐시는 각각 `.venv-stt`, `.cache/uv`에 저장됩니다(이미 지정한 `UV_CACHE_DIR`은 유지). 모델 가중치는 CPU·GPU 공용이므로 다시 받을 필요가 없습니다.
+
+GPU 없는 Windows와 명시적 CPU 설정은 기존 경로를 사용하고, Apple Silicon은 MLX GPU 경로를 사용합니다. CUDA 설치 검사가 실패하면 오류를 해결한 뒤 재실행하세요. `npm run stt:health`의 `loaded_model`, `backend`, `device`, `compute_type`으로 실제 실행 경로를 확인할 수 있습니다. Qwen CUDA의 기대값은 `device=cuda`, `compute_type=float16`입니다. 다른 설치 방법으로 CPU 전용 PyTorch를 설치한 경우에는 Qwen이 경고 후 CPU로 대체 실행할 수 있으므로 상태를 확인해야 합니다.
+
+RTX 5070에서 두 모델의 실제 GPU 모델·입력·출력, HTTP·WebSocket 생성과 음성 인식을 확인했습니다. 명령과 검사 범위는 [Qwen CUDA 검증 기록](docs/qwen-cuda-validation.md)을 참고하세요.
 
 Qwen도 기존 HTTP 전사·WebSocket 롤링 오디오 창과 음성 감지, 텍스트 환각·반복 차단을 사용합니다. 결과 시간은 오디오 창의 범위이며 단어별 정렬 정보가 아닙니다. Whisper식 신뢰도 점수는 생성하지 않습니다. 네이티브 Qwen 스트리밍 상태 유지와 별도 강제 정렬 모델은 이번 연동에 포함하지 않았습니다.
 

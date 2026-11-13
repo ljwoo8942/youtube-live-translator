@@ -16,6 +16,27 @@ from local_stt import app, qwen_backend as qwen
 
 
 class QwenModelSelectionTests(unittest.TestCase):
+    def test_cuda_runtime_check_rejects_a_successful_cpu_fallback(self) -> None:
+        from local_stt.test_qwen_runtime import QwenRuntimeTests
+
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {
+            "ok": True, "loaded_model": "qwen3-asr-0.6b",
+            "backend": "qwen3-asr-transformers", "device": "cpu", "compute_type": "float32",
+        }
+        case = QwenRuntimeTests("test_model_load_and_real_inference")
+        with (
+            mock.patch.object(app, "DEFAULT_MODEL", "qwen3-asr-0.6b"),
+            mock.patch.object(app, "DEFAULT_DEVICE", "cuda"),
+            mock.patch.dict("os.environ", {"YT_TRANSLATOR_STT_EXPECT_DEVICE": "cuda"}),
+            mock.patch("local_stt.test_qwen_runtime.TestClient") as client,
+            mock.patch.object(app, "_load_model") as load_model,
+        ):
+            client.return_value.get.return_value = response
+            with self.assertRaisesRegex(AssertionError, "falling back to CPU"):
+                case.test_model_load_and_real_inference()
+        load_model.assert_not_called()
+
     def test_intel_mac_is_explicitly_excluded(self) -> None:
         with (
             mock.patch.object(qwen.sys, "platform", "darwin"),
@@ -172,9 +193,10 @@ class QwenTransformersTests(unittest.TestCase):
         self.model.to.return_value = self.model
         self.model.eval.return_value = self.model
         self.model.generate.return_value = torch.tensor([[1, 2, 3, 4]])
+        self.loader = mock.Mock(return_value=self.model)
         for patch in (
             mock.patch("transformers.AutoProcessor.from_pretrained", return_value=self.processor),
-            mock.patch("transformers.AutoModelForMultimodalLM.from_pretrained", return_value=self.model),
+            mock.patch("transformers.AutoModelForMultimodalLM.from_pretrained", self.loader),
             mock.patch.object(qwen, "require_supported_platform"),
         ):
             patch.start()
@@ -189,6 +211,33 @@ class QwenTransformersTests(unittest.TestCase):
         decoded_tokens = self.processor.decode.call_args.args[0]
         self.assertTrue(self.torch.equal(decoded_tokens, self.torch.tensor([3, 4])))
         self.assertFalse(self.model.generate.call_args.kwargs["do_sample"])
+        self.model.to.assert_called_once_with("cpu")
+        self.assertEqual(self.loader.call_args.kwargs["dtype"], self.torch.float32)
+
+    def test_cuda_uses_float16_and_moves_model_and_processor_inputs_to_gpu(self) -> None:
+        self.model.device = self.torch.device("cuda")
+        self.model.dtype = self.torch.float16
+        for name in qwen.MODEL_REPOSITORIES:
+            with self.subTest(model=name), mock.patch("torch.cuda.is_available", return_value=True):
+                self.model.reset_mock()
+                self.processor.reset_mock()
+                backend = qwen.QwenAsrModel(name, "cuda")
+                segments, info = backend.transcribe(np.zeros(16000, dtype=np.float32), language="ja")
+                self.assertEqual((backend.device, backend.compute_type), ("cuda", "float16"))
+                self.assertEqual(info.language, "ja")
+                self.assertEqual(segments[0].text, "青い風の中で")
+                self.model.to.assert_called_once_with("cuda")
+                self.processor.apply_transcription_request.return_value.to.assert_called_once_with(self.model.device, self.torch.float16)
+                self.assertEqual(self.loader.call_args.args[0], qwen.MODEL_REPOSITORIES[name]["transformers"])
+                self.assertEqual(self.loader.call_args.kwargs["dtype"], self.torch.float16)
+                self.assertFalse(self.loader.call_args.kwargs["trust_remote_code"])
+                self.assertTrue(self.loader.call_args.kwargs["use_safetensors"])
+
+    def test_explicit_cpu_is_preserved_when_cuda_is_available(self) -> None:
+        with mock.patch("torch.cuda.is_available", return_value=True):
+            backend = qwen.QwenAsrModel("qwen3-asr-1.7b", "cpu")
+        self.assertEqual((backend.device, backend.compute_type), ("cpu", "float32"))
+        self.model.to.assert_called_once_with("cpu")
 
     def test_unavailable_cuda_is_reported_as_cpu(self) -> None:
         with mock.patch("torch.cuda.is_available", return_value=False):

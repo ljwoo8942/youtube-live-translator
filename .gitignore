@@ -4,6 +4,7 @@ dist/
 
 # Local Python runtime and cache
 .venv-stt/
+.cache/
 __pycache__/
 *.py[cod]
 

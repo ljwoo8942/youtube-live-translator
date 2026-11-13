@@ -12,13 +12,13 @@
     "typecheck": "tsc --noEmit",
     "test:contracts": "node --test tests/*.test.mjs",
     "preview": "vite preview",
-    "stt:setup": "uv python install 3.11 && uv venv --allow-existing --python 3.11 .venv-stt && uv pip install --python .venv-stt -r local_stt/requirements.txt",
+    "stt:setup": "uv python install 3.11 && uv venv --allow-existing --python 3.11 .venv-stt && uv run --no-project --python .venv-stt python -m local_stt.setup_runtime",
     "stt:start": "uv run --no-project --python .venv-stt python -m uvicorn local_stt.app:app --host 127.0.0.1 --port 8765",
     "stt:daemon": "uv run --no-project --python .venv-stt python local_stt/start_server.py",
     "stt:dev": "npm run stt:start",
     "stt:health": "uv run --no-project --python .venv-stt python local_stt/health_check.py",
     "stt:qwen:download": "uv run --no-project --python .venv-stt python -m local_stt.qwen_backend",
-    "stt:test": "uv run --no-project --python .venv-stt python -m unittest local_stt.test_app local_stt.test_qwen_backend"
+    "stt:test": "uv run --no-project --python .venv-stt python -m unittest local_stt.test_app local_stt.test_qwen_backend local_stt.test_setup_runtime"
   },
   "devDependencies": {
     "typescript": "^5.8.3",

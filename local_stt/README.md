@@ -10,6 +10,10 @@ Install Node.js 22.18+ and [uv](https://docs.astral.sh/uv/getting-started/instal
 npm run stt:setup
 ```
 
+Stop the existing STT server before setup. On Windows with an NVIDIA GPU, setup installs the official `torch==2.15.0+cu132` wheel from [PyTorch's CUDA 13.2 index](https://download.pytorch.org/whl/cu132) before the base dependencies. The exact CUDA build replaces an existing CPU-only wheel instead of accepting it as already installed. A CUDA 13.2-compatible NVIDIA driver and a supported Turing (`sm_75`) or newer GPU are required; setup checks a real FP16 matrix operation and fails with a recovery hint if GPU initialization or kernels fail. Older NVIDIA hardware must use an explicit CPU setup rather than expecting the CUDA probe to pass.
+
+All packages stay in `.venv-stt`. The installer uses `.cache/uv` for downloads unless `UV_CACHE_DIR` is already set. No-GPU Windows and an explicit `YT_TRANSLATOR_STT_DEVICE=cpu` keep the ordinary dependency path. Apple Silicon keeps MLX; Intel Macs remain excluded. Model weights are shared between CPU and CUDA and do not need to be deleted or downloaded again.
+
 ## Run
 
 ```bash
@@ -109,3 +113,19 @@ Streaming results are finalized after a repeated decode or the profile's stabili
 The lyrics profile, including the live mode's lyrics fallback, uses a Japanese lyrics prompt by default. The ordinary/live speech pass has no initial prompt by default. Replace the mode-specific prompts with `YT_TRANSLATOR_STT_LYRICS_INITIAL_PROMPT` or `YT_TRANSLATOR_STT_LIVE_INITIAL_PROMPT` as needed; an empty lyrics override keeps the default lyrics prompt.
 
 Override with environment variables such as `YT_TRANSLATOR_STT_MODEL`, `YT_TRANSLATOR_STT_DEVICE`, `YT_TRANSLATOR_STT_COMPUTE_TYPE`, `YT_TRANSLATOR_STT_TEMPERATURE`, `YT_TRANSLATOR_STT_LIVE_VAD_THRESHOLD`, `YT_TRANSLATOR_STT_STREAM_WINDOW_SECONDS`, or `YT_TRANSLATOR_STT_STREAM_DECODE_INTERVAL_SECONDS`.
+
+## CUDA acceptance test
+
+After setup and model preparation, run this in PowerShell for each model:
+
+```powershell
+$env:YT_TRANSLATOR_STT_DEVICE = 'cuda'
+$env:YT_TRANSLATOR_STT_EXPECT_DEVICE = 'cuda'
+foreach ($model in @('qwen3-asr-0.6b', 'qwen3-asr-1.7b')) {
+    $env:YT_TRANSLATOR_STT_MODEL = $model
+    uv run --no-project --python .venv-stt python -m unittest local_stt.test_qwen_runtime -v
+    if ($LASTEXITCODE -ne 0) { throw "CUDA test failed: $model" }
+}
+```
+
+The test rejects CPU fallback, checks CUDA model parameters and input/output tensors, and runs actual HTTP and WebSocket generation. Its tone fixture checks GPU execution, not speech accuracy or live subtitle latency. See the [RTX 5070 validation record](../docs/qwen-cuda-validation.md) for the additional generated-speech control. GitHub-hosted Windows runners have no NVIDIA GPU; their CPU tests do not replace this local CUDA check.
