@@ -26,6 +26,11 @@ let selected = createEmptySongCorrection();
 let selectedIsNew = true;
 let currentMedia: CorrectionMediaContext | undefined;
 let searchText = "";
+let savedEditorState = "";
+let savedBulkState = "";
+let actionPending = false;
+type FormControl = HTMLButtonElement | HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
+const disabledControls = new Map<FormControl, boolean>();
 
 function splitList(value: string): string[] {
   return [...new Set(value.split(/[\n,]/).map((entry) => entry.trim()).filter(Boolean))];
@@ -44,7 +49,33 @@ function getErrorMessage(error: unknown): string {
 }
 
 function runAction(action: () => Promise<void>): void {
-  void action().catch((error) => setStatus(getErrorMessage(error), "error"));
+  if (actionPending) return;
+  actionPending = true;
+  const focused = document.activeElement as HTMLElement | null;
+  setControlsBusy(true);
+  setStatus("처리 중...");
+  void action().catch((error) => setStatus(getErrorMessage(error), "error")).finally(() => {
+    actionPending = false;
+    setControlsBusy(false);
+    const focusTarget = focused?.isConnected ? focused : focused?.id ? document.getElementById(focused.id) : null;
+    if (focusTarget && document.activeElement === document.body) focusTarget.focus();
+    if (document.querySelector("#status")?.textContent === "처리 중...") setStatus("준비됨");
+  });
+}
+
+function setControlsBusy(busy: boolean): void {
+  document.querySelector(".workspace")?.setAttribute("aria-busy", String(busy));
+  if (busy) {
+    for (const control of document.querySelectorAll<FormControl>("button, input, select, textarea")) {
+      if (!disabledControls.has(control)) disabledControls.set(control, control.disabled);
+      control.disabled = true;
+    }
+  } else {
+    for (const [control, disabled] of disabledControls) control.disabled = disabled;
+    disabledControls.clear();
+    const deleteButton = document.querySelector<HTMLButtonElement>("#deleteSong");
+    if (deleteButton) deleteButton.disabled = selectedIsNew;
+  }
 }
 
 function cloneSong(song: SongCorrection): SongCorrection {
@@ -82,6 +113,7 @@ function staticShell(): string {
           <div>
             <p id="editorMode" class="eyebrow"></p>
             <h2 id="editorTitle">새 교정</h2>
+            <p id="unsavedChanges" class="unsaved" role="status" aria-live="polite" aria-atomic="true" hidden>저장하지 않은 변경사항</p>
           </div>
           <div class="editor-actions">
             <button id="deleteSong" class="danger">삭제</button>
@@ -138,7 +170,7 @@ function staticShell(): string {
       </section>
     </main>
     <footer>
-      <div id="status" class="status">준비됨</div>
+      <div id="status" class="status" role="status" aria-live="polite" aria-atomic="true">준비됨</div>
     </footer>
   `;
 }
@@ -156,6 +188,39 @@ function syncMetadataFromForm(): void {
   selected.targetLanguage = inputValue("targetLanguage").trim() || "ko";
   selected.durationSeconds = Number(inputValue("durationSeconds")) || undefined;
   selected.videoIds = splitList(inputValue("videoIds"));
+}
+
+function bulkEditorState(): string {
+  return JSON.stringify([inputValue("bulkSource"), inputValue("bulkTranslation")]);
+}
+
+function hasUnsavedChanges(): boolean {
+  if (!savedEditorState) return false;
+  syncMetadataFromForm();
+  return JSON.stringify(selected) !== savedEditorState || bulkEditorState() !== savedBulkState;
+}
+
+function updateDirtyState(): void {
+  const indicator = document.querySelector<HTMLElement>("#unsavedChanges");
+  if (indicator) indicator.hidden = !hasUnsavedChanges();
+}
+
+function confirmDiscardChanges(): boolean {
+  return !actionPending && (!hasUnsavedChanges() || window.confirm(
+    "저장하지 않은 변경사항을 버릴까요? 저장하려면 취소한 뒤 저장을 누르세요."
+  ));
+}
+
+function resetEditor(): void {
+  for (const id of ["bulkSource", "bulkTranslation"]) {
+    const node = field<HTMLTextAreaElement>(id);
+    if (node) node.value = "";
+  }
+  renderEditor();
+  savedEditorState = JSON.stringify(selected);
+  savedBulkState = bulkEditorState();
+  updateDirtyState();
+  renderSongList();
 }
 
 function renderSongList(): void {
@@ -188,13 +253,14 @@ function renderSongList(): void {
     count.textContent = `${song.lines.length}줄 · 커버 ${song.variants.length}`;
     button.append(title, artist, count);
     button.addEventListener("click", () => {
+      if ((!selectedIsNew && selected.id === song.id) || !confirmDiscardChanges()) return;
       selected = cloneSong(song);
       selectedIsNew = false;
-      renderEditor();
-      renderSongList();
+      resetEditor();
     });
     container.append(button);
   }
+  if (actionPending) setControlsBusy(true);
 }
 
 function field<T extends HTMLInputElement | HTMLTextAreaElement>(id: string): T | null {
@@ -224,6 +290,7 @@ function renderEditor(): void {
   if (deleteButton) deleteButton.disabled = selectedIsNew;
   renderLines();
   renderVariants();
+  if (actionPending) setControlsBusy(true);
 }
 
 function createTextArea(value: string, label: string, onInput: (value: string) => void): HTMLTextAreaElement {
@@ -278,10 +345,19 @@ function renderLines(): void {
       removeButton(`${index + 1}번째 줄 삭제`, () => {
         selected.lines.splice(index, 1);
         renderLines();
+        updateDirtyState();
+        focusLine(Math.min(index, selected.lines.length - 1));
       })
     );
     container.append(row);
   });
+}
+
+function focusLine(index: number): void {
+  const field = document.querySelectorAll<HTMLTextAreaElement>("#lineEditor textarea")[index * 2];
+  const target = field ?? document.querySelector<HTMLButtonElement>("#addLine");
+  target?.focus();
+  target?.scrollIntoView({ block: "nearest" });
 }
 
 function newLine(): CorrectionLine {
@@ -346,6 +422,7 @@ function renderOverrideRows(container: HTMLElement, variant: CoverVariant): void
       removeButton("커버 교정 줄 삭제", () => {
         variant.lineOverrides.splice(index, 1);
         renderVariants();
+        updateDirtyState();
       })
     );
     container.append(row);
@@ -377,12 +454,14 @@ function renderVariants(): void {
       removeButton("커버 프로필 삭제", () => {
         selected.variants.splice(index, 1);
         renderVariants();
+        updateDirtyState();
       })
     );
     const fields = document.createElement("div");
     fields.className = "variant-fields";
     const nameInput = document.createElement("input");
     nameInput.placeholder = "커버 이름";
+    nameInput.setAttribute("aria-label", `${index + 1}번째 커버 이름`);
     nameInput.value = variant.name;
     nameInput.addEventListener("input", () => {
       variant.name = nameInput.value;
@@ -390,6 +469,7 @@ function renderVariants(): void {
     });
     const performerInput = document.createElement("input");
     performerInput.placeholder = "커버 가수";
+    performerInput.setAttribute("aria-label", `${index + 1}번째 커버 가수`);
     performerInput.value = variant.performer ?? "";
     performerInput.addEventListener("input", () => {
       variant.performer = performerInput.value.trim() || undefined;
@@ -399,6 +479,7 @@ function renderVariants(): void {
     durationInput.min = "0";
     durationInput.step = "0.1";
     durationInput.placeholder = "영상 길이(초)";
+    durationInput.setAttribute("aria-label", `${index + 1}번째 커버 영상 길이(초)`);
     durationInput.value = variant.durationSeconds?.toString() ?? "";
     durationInput.addEventListener("input", () => {
       variant.durationSeconds = Number(durationInput.value) || undefined;
@@ -406,6 +487,7 @@ function renderVariants(): void {
     const videoIds = document.createElement("textarea");
     videoIds.rows = 2;
     videoIds.placeholder = "YouTube 영상 ID";
+    videoIds.setAttribute("aria-label", `${index + 1}번째 커버 YouTube 영상 ID`);
     videoIds.value = variant.videoIds.join("\n");
     videoIds.addEventListener("input", () => {
       variant.videoIds = splitList(videoIds.value);
@@ -421,6 +503,7 @@ function renderVariants(): void {
     add.addEventListener("click", () => {
       variant.lineOverrides.push(newOverride());
       renderVariants();
+      updateDirtyState();
     });
     overrideHead.append(label, add);
     const overrides = document.createElement("div");
@@ -480,6 +563,9 @@ async function loadCurrentMedia(): Promise<CorrectionMediaContext> {
 }
 
 async function saveSelected(): Promise<void> {
+  if (bulkEditorState() !== savedBulkState) {
+    throw new Error("일괄 편집 내용을 먼저 '일괄 반영'한 뒤 저장하세요.");
+  }
   syncMetadataFromForm();
   selected.lines = selected.lines.map((line) => ({
     ...line,
@@ -501,12 +587,13 @@ async function saveSelected(): Promise<void> {
   selected = cloneSong(saved);
   selectedIsNew = false;
   await notifyLibraryUpdated();
-  renderEditor();
-  renderSongList();
+  resetEditor();
   setStatus("교정 사전을 저장했습니다.", "success");
 }
 
 async function importFile(file: File): Promise<void> {
+  // The asynchronous action is already busy; ask about its existing draft before replacing it.
+  if (hasUnsavedChanges() && !window.confirm("저장하지 않은 변경사항을 버리고 파일을 가져올까요?")) return;
   const text = await file.text();
   if (file.name.toLocaleLowerCase().endsWith(".json")) {
     const library = normalizeCorrectionLibrary(JSON.parse(text) as unknown);
@@ -518,8 +605,7 @@ async function importFile(file: File): Promise<void> {
     selected = songs[0] ? cloneSong(songs[0]) : createEmptySongCorrection();
     selectedIsNew = songs.length === 0;
     await notifyLibraryUpdated();
-    renderEditor();
-    renderSongList();
+    resetEditor();
     setStatus(`${songs.length}개 곡을 가져왔습니다.`, "success");
     return;
   }
@@ -528,16 +614,29 @@ async function importFile(file: File): Promise<void> {
     throw new Error("가사 줄을 찾지 못했습니다.");
   }
   selected.lines = lines;
+  for (const id of ["bulkSource", "bulkTranslation"]) {
+    const node = field<HTMLTextAreaElement>(id);
+    if (node) node.value = "";
+  }
+  savedBulkState = bulkEditorState();
   renderLines();
+  updateDirtyState();
   setStatus(`${lines.length}개 원문 줄을 가져왔습니다. 번역을 입력한 뒤 저장하세요.`, "success");
 }
 
 function bindEvents(): void {
+  document.querySelector(".editor")?.addEventListener("input", updateDirtyState);
+  document.querySelector(".editor")?.addEventListener("change", updateDirtyState);
+  window.addEventListener("beforeunload", (event) => {
+    if (!hasUnsavedChanges()) return;
+    event.preventDefault();
+    event.returnValue = "";
+  });
   document.querySelector("#newSong")?.addEventListener("click", () => {
+    if (!confirmDiscardChanges()) return;
     selected = createEmptySongCorrection();
     selectedIsNew = true;
-    renderEditor();
-    renderSongList();
+    resetEditor();
   });
   document.querySelector<HTMLInputElement>("#search")?.addEventListener("input", (event) => {
     searchText = (event.currentTarget as HTMLInputElement).value;
@@ -546,12 +645,17 @@ function bindEvents(): void {
   document.querySelector("#addLine")?.addEventListener("click", () => {
     selected.lines.push(newLine());
     renderLines();
+    updateDirtyState();
+    focusLine(selected.lines.length - 1);
   });
   document.querySelector("#loadBulk")?.addEventListener("click", () => {
+    if (bulkEditorState() !== savedBulkState && !window.confirm("작성 중인 일괄 편집 내용을 현재 줄로 바꿀까요?")) return;
     const source = field<HTMLTextAreaElement>("bulkSource");
     const translation = field<HTMLTextAreaElement>("bulkTranslation");
     if (source) source.value = selected.lines.map((line) => line.source).join("\n");
     if (translation) translation.value = selected.lines.map((line) => line.translation).join("\n");
+    savedBulkState = bulkEditorState();
+    updateDirtyState();
   });
   document.querySelector("#applyBulk")?.addEventListener("click", () => {
     const sourceLines = inputValue("bulkSource").split(/\r?\n/);
@@ -576,6 +680,8 @@ function bindEvents(): void {
     }
     renderLines();
     renderVariants();
+    savedBulkState = bulkEditorState();
+    updateDirtyState();
     setStatus(
       sourceLines.length === translationLines.length
         ? `${selected.lines.length}개 줄을 반영했습니다.`
@@ -586,6 +692,7 @@ function bindEvents(): void {
   document.querySelector("#addVariant")?.addEventListener("click", () => {
     selected.variants.push(newVariant());
     renderVariants();
+    updateDirtyState();
   });
   document.querySelector("#saveSong")?.addEventListener("click", () => runAction(saveSelected));
   document.querySelector("#deleteSong")?.addEventListener("click", () => {
@@ -598,19 +705,21 @@ function bindEvents(): void {
       selected = songs[0] ? cloneSong(songs[0]) : createEmptySongCorrection();
       selectedIsNew = songs.length === 0;
       await notifyLibraryUpdated();
-      renderEditor();
-      renderSongList();
+      resetEditor();
       setStatus("삭제했습니다.", "success");
     });
   });
   document.querySelector("#importCurrent")?.addEventListener("click", () => {
     runAction(async () => {
+      syncMetadataFromForm();
       const media = await loadCurrentMedia();
+      syncMetadataFromForm();
       selected.title ||= media.title;
       selected.artist ||= media.author;
       selected.durationSeconds ||= media.durationSeconds;
       if (!selected.videoIds.includes(media.videoId)) selected.videoIds.push(media.videoId);
       renderEditor();
+      updateDirtyState();
       setStatus("현재 영상 정보를 채웠습니다.", "success");
     });
   });
@@ -630,6 +739,7 @@ function bindEvents(): void {
         lineOverrides: []
       });
       renderVariants();
+      updateDirtyState();
       setStatus("현재 영상을 커버 프로필에 추가했습니다.", "success");
     });
   });
@@ -678,8 +788,7 @@ async function main(): Promise<void> {
   }
   const toggle = document.querySelector<HTMLInputElement>("#correctionEnabled");
   if (toggle) toggle.checked = preferences.enabled;
-  renderSongList();
-  renderEditor();
+  resetEditor();
 }
 
 void main().catch((error) => {

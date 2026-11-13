@@ -56,7 +56,9 @@ test("bulk UI requires consent before removing timing and keeps detached cover t
   const globals = {
     document: { querySelector: (id) => ({ addEventListener: (_, handler) => handlers.set(id, handler) }) },
     selected, mergeBulkCorrectionLines, inputValue: (id) => id === "bulkSource" ? "replacement" : "new translation",
-    window: { confirm: () => consent }, renderLines: () => {}, renderVariants: () => {}, setStatus: () => {}
+    window: { confirm: () => consent, addEventListener() {} },
+    updateDirtyState() {}, bulkEditorState: () => "", savedBulkState: "",
+    renderLines: () => {}, renderVariants: () => {}, setStatus: () => {}
   };
   functions("../src/corrections/index.ts", ["bindEvents"], globals).bindEvents();
   handlers.get("#applyBulk")();
@@ -164,6 +166,7 @@ test("options save and model-list actions wait for their configured host permiss
   next.inputMode = "captions";
   const globals = {
     DEFAULT_SETTINGS,
+    actionPending: false, app: undefined,
     byId: (id) => ({ addEventListener: (_, handler) => handlers.set(id, handler) }),
     collectSettings: () => next,
     inputValue: () => next.openai.baseUrl,
@@ -189,5 +192,5 @@ test("options save and model-list actions wait for their configured host permiss
   finish.reject(new Error("denied"));
   await new Promise(setImmediate);
   assert.equal(modelLoads, 0);
-  assert.deepEqual(statuses, ["denied"]);
+  assert.equal(statuses.at(-1), "denied");
 });

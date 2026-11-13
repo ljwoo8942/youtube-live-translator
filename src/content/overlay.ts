@@ -65,6 +65,7 @@ export class TranslatorOverlay {
           max-width: none;
           max-height: none;
           contain: style paint;
+          container: ytlt-overlay / size;
           pointer-events: none;
           background: transparent;
           font-family: Roboto, Arial, "Noto Sans KR", sans-serif;
@@ -93,6 +94,11 @@ export class TranslatorOverlay {
           line-height: 1.35;
           text-shadow: 0 1px 2px rgba(0, 0, 0, 0.85);
           box-shadow: 0 6px 22px rgba(0, 0, 0, 0.24);
+        }
+
+        .box:focus-visible {
+          outline: 2px solid #fff;
+          outline-offset: 1px;
         }
 
         .translation {
@@ -139,6 +145,9 @@ export class TranslatorOverlay {
           top: 12px;
           bottom: auto;
           display: none;
+          max-width: calc(100% - 24px);
+          box-sizing: border-box;
+          flex-wrap: wrap;
           align-items: center;
           gap: 4px;
           padding: 5px 6px;
@@ -155,6 +164,7 @@ export class TranslatorOverlay {
         }
 
         .controls button {
+          flex: 0 0 28px;
           width: 28px;
           height: 26px;
           border: 0;
@@ -168,6 +178,11 @@ export class TranslatorOverlay {
 
         .controls button:hover {
           background: rgba(255, 255, 255, 0.2);
+        }
+
+        .controls button:focus-visible {
+          outline: 2px solid #fff;
+          outline-offset: 1px;
         }
 
         .controls button[data-active="true"] {
@@ -196,6 +211,52 @@ export class TranslatorOverlay {
           white-space: nowrap;
           pointer-events: none;
         }
+
+        @container ytlt-overlay (max-height: 280px) {
+          .controls {
+            top: 4px;
+            right: 4px;
+            max-width: calc(100% - 8px);
+            gap: 2px;
+            padding: 2px;
+          }
+
+          .controls button {
+            flex-basis: 24px;
+            width: 24px;
+            height: 24px;
+          }
+
+          .control-status {
+            display: none;
+          }
+
+          .stack {
+            bottom: 8px;
+          }
+
+          .box {
+            max-width: calc(100% - 16px);
+            padding: 6px 10px;
+            max-height: max(32px, calc(100cqh - 96px));
+            overflow-y: auto;
+            pointer-events: auto;
+          }
+
+        }
+
+        @container ytlt-overlay (max-height: 180px) {
+          .stack {
+            bottom: 4px;
+          }
+
+          .box {
+            max-width: calc(100% - 8px);
+            max-height: max(32px, calc(100cqh - 76px));
+            padding: 4px 8px;
+          }
+
+        }
       </style>
       <div class="controls" aria-label="YouTube translator controls">
         <button data-action="toggle" title="번역 켜기/끄기" type="button">ON</button>
@@ -210,10 +271,10 @@ export class TranslatorOverlay {
         <button data-action="moveDown" title="자막 아래로" type="button">↓</button>
         <button data-action="retry" title="음성 인식 재시도" type="button">↻</button>
         <button data-action="options" title="전체 설정 열기" type="button">⚙</button>
-        <span class="control-status"></span>
+        <span class="control-status" role="status" aria-live="polite" aria-atomic="true"></span>
       </div>
       <div class="stack">
-        <div class="box">
+        <div class="box" role="region" aria-label="번역 자막" tabindex="0">
           <div class="translation"></div>
           <div class="source"></div>
           <div class="status"></div>

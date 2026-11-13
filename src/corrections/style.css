@@ -97,6 +97,12 @@ h3 {
   text-transform: uppercase;
 }
 
+.unsaved {
+  margin-top: 6px;
+  color: #9a3412;
+  font-size: 13px;
+}
+
 .top-actions,
 .editor-actions,
 .section-head,

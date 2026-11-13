@@ -404,6 +404,11 @@ button:active {
   transform: scale(0.95);
 }
 
+button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
 button:focus-visible {
   outline: 2px solid var(--color-focus);
   outline-offset: 2px;
@@ -488,8 +493,21 @@ button.danger {
   }
 
   .shell > .actions {
+    position: static;
+    width: calc(100% - 28px);
+    margin: 24px auto 18px;
+    transform: none;
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .shell {
+    padding-bottom: 0;
+  }
+
+  .status {
+    flex: 0 1 auto;
+    overflow-wrap: anywhere;
   }
 
   .shell > .actions button,

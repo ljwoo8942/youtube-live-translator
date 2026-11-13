@@ -1672,6 +1672,23 @@ async function stopAudioCaptureAfterFatalError(tabId: number, videoId: string, e
   setAudioFailureCooldown(tabId, error, videoId);
 }
 
+async function handleTestTranslation(
+  message: Extract<RuntimeMessage, { type: "TEST_TRANSLATION" }>,
+  sender: chrome.runtime.MessageSender
+): Promise<MessageResponse<{ translatedText: string; provider: string }>> {
+  if (sender.id !== chrome.runtime.id || sender.url?.split(/[?#]/)[0] !== chrome.runtime.getURL("options.html")) {
+    return { ok: false, error: "번역 연결 테스트는 설정 페이지에서만 실행할 수 있습니다." };
+  }
+  const settings = { ...message.settings, enabled: true };
+  assertTranslationReady(settings);
+  // Diagnostics must contact the provider without changing saved settings or using cached results.
+  const result = await translateSegment(settings, message.segment);
+  const translatedText = sanitizeTranslatedSubtitle(message.segment, result.translatedText, settings);
+  return translatedText
+    ? { ok: true, translatedText, provider: result.provider }
+    : { ok: false, error: BLOCKED_HALLUCINATION_ERROR };
+}
+
 async function translateAndRespond(
   segment: CaptionSegment,
   signal?: AbortSignal,
@@ -3013,6 +3030,11 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
         startCaptionLyricsAssist(sender.tab.id, message.videoId, settings);
         startCorrectionSession(sender.tab.id, message.videoId);
         sendResponse({ ok: true });
+        return;
+      }
+
+      if (message.type === "TEST_TRANSLATION") {
+        sendResponse(await handleTestTranslation(message, sender));
         return;
       }
 

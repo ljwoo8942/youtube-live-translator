@@ -8,6 +8,8 @@ let settings: TranslatorSettings;
 let currentTabIsYouTube = false;
 let correctionEnabled = true;
 let correctionCount = 0;
+let actionPending = false;
+let popupClosing = false;
 
 function activeTab(): Promise<chrome.tabs.Tab | undefined> {
   return chrome.tabs.query({ active: true, currentWindow: true }).then((tabs) => tabs[0]);
@@ -87,6 +89,7 @@ function setStatus(text: string): void {
 }
 
 function closePopupAfterSuccess(): void {
+  popupClosing = true;
   window.setTimeout(() => window.close(), 120);
 }
 
@@ -106,8 +109,24 @@ function escapeHtml(value: string): string {
 }
 
 function runAction(action: () => Promise<void>): void {
+  if (actionPending || popupClosing) return;
+  actionPending = true;
+  const focused = document.activeElement as HTMLElement | null;
+  const controls = Array.from(document.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLButtonElement>("input, select, button"));
+  const disabled = controls.map((control) => control.disabled);
+  controls.forEach((control) => { control.disabled = true; });
+  app?.setAttribute("aria-busy", "true");
+  setStatus("처리 중...");
   void action().catch((error) => {
     setStatus(getErrorMessage(error));
+  }).finally(() => {
+    actionPending = false;
+    app?.setAttribute("aria-busy", "false");
+    if (!popupClosing) {
+      controls.forEach((control, index) => { control.disabled = disabled[index]; });
+      if (focused?.isConnected && document.activeElement === document.body) focused.focus();
+    }
+    if (document.querySelector("#status")?.textContent === "처리 중...") setStatus("완료했습니다.");
   });
 }
 
@@ -221,7 +240,7 @@ function render(): void {
           <button id="options" class="primary">전체 설정</button>
           <button id="corrections">교정 사전</button>
         </div>
-        <div id="status" class="status">YouTube 영상 탭에서 다시 열어 주세요.</div>
+        <div id="status" class="status" role="status" aria-live="polite" aria-atomic="true">YouTube 영상 탭에서 다시 열어 주세요.</div>
       </section>
     `;
     document.querySelector("#options")?.addEventListener("click", () => {
@@ -253,6 +272,27 @@ function render(): void {
         <p class="tagline">${isRecommendedFlow ? "로컬 STT + 번역 API" : "사용자 지정 흐름"}</p>
       </section>
 
+      <section class="quick-toggles" aria-label="자막 표시 설정">
+        <label class="panel-switch">
+          <span>영상 미니 컨트롤</span>
+          <input id="miniControlsEnabled" type="checkbox" />
+        </label>
+        <label class="panel-switch">
+          <span>사용자 교정 사전</span>
+          <input id="correctionEnabled" type="checkbox" />
+        </label>
+      </section>
+      <div class="actions primary-actions">
+        <button id="save" class="primary">저장</button>
+        <button id="startAudio">음성 시작</button>
+        <button id="stopAudio">음성 중지</button>
+      </div>
+      <div class="actions">
+        <button id="options">전체 설정</button>
+        <button id="corrections">교정 사전</button>
+      </div>
+      <div id="status" class="status" role="status" aria-live="polite" aria-atomic="true"></div>
+
       <section class="quick-status">
         <div class="status-row">
           <span class="status-dot ${isRecommendedFlow ? "ok" : ""}"></span>
@@ -269,7 +309,9 @@ function render(): void {
         </div>
       </section>
 
-      <section class="panel">
+      <details class="quick-settings">
+        <summary>입력·언어·모델 설정</summary>
+        <section class="panel">
         <label>
           입력 방식
           <select id="inputMode">
@@ -326,24 +368,8 @@ function render(): void {
           목표 언어
           <input id="targetLanguage" placeholder="ko" />
         </label>
-        <label class="panel-switch">
-          <span>영상 미니 컨트롤</span>
-          <input id="miniControlsEnabled" type="checkbox" />
-        </label>
-        <label class="panel-switch">
-          <span>사용자 교정 사전</span>
-          <input id="correctionEnabled" type="checkbox" />
-        </label>
-      </section>
-
-      <div class="actions">
-        <button id="options" class="primary">전체 설정</button>
-        <button id="corrections">교정 사전</button>
-        <button id="save">저장</button>
-        <button id="startAudio">음성 시작</button>
-        <button id="stopAudio">음성 중지</button>
-      </div>
-      <div id="status" class="status"></div>
+        </section>
+      </details>
     </section>
   `;
 

@@ -2,6 +2,7 @@ import { DEFAULT_SETTINGS } from "../shared/defaults";
 import { diffSettings, loadSettings } from "../shared/storage";
 import { requestProviderPermissions } from "../shared/providerPermissions";
 import { fetchWithTimeout } from "../shared/network";
+import { transcribeAudio } from "../background/providers";
 import type {
   ApiAuthHeaderMode,
   AiEndpointMode,
@@ -39,6 +40,7 @@ const AI_GATEWAY_PRESETS = {
   }
 };
 let settings: TranslatorSettings;
+let actionPending = false;
 type JsonObject = Record<string, unknown>;
 
 function trimTrailingSlash(value: string): string {
@@ -246,14 +248,6 @@ function authHeaders(apiKey: string, mode: ApiAuthHeaderMode): HeadersInit {
   return { Authorization: `Bearer ${apiKey}` };
 }
 
-function apiSttModel(model: string): string {
-  const trimmed = model.trim();
-  if (!trimmed || /^(tiny|base|small|medium|large|large-v\d+(?:-turbo)?|distil-.+)$/i.test(trimmed)) {
-    return "whisper-1";
-  }
-  return trimmed;
-}
-
 function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
@@ -457,8 +451,23 @@ function setStatus(text: string): void {
 }
 
 function runAction(action: () => Promise<void>): void {
+  if (actionPending) return;
+  actionPending = true;
+  const controls = Array.from(app?.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | HTMLButtonElement>("button,input,select,textarea") ?? []);
+  const focused = controls.find((control) => control === document.activeElement);
+  const disabled = controls.map((control) => control.disabled);
+  controls.forEach((control) => { control.disabled = true; });
+  app?.setAttribute("aria-busy", "true");
+  setStatus("작업 중입니다...");
   void action().catch((error) => {
     setStatus(getErrorMessage(error));
+  }).finally(() => {
+    actionPending = false;
+    controls.forEach((control, index) => { control.disabled = disabled[index]; });
+    app?.setAttribute("aria-busy", "false");
+    const focusTarget = focused?.isConnected ? focused : focused?.id ? document.getElementById(focused.id) : null;
+    if (focusTarget && document.activeElement === document.body) focusTarget.focus();
+    if (byId<HTMLDivElement>("status").textContent === "작업 중입니다...") setStatus("작업을 완료했습니다.");
   });
 }
 
@@ -478,6 +487,19 @@ function runSettingsAction(action: () => Promise<void>): void {
     ? next.streamingSttEndpoint
     : undefined;
   runProviderAction(action, urls, streamingUrl);
+}
+
+function runPipelineTest(next = collectSettings()): void {
+  const urls = [next[next.translationProvider].baseUrl];
+  if (next.inputMode !== "captions") {
+    if (next.sttProvider === "lmStudio") {
+      if (next.lmStudio.tryStt) urls.push(next.lmStudio.baseUrl);
+      urls.push(next.whisper.baseUrl);
+    } else {
+      urls.push(next.sttProvider === "openai" ? next.apiStt.baseUrl : next.whisper.baseUrl);
+    }
+  }
+  runProviderAction(() => testLocalPipeline(next), urls);
 }
 
 function setInput(id: string, value: string | number | boolean): void {
@@ -531,7 +553,7 @@ function render(): void {
           <button id="heroLivePreset" type="button">라이브 STT 프리셋</button>
           <button id="heroLyricsPreset" type="button">노래 STT 프리셋</button>
           <button id="openCorrections" type="button">곡 교정 사전</button>
-          <button id="heroPipelineTest" type="button">전체 테스트</button>
+          <button id="heroPipelineTest" type="button">현재 설정 연결 테스트</button>
         </div>
       </section>
 
@@ -779,7 +801,7 @@ function render(): void {
           <div class="actions">
             <button id="apiKeyAudioPreset" type="button">API 키로 음성 자막 프리셋</button>
             <button id="apiSttTest" type="button">API STT 연결 테스트</button>
-            <button id="apiPipelineTest" type="button">API STT + 번역 테스트</button>
+            <button id="apiPipelineTest" type="button">API STT + 번역 연결 테스트</button>
           </div>
           <span class="hint">YouTube 자체 자막이 없을 때 탭 음성을 API STT로 인식하고, AI API 번역 자막으로 표시합니다.</span>
         </section>
@@ -887,9 +909,9 @@ function render(): void {
             <button id="localGpuPreset" type="button">로컬 STT + 번역 API 프리셋</button>
             <button id="liveSttPreset" type="button">라이브 STT 프리셋</button>
             <button id="fasterWhisperProbe" type="button">로컬 STT 연결 확인</button>
-            <button id="localPipelineTest" type="button">STT + 번역 API 전체 테스트</button>
+            <button id="localPipelineTest" type="button">로컬 STT + 번역 연결 테스트</button>
           </div>
-          <span class="hint">M 시리즈 Mac은 MLX GPU, Windows는 CUDA/CPU를 사용합니다. Intel Mac은 지원하지 않습니다. 기본 모델은 small이며 Qwen 0.6B·1.7B도 선택할 수 있습니다. 먼저 로컬 STT 연결 확인으로 서버 모델을 적용하세요. 테스트 전 ${LOCAL_STT_START_HINT}</span>
+          <span class="hint">M 시리즈 Mac은 MLX GPU, Windows는 CUDA/CPU를 사용합니다. Intel Mac은 지원하지 않습니다. 기본 모델은 small이며 Qwen 0.6B·1.7B도 선택할 수 있습니다. 모델을 선택한 뒤 설정 저장을 눌러 적용하세요. 연결 확인은 서버 상태만 검사합니다. 테스트 전 ${LOCAL_STT_START_HINT}</span>
         </section>
 
         <section class="section full">
@@ -928,8 +950,8 @@ function render(): void {
       <div class="actions">
         <button id="save" class="primary">설정 저장</button>
         <button id="test">번역 테스트</button>
-        <button id="restore" class="danger">기본값 복원</button>
-        <div id="status" class="status"></div>
+        <button id="restore" class="danger">동작·자막 기본값 복원</button>
+        <div id="status" class="status" role="status" aria-live="polite" aria-atomic="true"></div>
       </div>
     </section>
   `;
@@ -1087,10 +1109,11 @@ async function saveCurrentSettings(): Promise<void> {
   setStatus("설정을 저장했습니다. YouTube 탭에 바로 반영됩니다.");
 }
 
-async function testTranslation(): Promise<void> {
-  await saveCurrentSettings();
+async function testTranslation(next = collectSettings(), label = "번역"): Promise<void> {
+  setStatus(`${label} 연결을 테스트하는 중입니다...`);
   const response = await chrome.runtime.sendMessage<MessageResponse<{ translatedText: string; provider: string }>>({
-    type: "CAPTION_SEGMENT",
+    type: "TEST_TRANSLATION",
+    settings: next,
     segment: {
       id: "options-test",
       source: "youtubeDom",
@@ -1099,11 +1122,11 @@ async function testTranslation(): Promise<void> {
       text: "Hello, this is a translation test."
     }
   });
-  setStatus(response?.ok ? `테스트 성공: ${response.translatedText}` : `테스트 실패: ${response?.error ?? "background 응답 없음"}`);
+  if (!response?.ok) throw new Error(`${label} 테스트 실패: ${response?.error ?? "background 응답 없음"}`);
+  setStatus(`${label} 연결 테스트 성공: ${response.translatedText}`);
 }
 
 async function loadLmStudioModels(): Promise<void> {
-  setInput("translationProvider", "lmStudio");
   setStatus("LM Studio 모델 목록을 불러오는 중입니다...");
 
   const models = await readLmStudioModelIds();
@@ -1118,72 +1141,25 @@ async function loadLmStudioModels(): Promise<void> {
 }
 
 async function testLmStudioTranslation(): Promise<void> {
-  setInput("translationProvider", "lmStudio");
-  await saveCurrentSettings();
-  const response = await chrome.runtime.sendMessage<MessageResponse<{ translatedText: string; provider: string }>>({
-    type: "CAPTION_SEGMENT",
-    segment: {
-      id: "lm-studio-options-test",
-      source: "youtubeDom",
-      startMs: 0,
-      endMs: 1000,
-      text: "Hello, this is a translation test."
-    }
-  });
-  setStatus(response?.ok ? `LM Studio 번역 테스트 성공: ${response.translatedText}` : `LM Studio 번역 테스트 실패: ${response?.error ?? "background 응답 없음"}`);
+  await testTranslation({ ...collectSettings(), translationProvider: "lmStudio" }, "LM Studio 번역");
 }
 
-async function probeFasterWhisper(): Promise<void> {
-  const baseUrl = normalizeOpenAiBaseUrl(inputValue("whisperBaseUrl", DEFAULT_SETTINGS.whisper.baseUrl));
-  setInput("whisperBaseUrl", baseUrl);
+async function probeFasterWhisper(next = collectSettings()): Promise<void> {
+  const baseUrl = normalizeOpenAiBaseUrl(next.whisper.baseUrl);
   const healthUrl = joinUrl(baseUrl.replace(/\/v1\/?$/, ""), "/health");
   setStatus("로컬 STT 서버를 확인하는 중입니다...");
-
   const [healthResult, modelsResult] = await Promise.all([
     fetchText(healthUrl, undefined, "로컬 STT 서버", LOCAL_STT_START_HINT),
     fetchText(joinUrl(baseUrl, "/models"), undefined, "로컬 STT 서버", LOCAL_STT_START_HINT)
   ]);
-  const { response: healthResponse, text: healthText } = healthResult;
-  const { response: modelsResponse, text: modelsText } = modelsResult;
-
-  if (!healthResponse.ok) {
-    throw new Error(`로컬 STT health 실패: HTTP ${healthResponse.status} ${healthText.slice(0, 180)}`);
-  }
-  if (!modelsResponse.ok) {
-    throw new Error(`로컬 STT models 실패: HTTP ${modelsResponse.status} ${modelsText.slice(0, 180)}`);
-  }
-
-  const health = healthText ? JSON.parse(healthText) : {};
-  const models = modelsText ? JSON.parse(modelsText) : {};
-  if (health.ok === false) {
-    throw new Error(`로컬 STT 준비 실패: ${formatLocalSttHealthStatus(health)}`);
-  }
-
-  const modelIds = Array.isArray(models.data)
-    ? (models.data as JsonObject[]).map((model) => model.id).filter((id): id is string => typeof id === "string")
-    : [];
-  const selectedModel = rawInputValue("whisperModel") || LOCAL_STT_MODEL;
-  const cachedModels = stringArray(health.cached_models);
-  const loadedModel =
-    typeof health.loaded_model === "string" && health.loaded_model
-      ? health.loaded_model
-      : typeof health.model === "string" && health.model
-        ? health.model
-        : "";
-  const selectedIsUsable =
-    cachedModels.includes(selectedModel) ||
-    selectedModel === loadedModel ||
-    selectedModel.includes("/") ||
-    selectedModel.includes("\\");
-  const modelId = selectedIsUsable ? selectedModel : loadedModel || cachedModels[0] || modelIds[0] || selectedModel;
-
-  setInput("whisperModel", modelId);
-  setInput("sttProvider", "whisper");
-  setStatus(
-    health.ok
-      ? `로컬 STT 연결 성공: 서버 ${loadedModel}, 선택 ${modelId}, ${health.backend ?? "Whisper"}, ${health.device ?? "device?"}/${health.compute_type ?? "compute?"}`
-      : `로컬 STT 응답 오류: ${health.error ?? "상태를 확인하세요."}`
-  );
+  if (!healthResult.response.ok) throw new Error(`로컬 STT health 실패: HTTP ${healthResult.response.status} ${healthResult.text.slice(0, 180)}`);
+  if (!modelsResult.response.ok) throw new Error(`로컬 STT models 실패: HTTP ${modelsResult.response.status} ${modelsResult.text.slice(0, 180)}`);
+  const health = healthResult.text ? JSON.parse(healthResult.text) : {};
+  if (health.ok === false) throw new Error(`로컬 STT 준비 실패: ${formatLocalSttHealthStatus(health)}`);
+  const loadedModel = typeof health.loaded_model === "string" ? health.loaded_model : health.model ?? "";
+  const selectedModel = next.whisper.model;
+  const prepared = stringArray(health.cached_models).includes(selectedModel) || selectedModel === loadedModel || selectedModel.includes("/") || selectedModel.includes("\\");
+  setStatus(`로컬 STT 연결 성공: 서버 ${loadedModel}, 선택 ${selectedModel}${prepared ? "" : " (선택 모델 준비 필요)"}, ${health.backend ?? "Whisper"}, ${health.device ?? "device?"}/${health.compute_type ?? "compute?"}`);
 }
 
 function createSilentWavBlob(seconds = 1): Blob {
@@ -1227,128 +1203,24 @@ function createSilentWavBlob(seconds = 1): Blob {
   return new Blob([buffer], { type: "audio/wav" });
 }
 
-async function testLocalPipeline(): Promise<void> {
-  await probeFasterWhisper();
-  await saveCurrentSettings();
-  setStatus("로컬 STT와 AI API 번역을 함께 테스트하는 중입니다...");
-
-  const form = new FormData();
-  form.append("file", createSilentWavBlob(), "silence.wav");
-  form.append("model", inputValue("whisperModel", LOCAL_STT_MODEL));
-  const { response: sttResponse, text: sttText } = await fetchText(
-    joinOpenAiUrl(inputValue("whisperBaseUrl", LOCAL_STT_BASE_URL), inputValue("whisperEndpoint", "/audio/transcriptions")),
-    {
-      method: "POST",
-      body: form
-    },
-    "로컬 STT 서버",
-    LOCAL_STT_START_HINT
-  );
-  if (!sttResponse.ok) {
-    throw new Error(`STT 테스트 실패: HTTP ${sttResponse.status} ${sttText.slice(0, 180)}`);
+async function testLocalPipeline(next = collectSettings()): Promise<void> {
+  if (next.inputMode === "captions") {
+    await testTranslation(next);
+    setStatus("공식 자막 모드: 고정 문장 번역 연결을 확인했습니다. 실제 자막 표시는 영상에서 확인하세요.");
+    return;
   }
-
-  const translationResponse = await chrome.runtime.sendMessage<MessageResponse<{ translatedText: string; provider: string }>>({
-    type: "CAPTION_SEGMENT",
-    segment: {
-      id: "local-pipeline-test",
-      source: "audioStt",
-      startMs: 0,
-      endMs: 1000,
-      text: "Local speech recognition and AI translation API are connected."
-    }
-  });
-
-  if (!translationResponse?.ok) {
-    throw new Error(`AI API 번역 테스트 실패: ${translationResponse?.error ?? "background 응답 없음"}`);
-  }
-
-  setStatus(`로컬 STT + 번역 API 테스트 성공: ${translationResponse.translatedText}`);
+  if (next.sttProvider === "whisper" && isLocalBaseUrl(next.whisper.baseUrl)) await probeFasterWhisper(next);
+  setStatus("무음 STT 요청과 고정 문장 번역의 연결을 확인하는 중입니다...");
+  await transcribeAudio(next, await createSilentWavBlob().arrayBuffer(), "audio/wav");
+  await testTranslation(next);
+  setStatus("연결 테스트 성공: 무음 STT 응답과 고정 문장 번역을 확인했습니다. 실제 탭 캡처·음성 인식 정확도는 영상에서 확인하세요.");
 }
 
 async function testApiStt(): Promise<void> {
-  const baseUrl = normalizeOpenAiBaseUrl(inputValue("apiSttBaseUrl", DEFAULT_SETTINGS.apiStt.baseUrl));
-  const endpoint = inputValue("apiSttEndpoint", DEFAULT_SETTINGS.apiStt.endpoint);
-  const authHeaderMode = selectValue<ApiAuthHeaderMode>("apiSttAuthHeaderMode");
-  const apiKey = inputValue("apiSttApiKey") || inputValue("openaiApiKey");
-  const model = apiSttModel(inputValue("apiSttModel", DEFAULT_SETTINGS.apiStt.model));
-
-  setInput("apiSttBaseUrl", baseUrl);
-  setInput("apiSttModel", model);
-  if (!apiKey && authHeaderMode !== "none") {
-    throw new Error("API STT 키가 없습니다. AI API 키를 입력하거나 API STT 키를 입력하세요.");
-  }
-
+  const next = { ...collectSettings(), sttProvider: "openai" as const, inputMode: "audio" as const };
   setStatus("API STT 연결을 테스트하는 중입니다...");
-  const form = new FormData();
-  form.append("file", createSilentWavBlob(), "silence.wav");
-  form.append("model", model);
-  form.append("response_format", "json");
-  const sourceLanguage = selectValue<string>("sourceLanguage") || "auto";
-  const contentMode = selectValue<ContentMode>("contentMode");
-  const mixedLanguageAudio = contentMode === "lyrics";
-  if (sourceLanguage !== "auto" && !mixedLanguageAudio) {
-    form.append("language", sourceLanguage);
-  }
-  if (isLocalBaseUrl(baseUrl)) {
-    form.append("content_mode", contentMode);
-  }
-
-  const { response, text } = await fetchText(
-    joinOpenAiUrl(baseUrl, endpoint),
-    {
-      method: "POST",
-      headers: authHeaders(apiKey, authHeaderMode),
-      body: form
-    },
-    "API STT",
-    "Base URL, endpoint, API 키/권한, 모델명을 확인하세요."
-  );
-
-  if (!response.ok) {
-    throw new Error(`API STT 테스트 실패: ${apiHttpErrorMessage(response, text)}`);
-  }
-
-  let json: JsonObject = {};
-  try {
-    json = text ? (JSON.parse(text) as JsonObject) : {};
-  } catch {
-    throw new Error(`API STT 응답이 JSON이 아닙니다: ${text.slice(0, 180)}`);
-  }
-  if (json.error) {
-    throw new Error(`API STT 테스트 실패: ${typeof json.error === "string" ? json.error : JSON.stringify(json.error).slice(0, 180)}`);
-  }
-
-  const transcript = typeof json.text === "string" ? json.text.trim() : typeof json.transcript === "string" ? json.transcript.trim() : "";
-  setInput("sttProvider", "openai");
-  setStatus(transcript ? `API STT 연결 성공: ${transcript}` : "API STT 연결 성공: 무음 테스트 응답을 받았습니다.");
-}
-
-async function testApiAudioPipeline(): Promise<void> {
-  setInput("enabled", true);
-  setInput("inputMode", "captionsThenAudio");
-  setInput("translationProvider", "openai");
-  setInput("sttProvider", "openai");
-  await testApiStt();
-  await saveCurrentSettings();
-  setStatus("API STT 결과를 AI API 번역으로 전달하는 중입니다...");
-
-  const response = await chrome.runtime.sendMessage<MessageResponse<{ translatedText: string; provider: string }>>({
-    type: "CAPTION_SEGMENT",
-    segment: {
-      id: "api-audio-pipeline-test",
-      source: "audioStt",
-      startMs: 0,
-      endMs: 1000,
-      text: "API speech recognition and AI translation are connected."
-    }
-  });
-
-  if (!response?.ok) {
-    throw new Error(`AI API 번역 테스트 실패: ${response?.error ?? "background 응답 없음"}`);
-  }
-
-  setStatus(`API 음성 자막 파이프라인 성공: ${response.translatedText}`);
+  const transcript = await transcribeAudio(next, await createSilentWavBlob().arrayBuffer(), "audio/wav");
+  setStatus(transcript ? `API STT 연결 성공: ${transcript}` : "API STT 연결 성공: 무음 테스트 응답을 받았습니다. 실제 음성 인식 정확도는 영상에서 확인하세요.");
 }
 
 function applyLocalGpuPreset(): void {
@@ -1490,7 +1362,6 @@ function applyAiGatewayPreset(): void {
 }
 
 async function loadOpenAiModels(): Promise<void> {
-  setInput("translationProvider", "openai");
   setStatus("AI API 모델 목록을 불러오는 중입니다...");
 
   const models = await readAiGatewayModelIds();
@@ -1533,12 +1404,12 @@ function bindActions(): void {
   });
 
   byId<HTMLButtonElement>("heroPipelineTest").addEventListener("click", () => {
-    applyLocalGpuPreset();
-    runSettingsAction(testLocalPipeline);
+    runPipelineTest();
   });
 
   byId<HTMLButtonElement>("test").addEventListener("click", () => {
-    runSettingsAction(testTranslation);
+    const next = collectSettings();
+    runProviderAction(() => testTranslation(next), [next[next.translationProvider].baseUrl]);
   });
 
   byId<HTMLSelectElement>("openaiGatewayPreset").addEventListener("change", () => {
@@ -1587,10 +1458,7 @@ function bindActions(): void {
   });
 
   byId<HTMLButtonElement>("apiPipelineTest").addEventListener("click", () => {
-    setInput("inputMode", "captionsThenAudio");
-    setInput("translationProvider", "openai");
-    setInput("sttProvider", "openai");
-    runSettingsAction(testApiAudioPipeline);
+    runPipelineTest({ ...collectSettings(), sttProvider: "openai", inputMode: "audio" });
   });
 
   byId<HTMLButtonElement>("loadLmStudioModels").addEventListener("click", () => {
@@ -1598,8 +1466,7 @@ function bindActions(): void {
   });
 
   byId<HTMLButtonElement>("lmStudioProbe").addEventListener("click", () => {
-    setInput("translationProvider", "lmStudio");
-    runSettingsAction(testLmStudioTranslation);
+    runProviderAction(testLmStudioTranslation, [inputValue("lmStudioBaseUrl", DEFAULT_SETTINGS.lmStudio.baseUrl)]);
   });
 
   byId<HTMLButtonElement>("localGpuPreset").addEventListener("click", () => {
@@ -1615,16 +1482,27 @@ function bindActions(): void {
   });
 
   byId<HTMLButtonElement>("localPipelineTest").addEventListener("click", () => {
-    applyLocalGpuPreset();
-    runSettingsAction(testLocalPipeline);
+    runPipelineTest({ ...collectSettings(), sttProvider: "whisper", inputMode: "audio" });
   });
 
   byId<HTMLButtonElement>("restore").addEventListener("click", () => {
     runAction(async () => {
+      if (!window.confirm("동작·자막 설정을 기본값으로 복원할까요? 저장된 API 연결·모델·키는 유지됩니다.")) {
+        setStatus("기본값 복원을 취소했습니다.");
+        return;
+      }
+      const stored = await loadSettings();
       const defaultSettings = structuredClone(DEFAULT_SETTINGS);
-      settings = await saveSettingsPatch(diffSettings(settings, defaultSettings));
+      for (const provider of ["openai", "apiStt", "lmStudio", "whisper", "ollama"] as const) {
+        Object.assign(defaultSettings[provider], stored[provider]);
+      }
+      defaultSettings.translationProvider = stored.translationProvider;
+      defaultSettings.sttProvider = stored.sttProvider;
+      defaultSettings.streamingSttEndpoint = stored.streamingSttEndpoint;
+      defaultSettings.streamingSttEnabled = stored.streamingSttEnabled;
+      settings = await saveSettingsPatch(diffSettings(stored, defaultSettings));
       render();
-      setStatus("기본값으로 복원했습니다.");
+      setStatus("동작·자막 설정을 복원했습니다. API 연결·모델·키는 유지했습니다.");
     });
   });
 }
