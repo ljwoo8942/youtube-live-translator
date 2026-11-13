@@ -4,3 +4,6 @@ python-multipart>=0.0.9
 faster-whisper>=1.2.1
 numpy>=1.26.0
 mlx-whisper==0.4.3; platform_system == "Darwin" and platform_machine == "arm64"
+torch>=2.6; platform_system != "Darwin" or platform_machine == "arm64"
+transformers==5.22.2
+mlx-audio[stt]==0.6.5; platform_system == "Darwin" and platform_machine == "arm64"

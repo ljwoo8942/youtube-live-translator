@@ -1,6 +1,6 @@
-# Local Whisper STT server (MLX and faster-whisper)
+# Local STT server (Whisper and Qwen3-ASR)
 
-OpenAI-compatible speech-to-text server for the YouTube Live Translator extension on Windows and macOS (Apple Silicon and Intel).
+OpenAI-compatible speech-to-text server for the YouTube Live Translator extension on Windows and Apple Silicon macOS. Intel Macs are not supported.
 
 ## Setup
 
@@ -34,10 +34,10 @@ npm run stt:daemon
 
 The first `/health` request loads and probes the selected engine's model. The default model is `small`. Transcription requests can also pass a `model` form field, so choosing another model in the extension loads it when it is cached locally. Set `YT_TRANSLATOR_STT_MODEL` before starting the server to prepare a new model or select a local model directory.
 
-Device selection is automatic: native Apple Silicon macOS uses MLX Metal GPU, Intel macOS uses CPU, and Windows/Linux uses CUDA when an NVIDIA GPU is available and CPU otherwise. Environment overrides remain available.
+Device selection is automatic: native Apple Silicon macOS uses MLX Metal GPU, and Windows uses CUDA when an NVIDIA GPU is available and CPU otherwise. Environment overrides remain available.
 
 - model: `small`
-- device: `mlx` on Apple Silicon; `cpu` on Intel Mac; `cuda` when available on Windows/Linux
+- device: `mlx` on Apple Silicon; `cuda` when available on Windows, otherwise `cpu`
 - compute type: `float16` on MLX/CUDA, `int8` on CPU
 - beam size: `1`
 - VAD: enabled
@@ -51,6 +51,16 @@ MLX model aliases (`tiny`, `base`, `small`, `medium`, `large-v3`, `large-v3-turb
 MLX Whisper 0.4.3 uses greedy decoding, so effective beam size is reported as 1. VAD uses the existing Silero detector and forwards original audio clip timestamps; confidence scores, hallucination filters, and the HTTP/WebSocket contracts remain shared. Automatic language detection runs once per rolling window.
 
 To select MLX explicitly, use `YT_TRANSLATOR_STT_DEVICE=mlx npm run stt:start`. For CPU, use `YT_TRANSLATOR_STT_DEVICE=cpu YT_TRANSLATOR_STT_COMPUTE_TYPE=int8 npm run stt:start`. For a slower machine, try `YT_TRANSLATOR_STT_MODEL=base npm run stt:start`, then use the extension's connection check to adopt the server model. Recreate copied virtual environments with `npm run stt:setup` on the target OS.
+
+## Qwen3-ASR
+
+Run `npm run stt:setup` and `npm run stt:qwen:download` to prepare both models for your platform. Select `qwen3-asr-0.6b` or `qwen3-asr-1.7b` in the extension and save. The server accepts configured or cached models only; HTTP/WS clients cannot request arbitrary downloads.
+
+Apple Silicon uses the `mlx-community/Qwen3-ASR-0.6B-8bit` and `mlx-community/Qwen3-ASR-1.7B-8bit` repositories through mlx-audio. Windows uses the official `Qwen/Qwen3-ASR-0.6B-hf` and `Qwen/Qwen3-ASR-1.7B-hf` checkpoints through Transformers. CUDA-enabled PyTorch uses float16; a CPU-only PyTorch build warns and falls back to CPU/float32. Check `device` and `compute_type` in `/health`; install a matching CUDA build from the official PyTorch instructions for Windows GPU use.
+
+Set `YT_TRANSLATOR_STT_MODEL=qwen3-asr-0.6b` (or `qwen3-asr-1.7b`) before starting to use Qwen as the initial model. Health checks preserve an already selected model instead of replacing it with the default Whisper model.
+
+Both HTTP and WebSocket use the existing rolling-window inference and VAD/text filters. Qwen returns window-level text, not Whisper confidence scores or word-level alignment. Its effective beam size is 1. Native stateful Qwen streaming and a forced aligner are not included. The 1.7B model on CPU may be slow; GPU is recommended.
 
 When the extension sends `content_mode=lyrics`, the server switches to a song-friendly profile:
 

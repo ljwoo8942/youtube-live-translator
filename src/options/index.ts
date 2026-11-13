@@ -505,7 +505,7 @@ function render(): void {
       <section class="hero-tile">
         <p class="eyebrow">Recommended Flow</p>
         <h1>로컬 STT + 번역 API</h1>
-        <p class="muted">로컬 Whisper로 음성을 인식하고 AI API로 번역합니다. Apple Silicon은 MLX GPU를 사용합니다.</p>
+        <p class="muted">로컬 Whisper 또는 Qwen3-ASR로 음성을 인식하고 AI API로 번역합니다. Apple Silicon은 MLX GPU를 사용합니다.</p>
         <div class="hero-actions">
           <button id="heroLocalPreset" class="primary" type="button">로컬 STT 프리셋</button>
           <button id="heroLivePreset" type="button">라이브 STT 프리셋</button>
@@ -619,7 +619,7 @@ function render(): void {
               STT provider
               <select id="sttProvider">
                 <option value="lmStudio">LM Studio STT 먼저 시도</option>
-                <option value="whisper">Whisper-compatible</option>
+                <option value="whisper">로컬 STT (Whisper / Qwen)</option>
                 <option value="openai">OpenAI-compatible</option>
               </select>
               <span class="hint">자막 없는 영상은 STT도 필요합니다. API 키로 음성 인식까지 쓰려면 OpenAI-compatible을 선택하세요.</span>
@@ -869,11 +869,11 @@ function render(): void {
             <button id="fasterWhisperProbe" type="button">로컬 STT 연결 확인</button>
             <button id="localPipelineTest" type="button">STT + 번역 API 전체 테스트</button>
           </div>
-          <span class="hint">기본 STT 모델은 small입니다. M 시리즈 Mac은 MLX GPU, Intel Mac은 CPU/int8, NVIDIA GPU가 있는 Windows·Linux는 CUDA를 사용합니다. CPU에서 느리면 base를 선택하고, 인식률이 부족하면 medium을 테스트하세요. 먼저 로컬 STT 연결 확인으로 서버 모델을 적용하세요. 테스트 전 ${LOCAL_STT_START_HINT}</span>
+          <span class="hint">M 시리즈 Mac은 MLX GPU, Windows는 CUDA/CPU를 사용합니다. Intel Mac은 지원하지 않습니다. 기본 모델은 small이며 Qwen 0.6B·1.7B도 선택할 수 있습니다. 먼저 로컬 STT 연결 확인으로 서버 모델을 적용하세요. 테스트 전 ${LOCAL_STT_START_HINT}</span>
         </section>
 
         <section class="section full">
-          <h2>Whisper-compatible STT</h2>
+          <h2>로컬 STT 모델 (Whisper / Qwen)</h2>
           <div class="fields">
             <label>
               Base URL
@@ -892,7 +892,10 @@ function render(): void {
                 <option value="medium">medium - 정확도 우선</option>
                 <option value="large-v3-turbo">large-v3-turbo - 무거움</option>
                 <option value="large-v3">large-v3 - 매우 무거움</option>
+                <option value="qwen3-asr-0.6b">Qwen3-ASR 0.6B - 라이브/속도 우선</option>
+                <option value="qwen3-asr-1.7b">Qwen3-ASR 1.7B - 정확도/노래 비교용</option>
               </select>
+              <span class="hint">Qwen은 서버 업데이트 후 npm run stt:setup, npm run stt:qwen:download로 모델을 준비하세요. Mac은 MLX GPU, Windows는 PyTorch CUDA/CPU로 실행합니다.</span>
             </label>
             <label>
               엔드포인트
@@ -1158,7 +1161,7 @@ async function probeFasterWhisper(): Promise<void> {
   setInput("sttProvider", "whisper");
   setStatus(
     health.ok
-      ? `로컬 STT 연결 성공: ${modelId}, ${health.backend ?? "Whisper"}, ${health.device ?? "device?"}/${health.compute_type ?? "compute?"}`
+      ? `로컬 STT 연결 성공: 서버 ${loadedModel}, 선택 ${modelId}, ${health.backend ?? "Whisper"}, ${health.device ?? "device?"}/${health.compute_type ?? "compute?"}`
       : `로컬 STT 응답 오류: ${health.error ?? "상태를 확인하세요."}`
   );
 }

@@ -2,7 +2,7 @@
 
 YouTube 실시간 방송과 녹화 영상 위에 번역 자막을 표시하는 Manifest V3 Chrome 확장 프로그램입니다.
 
-제작자가 제공한 YouTube 공식 자막을 먼저 사용하고, 자막이 없을 때만 탭 오디오 STT로 전환합니다. 번역은 OpenAI 호환 AI API, LM Studio 또는 Ollama로 처리할 수 있으며, 로컬 STT는 Apple Silicon Mac의 MLX GPU와 Windows·Linux의 faster-whisper CUDA/CPU를 지원합니다.
+제작자가 제공한 YouTube 공식 자막을 먼저 사용하고, 자막이 없을 때만 탭 오디오 STT로 전환합니다. 번역은 OpenAI 호환 AI API, LM Studio 또는 Ollama로 처리할 수 있으며, 로컬 STT는 Whisper와 Qwen3-ASR 0.6B·1.7B를 지원합니다. 지원 플랫폼은 Windows와 Apple Silicon Mac입니다. Intel Mac은 지원 대상에서 제외합니다.
 
 > API 키는 확장 프로그램 설정 화면에서 입력하며 `chrome.storage.local`에만 저장됩니다. API 키는 이 저장소나 빌드된 확장 프로그램 소스에 포함되지 않습니다.
 
@@ -37,7 +37,7 @@ Chrome에서 개발자 모드를 켠 뒤 `chrome://extensions`의 `압축해제�
 
 ## macOS에서 처음 실행
 
-Apple Silicon(M 시리즈)과 Intel Mac에서 다음 순서로 실행합니다.
+macOS 14 이상의 Apple Silicon(M 시리즈) Mac에서 다음 순서로 실행합니다. Intel Mac과 Rosetta의 x86_64 Python은 지원하지 않습니다.
 
 ```bash
 git clone https://github.com/ljwoo8942/youtube-live-translator.git
@@ -50,13 +50,39 @@ npm run stt:start
 
 위 터미널은 열어 두고, Chrome에 `dist` 폴더를 로드하세요. 옵션 페이지에서 AI 번역 API 키를 입력한 뒤 `로컬 STT 연결 확인`과 `STT + 번역 API 전체 테스트`를 실행합니다. 새 터미널에서 `npm run stt:health`로 서버 상태를 확인할 수도 있습니다.
 
-M 시리즈 Mac에서는 [MLX Whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper)가 Metal GPU를 사용하도록 자동 선택됩니다. macOS 14 이상과 Apple Silicon용 arm64 Python이 필요하며, `npm run stt:setup`이 해당 Mac에서만 MLX를 설치합니다. Intel Mac 또는 Rosetta의 x86_64 Python에서는 faster-whisper CPU/int8을 사용합니다. LM Studio/Ollama 번역은 별도로 선택할 수 있습니다.
+M 시리즈 Mac에서는 Metal GPU가 자동 선택됩니다. Whisper는 `mlx-whisper`, Qwen3-ASR는 `mlx-audio`의 8bit 모델을 사용합니다. Apple Silicon용 arm64 Python이 필요하며, `npm run stt:setup`이 해당 Mac에서만 MLX 패키지를 설치합니다. LM Studio/Ollama 번역은 별도로 선택할 수 있습니다.
 
 이미 설치한 Mac은 `git pull`, `npm run stt:setup`을 실행하고 기존 STT 서버를 종료한 뒤 다시 시작하세요. 최초 인식 또는 상태 확인 시 MLX 형식의 모델을 내려받습니다. `npm run stt:health` 응답의 `backend`가 `mlx-whisper`, `device`가 `mlx`, `compute_type`이 `float16`, `ok`가 `true`이면 실제 GPU 초기화와 짧은 추론 검사를 통과한 것입니다.
 
 직접 지정하려면 `YT_TRANSLATOR_STT_DEVICE=mlx npm run stt:start`를 사용하세요. CPU로 실행할 때는 `YT_TRANSLATOR_STT_DEVICE=cpu YT_TRANSLATOR_STT_COMPUTE_TYPE=int8 npm run stt:start`를 사용합니다. 모델을 바꾸려면 서버 시작 전에 `YT_TRANSLATOR_STT_MODEL=base` 등으로 지정하고 옵션 페이지의 `로컬 STT 연결 확인`으로 서버 모델을 적용하세요.
 
 가상환경 `.venv-stt`는 운영체제와 CPU 구조에 종속됩니다. Windows 가상환경을 Mac으로 복사하지 말고 Mac에서 `npm run stt:setup`을 실행하세요. 설정·곡 교정 사전은 각 Chrome 프로필에 저장되므로, 곡 교정 사전은 JSON 내보내기/가져오기로 옮길 수 있습니다.
+
+## Qwen3-ASR 0.6B / 1.7B 사용
+
+기존 서버를 종료하고 다음 명령으로 실행 패키지와 두 모델을 준비합니다. 모델 파일은 운영체제별 Hugging Face 캐시에 저장되며 GitHub에는 업로드하지 않습니다.
+
+```bash
+git pull
+npm ci
+npm run build
+npm run stt:setup
+npm run stt:qwen:download
+npm run stt:start
+```
+
+확장프로그램을 새로고침하고 전체 설정의 `로컬 STT > 모델`에서 `Qwen3-ASR 0.6B` 또는 `Qwen3-ASR 1.7B`를 선택한 뒤 저장하세요. 라이브·노래 프리셋은 선택한 Qwen 모델을 유지합니다. 다운로드하지 않은 모델은 전사 요청에서 거부되며 준비 명령이 안내됩니다.
+
+| 선택값 | Windows | Apple Silicon Mac |
+| --- | --- | --- |
+| `qwen3-asr-0.6b` | `Qwen/Qwen3-ASR-0.6B-hf` / Transformers | `mlx-community/Qwen3-ASR-0.6B-8bit` / MLX GPU |
+| `qwen3-asr-1.7b` | `Qwen/Qwen3-ASR-1.7B-hf` / Transformers | `mlx-community/Qwen3-ASR-1.7B-8bit` / MLX GPU |
+
+서버의 시작 모델도 Qwen으로 바꾸려면 Mac에서 `YT_TRANSLATOR_STT_MODEL=qwen3-asr-0.6b npm run stt:start`를 사용하세요. Windows PowerShell에서는 `$env:YT_TRANSLATOR_STT_MODEL = 'qwen3-asr-0.6b'` 실행 후 `npm run stt:start`를 실행합니다. 1.7B도 같은 방식으로 지정합니다.
+
+Windows는 CUDA가 활성화된 PyTorch이면 GPU/float16, 그렇지 않으면 경고를 표시하고 CPU/float32를 사용합니다. GPU를 사용하려면 [PyTorch 공식 설치 안내](https://pytorch.org/get-started/locally/)에서 현재 드라이버에 맞는 CUDA 빌드를 설치하세요. `npm run stt:health`의 `loaded_model`, `backend`, `device`, `compute_type`으로 실제 실행 경로를 확인할 수 있습니다. 1.7B CPU 실행은 느릴 수 있습니다.
+
+Qwen도 기존 HTTP 전사·WebSocket 롤링 오디오 창과 음성 감지, 텍스트 환각·반복 차단을 사용합니다. 결과 시간은 오디오 창의 범위이며 단어별 정렬 정보가 아닙니다. Whisper식 신뢰도 점수는 생성하지 않습니다. 네이티브 Qwen 스트리밍 상태 유지와 별도 강제 정렬 모델은 이번 연동에 포함하지 않았습니다.
 
 ## 로컬 AI 기본값
 
@@ -151,10 +177,10 @@ YouTube 번역을 사용하는 동안 이 터미널을 열어 두세요. `stt:st
 npm run stt:health
 ```
 
-서버는 M 시리즈 Mac에서 MLX GPU, Intel Mac에서 CPU를 사용하고, Windows·Linux에서는 사용 가능한 NVIDIA GPU가 있으면 CUDA를 선택합니다. `YT_TRANSLATOR_STT_DEVICE`와 `YT_TRANSLATOR_STT_COMPUTE_TYPE`으로 직접 지정할 수도 있습니다.
+서버는 M 시리즈 Mac에서 MLX GPU를 사용하고, Windows에서는 사용 가능한 NVIDIA GPU가 있으면 CUDA를 선택합니다. Whisper는 `YT_TRANSLATOR_STT_DEVICE`와 `YT_TRANSLATOR_STT_COMPUTE_TYPE`으로 직접 지정할 수도 있습니다. Qwen의 실제 정밀도는 선택된 엔진에 따라 결정됩니다.
 
 - 모델: `small`
-- 장치: Apple Silicon은 `mlx`, Intel Mac 및 GPU 없는 환경은 `cpu`, NVIDIA GPU가 있으면 `cuda`
+- 장치: Apple Silicon은 `mlx`, GPU 없는 Windows는 `cpu`, NVIDIA GPU가 있으면 `cuda`
 - 연산 형식: MLX와 CUDA는 `float16`, CPU는 `int8`
 - 스트리밍 엔드포인트: `ws://127.0.0.1:8765/v1/audio/stream`
 - HTTP 대체 청크: `8000ms`
@@ -208,4 +234,4 @@ uv pip install --python .venv-stt -r local_stt/requirements-dev.txt
 npm run stt:test
 ```
 
-GitHub Actions는 Windows, Apple Silicon Mac, Intel Mac에서 빌드·테스트·STT 설치와 실제 CPU/int8 모델 초기화를 확인합니다. Metal GPU 검사는 Apple Silicon에서 실행하며, runner에 GPU가 없으면 생략 사유를 표시합니다. 실제 M 시리즈 Mac에서는 `YT_TRANSLATOR_STT_MODEL=tiny uv run --no-project --python .venv-stt python -m unittest local_stt.test_mlx_runtime -v`로 GPU 추론을 확인할 수 있습니다. YouTube 재생 중 탭 오디오 캡처와 자막 표시까지는 Chrome에서 확인해야 합니다.
+GitHub Actions는 Windows와 Apple Silicon Mac에서 빌드·테스트·설치, Whisper 실행, Qwen 0.6B 실제 추론을 확인합니다. Mac에서는 Qwen 1.7B Metal 추론도 확인하며, runner에 GPU가 없으면 생략 사유를 표시합니다. Intel Mac 검증은 제외합니다. `YT_TRANSLATOR_STT_MODEL=qwen3-asr-0.6b uv run --no-project --python .venv-stt python -m unittest local_stt.test_qwen_runtime -v`로 준비된 Qwen 모델을 직접 확인할 수 있습니다. YouTube 재생 중 탭 오디오 캡처와 자막 표시까지는 Chrome에서 확인해야 합니다.

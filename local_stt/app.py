@@ -17,6 +17,7 @@ import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from local_stt.qwen_backend import MODEL_REPOSITORIES as QWEN_MODELS, cached_models as cached_qwen_models, canonical_model_name
 
 
 def _candidate_cuda_dll_dirs() -> list[Path]:
@@ -262,14 +263,14 @@ def _cached_models() -> list[str]:
     if DEFAULT_DEVICE == "mlx":
         from local_stt.mlx_backend import cached_models
 
-        return cached_models()
-    return _cached_faster_whisper_models()
+        return cached_models() + cached_qwen_models(DEFAULT_DEVICE)
+    return _cached_faster_whisper_models() + cached_qwen_models(DEFAULT_DEVICE)
 
 
 def _default_model() -> str:
     explicit = os.environ.get("YT_TRANSLATOR_STT_MODEL")
     if explicit:
-        return explicit
+        return canonical_model_name(explicit.strip())
 
     return "small"
 
@@ -309,16 +310,18 @@ _runtime_error: str | None = None
 
 
 def _server_config() -> dict[str, Any]:
+    active_model = _model_name or DEFAULT_MODEL
+    greedy = DEFAULT_DEVICE == "mlx" or active_model in QWEN_MODELS
     return {
         "model": DEFAULT_MODEL,
-        "device": DEFAULT_DEVICE,
-        "backend": "mlx-whisper" if DEFAULT_DEVICE == "mlx" else "faster-whisper",
-        "compute_type": DEFAULT_COMPUTE_TYPE,
-        "beam_size": 1 if DEFAULT_DEVICE == "mlx" else DEFAULT_BEAM_SIZE,
-        "lyrics_beam_size": 1 if DEFAULT_DEVICE == "mlx" else LYRICS_BEAM_SIZE,
-        "live_beam_size": 1 if DEFAULT_DEVICE == "mlx" else LIVE_BEAM_SIZE,
-        "base_model_beam_size": 1 if DEFAULT_DEVICE == "mlx" else BASE_MODEL_BEAM_SIZE,
-        "small_model_beam_size": 1 if DEFAULT_DEVICE == "mlx" else SMALL_MODEL_BEAM_SIZE,
+        "device": getattr(_model, "device", DEFAULT_DEVICE),
+        "backend": _backend_name(active_model),
+        "compute_type": getattr(_model, "compute_type", DEFAULT_COMPUTE_TYPE),
+        "beam_size": 1 if greedy else DEFAULT_BEAM_SIZE,
+        "lyrics_beam_size": 1 if greedy else LYRICS_BEAM_SIZE,
+        "live_beam_size": 1 if greedy else LIVE_BEAM_SIZE,
+        "base_model_beam_size": 1 if greedy else BASE_MODEL_BEAM_SIZE,
+        "small_model_beam_size": 1 if greedy else SMALL_MODEL_BEAM_SIZE,
         "temperature": DECODE_TEMPERATURE,
         "vad_filter": DEFAULT_VAD,
         "empty_retry_no_vad": EMPTY_RETRY_NO_VAD,
@@ -376,11 +379,12 @@ def _health_hint(error: str | None, model_name: str | None = None) -> str | None
 
 
 def _requested_model_name(model: str | None = None) -> str:
-    requested = (model or "").strip()
+    requested = canonical_model_name((model or "").strip())
     if not requested or requested == "whisper-1":
         return DEFAULT_MODEL
     if requested != DEFAULT_MODEL and requested not in _cached_models():
-        raise ValueError(f"STT model '{requested}' is not configured or cached locally.")
+        hint = " Run npm run stt:qwen:download first." if requested in QWEN_MODELS else ""
+        raise ValueError(f"STT model '{requested}' is not configured or cached locally.{hint}")
     return requested
 
 
@@ -415,7 +419,7 @@ def _is_compact_model(model_name: str | None) -> bool:
 
 
 def _beam_size_for_mode(content_mode: str | None, model_name: str | None = None) -> int:
-    if DEFAULT_DEVICE == "mlx":
+    if DEFAULT_DEVICE == "mlx" or canonical_model_name(model_name or DEFAULT_MODEL) in QWEN_MODELS:
         return 1
     if _is_lyrics_mode(content_mode):
         beam_size = max(DEFAULT_BEAM_SIZE, LYRICS_BEAM_SIZE)
@@ -570,6 +574,12 @@ def _prepare_audio_for_mode(audio: Any, content_mode: str | None) -> Any:
     return np.clip(normalized, -1.0, 1.0).astype(np.float32)
 
 
+def _backend_name(model: str) -> str:
+    if model in QWEN_MODELS:
+        return "qwen3-asr-mlx" if DEFAULT_DEVICE == "mlx" else "qwen3-asr-transformers"
+    return "mlx-whisper" if DEFAULT_DEVICE == "mlx" else "faster-whisper"
+
+
 def _load_model(model: str | None = None) -> Any:
     global _model, _model_name, _model_error, _model_error_name, _runtime_checked_model, _runtime_error
 
@@ -579,7 +589,11 @@ def _load_model(model: str | None = None) -> Any:
             return _model
 
         try:
-            if DEFAULT_DEVICE == "mlx":
+            if target_model in QWEN_MODELS:
+                from local_stt.qwen_backend import QwenAsrModel
+
+                loaded_model = QwenAsrModel(target_model, device=DEFAULT_DEVICE)
+            elif DEFAULT_DEVICE == "mlx":
                 from local_stt.mlx_backend import MlxWhisperModel
 
                 loaded_model = MlxWhisperModel(target_model, compute_type=DEFAULT_COMPUTE_TYPE)
@@ -634,7 +648,8 @@ def _probe_runtime(model: Any, model_name: str) -> None:
             segments, _ = model.transcribe(
                 str(temp_path),
                 beam_size=DEFAULT_BEAM_SIZE,
-                vad_filter=False if DEFAULT_DEVICE == "mlx" else DEFAULT_VAD,
+                vad_filter=False if DEFAULT_DEVICE == "mlx" or model_name in QWEN_MODELS else DEFAULT_VAD,
+                language="en" if model_name in QWEN_MODELS else None,
                 condition_on_previous_text=False,
             )
             list(segments)
@@ -1016,8 +1031,9 @@ def health() -> dict[str, Any]:
     error = _model_error
 
     try:
-        model = _load_model(DEFAULT_MODEL)
-        _probe_runtime(model, DEFAULT_MODEL)
+        model_name = _model_name or DEFAULT_MODEL
+        model = _load_model(model_name)
+        _probe_runtime(model, model_name)
     except Exception as exc:  # noqa: BLE001
         status = "error"
         error = str(exc)
@@ -1041,7 +1057,7 @@ def models() -> dict[str, Any]:
             {
                 "id": model_id,
                 "object": "model",
-                "owned_by": "local-mlx-whisper" if DEFAULT_DEVICE == "mlx" else "local-faster-whisper",
+                "owned_by": f"local-{_backend_name(model_id)}",
             }
             for model_id in model_ids
         ],

@@ -35,13 +35,6 @@ class PlatformConfigurationTests(unittest.TestCase):
             self.assertEqual(app._candidate_cuda_dll_dirs(), [])
         cuda_count.assert_not_called()
 
-    def test_intel_macos_uses_cpu(self) -> None:
-        with (
-            mock.patch.object(app.sys, "platform", "darwin"),
-            mock.patch.object(app.platform, "machine", return_value="x86_64"),
-        ):
-            self.assertEqual(app._default_device(), "cpu")
-
     def test_cuda_is_used_only_when_available(self) -> None:
         with mock.patch.object(app.sys, "platform", "win32"):
             with mock.patch.object(ctranslate2, "get_cuda_device_count", return_value=1):

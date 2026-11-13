@@ -299,7 +299,7 @@ function render(): void {
           STT provider
           <select id="sttProvider">
             <option value="lmStudio">LM Studio STT 먼저 시도</option>
-            <option value="whisper">Whisper-compatible</option>
+            <option value="whisper">로컬 STT (Whisper / Qwen)</option>
             <option value="openai">OpenAI-compatible</option>
           </select>
         </label>

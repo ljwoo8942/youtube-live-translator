@@ -1,4 +1,4 @@
-name: Windows and macOS
+name: Windows and Apple Silicon
 
 on:
   push:
@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-15, macos-15-intel]
+        os: [windows-latest, macos-15]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -44,3 +44,12 @@ jobs:
           YT_TRANSLATOR_STT_COMPUTE_TYPE: float16
           YT_TRANSLATOR_STT_MODEL: tiny
         run: uv run --no-project --python .venv-stt python -m unittest local_stt.test_mlx_runtime -v
+      - name: Qwen3-ASR 0.6B runtime
+        env:
+          YT_TRANSLATOR_STT_MODEL: qwen3-asr-0.6b
+        run: uv run --no-project --python .venv-stt python -m unittest local_stt.test_qwen_runtime -v
+      - name: Qwen3-ASR 1.7B Metal runtime
+        if: matrix.os == 'macos-15'
+        env:
+          YT_TRANSLATOR_STT_MODEL: qwen3-asr-1.7b
+        run: uv run --no-project --python .venv-stt python -m unittest local_stt.test_qwen_runtime -v
