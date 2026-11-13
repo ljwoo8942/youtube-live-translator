@@ -6,12 +6,25 @@ YouTube 실시간 방송과 녹화 영상 위에 번역 자막을 표시하는 M
 
 > API 키는 확장 프로그램 설정 화면에서 입력하며 `chrome.storage.local`에만 저장됩니다. API 키는 이 저장소나 빌드된 확장 프로그램 소스에 포함되지 않습니다.
 
+## 지원 범위
+
+| 항목 | 지원 내용 |
+| --- | --- |
+| 사이트 | **YouTube 전용**: `https://www.youtube.com/*`, `https://m.youtube.com/*` |
+| 영상 | YouTube 실시간 방송과 녹화 영상 |
+| 브라우저 | 데스크톱 Chrome 116 이상 |
+| 운영체제 | Windows, macOS 14 이상 Apple Silicon(M 시리즈) |
+| 로컬 음성 인식 | Whisper, Qwen3-ASR 0.6B·1.7B |
+| 번역 | OpenAI 호환 API·게이트웨이, LM Studio, Ollama |
+
+다른 동영상 사이트, 인강 사이트, 로컬 동영상 파일은 지원하지 않습니다. `m.youtube.com` 지원은 데스크톱 Chrome에서 해당 주소를 여는 경우를 뜻하며, Android·iOS의 YouTube 앱이나 모바일 브라우저 지원을 뜻하지 않습니다. Intel Mac과 Rosetta의 x86_64 Python은 지원하지 않습니다.
+
 ## 주요 기능
 
 - YouTube 실시간 방송과 녹화 영상의 번역 자막 오버레이
 - YouTube timed text, 전체 자막 선번역, IndexedDB 캐시를 활용하는 공식 자막 우선 처리
 - 공식 자막이 없을 때 `chrome.tabCapture`, offscreen WebAudio, 로컬 WebSocket STT를 이용하는 음성 인식 대체 경로
-- 제목·설명의 곡 후보를 LRCLIB에서 한 번 검색하고 STT와 연속 일치할 때만 가사를 채택하는 노래 보조
+- 제목·설명의 곡 후보를 LRCLIB에서 세션별로 검색하고 STT와 연속 일치할 때만 가사를 채택하는 노래 보조
 - 사용자가 입력한 원문·교정 번역과 커버별 차이를 로컬에 저장하는 곡 교정 사전
 - 켜기/끄기, 원문 표시, 노래 모드, 글자 크기, 위치, 재시도, 설정 열기를 제공하는 YouTube 미니 컨트롤
 - 번역 제공자:
@@ -29,21 +42,19 @@ YouTube 실시간 방송과 녹화 영상 위에 번역 자막을 표시하는 M
 Node.js 22.18 이상(권장 24)과 Chrome 116 이상이 필요합니다. 로컬 STT를 사용하려면 [uv](https://docs.astral.sh/uv/getting-started/installation/)도 설치하세요. Windows PowerShell과 macOS 터미널에서 같은 npm 명령을 사용합니다.
 
 ```bash
+git clone https://github.com/ljwoo8942/youtube-live-translator.git
+cd youtube-live-translator
 npm ci
 npm run build
 ```
 
 Chrome에서 개발자 모드를 켠 뒤 `chrome://extensions`의 `압축해제된 확장 프로그램을 로드합니다`로 생성된 `dist` 폴더를 선택합니다.
 
-## macOS에서 처음 실행
+## 로컬 STT 처음 실행
 
-macOS 14 이상의 Apple Silicon(M 시리즈) Mac에서 다음 순서로 실행합니다. Intel Mac과 Rosetta의 x86_64 Python은 지원하지 않습니다.
+Whisper 또는 Qwen으로 탭 음성을 인식하려면 저장소 폴더에서 다음을 실행합니다. Windows PowerShell과 macOS 터미널에서 같은 명령을 사용합니다. 클라우드 API STT만 사용하거나 공식 자막만 번역한다면 로컬 STT 서버를 설치할 필요가 없습니다.
 
 ```bash
-git clone https://github.com/ljwoo8942/youtube-live-translator.git
-cd youtube-live-translator
-npm ci
-npm run build
 npm run stt:setup
 npm run stt:start
 ```
@@ -52,11 +63,37 @@ npm run stt:start
 
 M 시리즈 Mac에서는 Metal GPU가 자동 선택됩니다. Whisper는 `mlx-whisper`, Qwen3-ASR는 `mlx-audio`의 8bit 모델을 사용합니다. Apple Silicon용 arm64 Python이 필요하며, `npm run stt:setup`이 해당 Mac에서만 MLX 패키지를 설치합니다. LM Studio/Ollama 번역은 별도로 선택할 수 있습니다.
 
-이미 설치한 Mac은 `git pull`, `npm run stt:setup`을 실행하고 기존 STT 서버를 종료한 뒤 다시 시작하세요. 최초 인식 또는 상태 확인 시 MLX 형식의 모델을 내려받습니다. `npm run stt:health` 응답의 `backend`가 `mlx-whisper`, `device`가 `mlx`, `compute_type`이 `float16`, `ok`가 `true`이면 실제 GPU 초기화와 짧은 추론 검사를 통과한 것입니다.
+최초 인식 또는 상태 확인 시 서버 시작 모델을 내려받을 수 있어 시간이 걸립니다. Whisper를 선택한 Mac에서 `npm run stt:health` 응답의 `backend`가 `mlx-whisper`, `device`가 `mlx`, `compute_type`이 `float16`, `ok`가 `true`이면 실제 GPU 초기화와 짧은 추론 검사를 통과한 것입니다. Windows의 Whisper는 사용 가능한 NVIDIA GPU가 있으면 CUDA를 선택하고, 그렇지 않으면 CPU를 사용합니다.
 
-직접 지정하려면 `YT_TRANSLATOR_STT_DEVICE=mlx npm run stt:start`를 사용하세요. CPU로 실행할 때는 `YT_TRANSLATOR_STT_DEVICE=cpu YT_TRANSLATOR_STT_COMPUTE_TYPE=int8 npm run stt:start`를 사용합니다. 모델을 바꾸려면 서버 시작 전에 `YT_TRANSLATOR_STT_MODEL=base` 등으로 지정하고 옵션 페이지의 `로컬 STT 연결 확인`으로 서버 모델을 적용하세요.
+Mac에서 직접 지정하려면 `YT_TRANSLATOR_STT_DEVICE=mlx npm run stt:start`를 사용하세요. Whisper를 CPU로 실행할 때는 `YT_TRANSLATOR_STT_DEVICE=cpu YT_TRANSLATOR_STT_COMPUTE_TYPE=int8 npm run stt:start`를 사용합니다. 새 Whisper 모델을 준비하려면 서버 시작 전에 `YT_TRANSLATOR_STT_MODEL=base` 등으로 지정한 뒤 `npm run stt:health`로 로딩을 확인하세요. 확장 프로그램에서도 같은 모델을 선택하고 `설정 저장`을 눌러야 합니다. `로컬 STT 연결 확인`은 서버 상태만 검사하며 모델 선택이나 저장된 설정을 바꾸지 않습니다.
 
 가상환경 `.venv-stt`는 운영체제와 CPU 구조에 종속됩니다. Windows 가상환경을 Mac으로 복사하지 말고 Mac에서 `npm run stt:setup`을 실행하세요. 설정·곡 교정 사전은 각 Chrome 프로필에 저장되므로, 곡 교정 사전은 JSON 내보내기/가져오기로 옮길 수 있습니다.
+
+## 처음 사용하는 순서
+
+1. YouTube 영상 탭을 열고 팝업의 `전체 설정`을 엽니다.
+2. 번역 제공자와 API 키 또는 로컬 번역 서버를 설정합니다. 음성 인식이 필요하면 STT 제공자와 모델도 선택합니다.
+3. `현재 설정 연결 테스트`로 입력한 값을 검사한 뒤 `설정 저장`을 누릅니다. 테스트만으로는 설정이 저장되지 않습니다.
+4. 영상으로 돌아가 확장 프로그램을 켭니다. 기본 입력 방식은 `선택한 공식 자막 우선 + 없으면 음성`입니다.
+5. 공식 자막이 없으면 탭 캡처 권한을 허용합니다. 음성 인식을 직접 시작하려면 팝업의 `음성 시작`을 사용합니다.
+
+| 입력 방식 | 동작 |
+| --- | --- |
+| 선택한 공식 자막만 사용 | 공식 자막을 번역하며 STT를 사용하지 않음 |
+| 선택한 공식 자막 우선 + 없으면 음성 | 공식 자막을 먼저 사용하고 없으면 선택한 STT로 전환 |
+| 음성만 | YouTube 자막 대신 탭 음성을 인식·번역 |
+
+YouTube의 자동 생성 자막·자동 번역문은 공식 원문 자막과 구분합니다. 자동 번역 화면이 켜져 있어도 가능한 경우 원래 공식 트랙을 가져옵니다.
+
+## 업데이트
+
+```bash
+git pull
+npm ci
+npm run build
+```
+
+Chrome 확장 관리 화면에서 확장 프로그램을 새로고침하고 **열려 있던 YouTube 페이지도 새로고침**하세요. 로컬 STT를 사용한다면 기존 서버를 종료하고 `npm run stt:setup`을 실행한 뒤 `npm run stt:start`로 다시 시작하세요. 곡 교정 사전은 업데이트 전에 JSON으로 백업할 수 있습니다.
 
 ## Qwen3-ASR 0.6B / 1.7B 사용
 
@@ -71,7 +108,7 @@ npm run stt:qwen:download
 npm run stt:start
 ```
 
-확장프로그램을 새로고침하고 전체 설정의 `로컬 STT > 모델`에서 `Qwen3-ASR 0.6B` 또는 `Qwen3-ASR 1.7B`를 선택한 뒤 저장하세요. 라이브·노래 프리셋은 선택한 Qwen 모델을 유지합니다. 다운로드하지 않은 모델은 전사 요청에서 거부되며 준비 명령이 안내됩니다.
+확장 프로그램과 YouTube 페이지를 새로고침하고 전체 설정의 `로컬 STT 모델 (Whisper / Qwen) > 모델`에서 `Qwen3-ASR 0.6B` 또는 `Qwen3-ASR 1.7B`를 선택한 뒤 저장하세요. 라이브·노래 프리셋은 선택한 Qwen 모델을 유지합니다. 다운로드하지 않은 모델은 전사 요청에서 거부되며 준비 명령이 안내됩니다.
 
 | 선택값 | Windows | Apple Silicon Mac |
 | --- | --- | --- |
@@ -87,27 +124,42 @@ Qwen도 기존 HTTP 전사·WebSocket 롤링 오디오 창과 음성 감지, 텍
 ## 로컬 AI 기본값
 
 - Ollama: `http://localhost:11434`
-- 로컬 Whisper STT: `http://127.0.0.1:8765/v1/audio/transcriptions`
-- 로컬 Whisper 스트리밍 STT: `ws://127.0.0.1:8765/v1/audio/stream`
+- 로컬 STT(Whisper / Qwen) HTTP: `http://127.0.0.1:8765/v1/audio/transcriptions`
+- 로컬 STT 스트리밍: `ws://127.0.0.1:8765/v1/audio/stream`
 - LM Studio: 로컬 LLM 번역을 선택한 경우 `http://127.0.0.1:1234/v1`
 
 확장 프로그램의 옵션 페이지에서 제공자를 선택하고, API 키와 언어 코드를 입력하며, 자막 오버레이를 조절할 수 있습니다.
 
-기본 권장 조합은 로컬 Whisper STT와 AI 번역 API입니다. 텍스트 번역 제공자로 LM Studio를 직접 선택한 경우에만 `LM Studio 연결 확인`을 사용하세요.
+기본 권장 조합은 로컬 Whisper STT와 AI 번역 API입니다. 텍스트 번역 제공자로 LM Studio를 직접 선택한 경우 `LM Studio 번역 테스트`로 연결을 확인할 수 있습니다.
 
 `Gemma4-E4B-Instruct-Pure-GGUF` 기준의 모델 Load, Inference, Local Server, 확장 프로그램 연결 값은 [LM Studio 설정 값](docs/lm-studio-settings.md)에서 확인할 수 있습니다.
 
 ## 공식 자막 선번역
 
-YouTube timed text를 사용할 수 있으면 확장 프로그램은 오디오 캡처를 시작하지 않습니다. 전체 timed text 트랙을 받아 현재 재생 구간 주변을 먼저 번역하고, 나머지 영상은 백그라운드에서 계속 번역합니다.
+기본 자막 우선 모드에서 공식 timed text를 사용할 수 있으면 오디오 캡처를 시작하지 않습니다. 전체 원문 트랙을 받아 현재 재생 구간 주변부터 번역합니다. AI API는 남은 자막을 백그라운드에서 선번역하며, 자동 선번역 작업에는 500개 자막·원문 100,000자 한도가 있습니다. LM Studio·Ollama는 재생 위치 주변의 자막을 우선 처리합니다. 이 한도는 전체 API 사용량이나 요금의 상한이 아니며 현재 자막·음성의 개별 번역 요청은 별도입니다.
 
 번역 자막 캐시는 영상 ID, 자막 해시, 목표 언어, 제공자/모델, 콘텐츠 모드를 기준으로 IndexedDB에 저장됩니다. 같은 영상을 다시 열면 캐시된 번역을 즉시 표시할 수 있습니다.
 
 번역 캐시는 30일·10,000개 항목으로 제한하며 오래된 항목부터 정리합니다. 저장 공간이 부족하거나 캐시를 사용할 수 없어도 번역은 계속합니다. 외부 API 주소를 저장하거나 연결을 테스트할 때 해당 서버의 접근 권한을 요청합니다. 서버 요청은 응답 본문까지 외부 API 60초, 로컬 서버 120초(health 45초)로 제한하며 세션 종료·설정 변경 시 이전 요청을 취소합니다.
 
-팝업 첫 화면에서 저장·음성 시작·음성 중지를 사용할 수 있습니다. 제공자·언어 등은 `입력·언어·모델 설정`을 펼쳐 변경합니다. 옵션의 연결 테스트는 현재 입력값을 임시 사용하며 설정을 저장하거나 프리셋을 바꾸지 않습니다. 무음 STT 요청과 고정 문장 번역의 연결 검사이므로 실제 탭 캡처나 인식 정확도는 영상에서 확인하세요. `동작·자막 기본값 복원`은 확인 후 동작·자막 설정만 복원하고 저장된 API 연결·모델·키는 유지합니다.
-
 음악 영상의 가사형 번역에는 옵션 페이지의 `콘텐츠 모드` 또는 YouTube 미니 컨트롤의 `♪` 버튼을 사용하세요.
+
+## 팝업·설정과 연결 테스트
+
+팝업 첫 화면에서 저장·음성 시작·음성 중지와 미니 컨트롤·교정 사전 켜기/끄기를 사용할 수 있습니다. 제공자·언어 등은 `입력·언어·모델 설정`을 펼쳐 변경합니다. 좁은 설정 창에서는 저장 영역이 본문을 가리지 않도록 페이지 하단에 배치됩니다. 작은 영상의 미니 컨트롤은 줄바꿈하며 긴 자막은 자막 영역을 스크롤해 읽을 수 있습니다.
+
+| 버튼 | 검사 범위 |
+| --- | --- |
+| 현재 설정 연결 테스트 | 현재 입력값으로 검사. 공식 자막 전용 모드는 번역만, 음성 사용 모드는 STT와 번역 연결 검사 |
+| 번역 테스트 | 현재 선택한 번역 제공자에 고정 문장 요청 |
+| 로컬 STT 연결 확인 | 로컬 서버의 `/health`·`/v1/models` 조회. 선택 모델을 변경하거나 저장하지 않음 |
+| 로컬 STT + 번역 연결 테스트 | 로컬 STT 무음 요청과 현재 번역 제공자의 연결 검사 |
+| API STT 연결 테스트 | API STT 무음 요청 검사 |
+| API STT + 번역 연결 테스트 | API STT와 현재 번역 제공자의 연결 검사 |
+
+연결 테스트는 현재 입력값을 임시 사용하며 설정을 저장하거나 프리셋을 바꾸지 않습니다. 검사 성공은 실제 탭 캡처나 음성 인식 정확도의 검증을 뜻하지 않습니다. 사용하려는 값은 따로 `설정 저장`을 누르세요. 처리 중에는 입력과 버튼을 잠가 중복 실행을 막고 결과를 상태 영역에 표시합니다.
+
+`동작·자막 기본값 복원`은 확인 후 동작·자막 설정만 복원합니다. 저장된 API 주소·인증 방식·키·모델, 제공자 선택과 스트리밍 연결 설정은 유지합니다.
 
 ## 곡 교정 사전
 
@@ -138,7 +190,7 @@ YouTube 영상에 내장 자막이 없을 때 번역 API 키만으로는 충분�
 - `API STT + 번역 연결 테스트`를 클릭해 STT 연결과 AI 번역을 함께 확인
 - 저장한 뒤 YouTube에서 `자막 우선 + 음성` 또는 `음성만` 선택
 
-전사 엔드포인트만 확인하려면 `API STT 연결 테스트`, 텍스트 번역만 확인하려면 `테스트`를 사용할 수 있습니다.
+전사 엔드포인트만 확인하려면 `API STT 연결 테스트`, 텍스트 번역만 확인하려면 `번역 테스트`를 사용할 수 있습니다.
 
 API STT 기본값:
 
@@ -189,7 +241,7 @@ npm run stt:health
 
 - 모델: `small`
 - 장치: Apple Silicon은 `mlx`, GPU 없는 Windows는 `cpu`, NVIDIA GPU가 있으면 `cuda`
-- 연산 형식: MLX와 CUDA는 `float16`, CPU는 `int8`
+- Whisper 연산 형식: MLX와 CUDA는 `float16`, CPU는 `int8` (Qwen은 MLX `8bit`, PyTorch CUDA `float16` / CPU `float32`)
 - 스트리밍 엔드포인트: `ws://127.0.0.1:8765/v1/audio/stream`
 - HTTP 대체 청크: `8000ms`
 - 엔드포인트: `http://127.0.0.1:8765/v1/audio/transcriptions`
@@ -207,7 +259,7 @@ npm run stt:health
 - `로컬 STT 연결 확인` 클릭
 - `로컬 STT + 번역 연결 테스트`로 로컬 STT와 번역 제공자 연결을 함께 확인
 
-로컬 프리셋은 `로컬 STT WebSocket 스트리밍 사용`을 활성화합니다. WebSocket 스트림에 실패하면 확장 프로그램은 기존 HTTP 전사 청크 방식으로 자동 전환하고, 설정된 경우 API STT로 한 번 더 대체합니다.
+로컬 프리셋은 `로컬 STT WebSocket 스트리밍 사용`을 활성화합니다. WebSocket 스트림에 실패하면 선택한 Whisper 호환 제공자의 HTTP 전사 청크 방식으로 전환합니다. 클라우드 API STT를 사용하려면 STT 제공자를 `OpenAI-compatible`로 직접 선택하세요. `LM Studio STT 먼저 시도`를 선택한 경우에는 실패 시 설정된 Whisper 호환 제공자로 대체합니다.
 
 기존 백그라운드 실행 방식을 의도적으로 사용하려면 `npm run stt:daemon`을 실행할 수 있지만, 안정적인 기본 경로는 포그라운드의 `npm run stt:start`입니다.
 
@@ -233,6 +285,26 @@ npm run stt:health
 - 로컬 실시간 음성 번역의 기본 경로는 로컬 Whisper STT와 AI API 텍스트 번역입니다. LM Studio 번역은 선택 가능한 로컬 LLM 모드로 계속 사용할 수 있습니다.
 - MLX Whisper 0.4.3은 beam search를 지원하지 않아 greedy decoding을 사용합니다. 상태·전사 응답의 beam 값도 `1`로 표시하며 언어 자동 감지는 각 오디오 창에서 수행합니다. 음성 감지와 환각 차단은 두 엔진 모두에 적용됩니다.
 
+## 데이터 처리와 권한
+
+- 탭 음성 인식은 선택한 YouTube 탭의 오디오를 사용하며 마이크 입력을 사용하지 않습니다.
+- AI 번역 API를 선택하면 원문 자막·인식된 텍스트와 번역 문맥을 설정한 제공자에 전송합니다. 클라우드 STT를 선택하면 탭 오디오 조각도 해당 STT 제공자에 전송합니다. 제공자에 따라 API 사용 요금이 발생할 수 있습니다.
+- 로컬 STT와 LM Studio·Ollama 번역을 선택하면 음성 인식·번역 연산을 로컬에서 수행합니다. 최초 모델 다운로드와 YouTube 접속에는 네트워크가 필요합니다.
+- 가사 검색 보조를 켜면 영상 제목·설명에서 추출한 검색어를 LRCLIB에 보냅니다. 설정에서 끌 수 있습니다.
+- 외부 API 접근 권한은 선택한 서버별로 요청합니다. 외부 서버는 HTTPS/WSS를 사용하고, HTTP/WS는 `localhost`·`127.0.0.1`에만 허용합니다. 포함된 STT 서버는 기본적으로 `127.0.0.1:8765`에서 실행됩니다.
+
+## 문제 해결
+
+| 증상 | 확인할 항목 |
+| --- | --- |
+| 다른 사이트에서 버튼이 비활성화됨 | YouTube 전용 동작입니다. YouTube 영상 탭에서 팝업을 다시 여세요. |
+| 업데이트 후 이전 화면이 남음 | `npm run build` 후 확장 프로그램과 YouTube 페이지를 모두 새로고침하세요. |
+| STT 서버에 연결되지 않음 | `npm run stt:start` 터미널을 유지하고 `npm run stt:health`로 상태와 실제 장치를 확인하세요. |
+| 선택한 모델이 준비되지 않았다고 표시됨 | Qwen은 `npm run stt:qwen:download`, Whisper는 서버 시작 모델 지정 후 상태 확인으로 준비하고, 확장에서도 모델 선택 후 저장하세요. |
+| 외부 API가 연결되지 않음 | URL·엔드포인트·접근 권한·인증 방식을 확인하세요. 401/403이면 키와 제공자 권한도 확인하세요. |
+| 연결 테스트는 성공하지만 자막이 없음 | 테스트는 연결 검사입니다. YouTube에서 확장 켜기, 입력 방식, 재생 상태와 탭 캡처 권한을 확인하세요. |
+| 일괄 편집 후 저장이 막힘 | 초안을 `일괄 반영`한 뒤 저장하세요. 곡 전환 확인에서 취소하면 작성하던 내용을 유지할 수 있습니다. |
+
 ## 검증
 
 ```bash
@@ -243,3 +315,5 @@ npm run stt:test
 ```
 
 GitHub Actions는 Windows와 Apple Silicon Mac에서 빌드·테스트·설치, Whisper 실행, Qwen 0.6B 실제 추론을 확인합니다. Mac에서는 Qwen 1.7B Metal 추론도 확인하며, runner에 GPU가 없으면 생략 사유를 표시합니다. Intel Mac 검증은 제외합니다. `YT_TRANSLATOR_STT_MODEL=qwen3-asr-0.6b uv run --no-project --python .venv-stt python -m unittest local_stt.test_qwen_runtime -v`로 준비된 Qwen 모델을 직접 확인할 수 있습니다. YouTube 재생 중 탭 오디오 캡처와 자막 표시까지는 Chrome에서 확인해야 합니다.
+
+`test:contracts`에는 자막 처리의 소스 검사와 편집 보호·진단·권한·중복 실행 등에 대한 동작 회귀 검사가 포함됩니다. 브라우저 API와 폼을 대체한 검사는 실제 Chrome 권한 팝업·전체화면·접근성 도구 검증을 대신하지 않습니다. 스트림 창 길이와 디코딩 간격은 설정값이며 실제 자막 지연이나 모델 정확도 측정값이 아닙니다.

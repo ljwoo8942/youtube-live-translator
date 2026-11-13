@@ -2,7 +2,7 @@
 
 YouTube Live Translator에서 로컬 번역 모델로 LM Studio를 사용할 때의 권장 설정입니다. 이 문서는 RTX 5070 12 GB VRAM, 시스템 메모리 64 GB 환경에서 테스트한 `Gemma4-E4B-Instruct-Pure-GGUF`를 기준으로 작성했습니다.
 
-이 모델은 **번역 전용 LLM**입니다. YouTube 음성 인식(STT)은 LM Studio가 아니라 이 프로젝트의 faster-whisper 로컬 서버를 사용하는 구성을 권장합니다.
+이 모델은 **번역 전용 LLM**입니다. 이 문서의 Windows STT 구성 예시는 프로젝트의 faster-whisper 로컬 서버를 사용합니다. 현재 서버는 Qwen3-ASR와 Apple Silicon의 MLX GPU도 지원하며, 전체 지원 범위와 설치 방법은 [README](../README.md)를 확인하세요. 아래 하드웨어별 예시 값은 확장 프로그램의 기본 번역 모델 설정과 별개입니다.
 
 ## 테스트 모델
 
@@ -11,7 +11,7 @@ YouTube Live Translator에서 로컬 번역 모델로 LM Studio를 사용할 때
 | 모델 | `Gemma4-E4B-Instruct-Pure-GGUF` |
 | 용도 | 공식 자막 및 STT 원문의 한국어 번역 |
 | 권장 제공자 | 확장 프로그램의 `LM Studio` |
-| 권장 STT | faster-whisper 로컬 WebSocket STT |
+| STT 구성 예시 | faster-whisper 로컬 WebSocket STT (Windows) |
 | 권장 엔드포인트 | `/chat/completions` |
 
 LM Studio의 모델 ID는 파일명으로 직접 추측하지 말고, 모델을 로드한 뒤 확장 프로그램 옵션의 `LM Studio > 모델 목록 불러오기`에서 표시되는 값을 그대로 선택합니다.
@@ -91,7 +91,7 @@ LM Studio의 `Developer > Local Server`에서 서버를 시작한 뒤 다음 값
 | 인증 방식 | `none` |
 | LM Studio STT 먼저 시도 | 끄기 |
 
-설정 후 `LM Studio 번역 테스트`를 실행해 최종 번역문만 응답하는지 확인합니다. 실제 YouTube 음성 자막은 `Whisper-compatible` STT와 faster-whisper 로컬 서버를 선택하는 구성이 가장 안정적입니다.
+설정 후 `LM Studio 번역 테스트`를 실행해 최종 번역문만 응답하는지 확인합니다. 테스트는 입력값으로 연결만 검사하며 저장하지 않습니다. 실제 사용할 설정은 `설정 저장`을 누르세요. 위 예시의 음성 인식은 `STT provider`를 `로컬 STT (Whisper / Qwen)`로 선택하고 faster-whisper 서버와 같은 Whisper 모델을 지정합니다.
 
 ## 문제 해결
 
