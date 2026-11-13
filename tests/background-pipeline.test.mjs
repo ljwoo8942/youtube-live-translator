@@ -207,3 +207,78 @@ test("pretranslation cancelled during lyrics assistance cannot admit a stale API
   finish([]);
   assert.equal((await request).ok, false);
 });
+
+function audioStopHarness({ liveTabs = [], state, activeTab, activeVideo, offscreen = false } = {}) {
+  const sent = [], notices = [], cleared = [], cancelled = [];
+  const context = functions("src/background/index.ts", ["stopAudioCaptureInternal", "getOffscreenAudioState"], {
+    activeAudioTabId: activeTab, activeAudioVideoId: activeVideo,
+    liveCapturedTabIds: async () => liveTabs,
+    hasOffscreenDocument: async () => offscreen,
+    chrome: { runtime: { sendMessage: async (message) => {
+      if (message.type === "GET_OFFSCREEN_AUDIO_STATE") return state ? { ok: true, ...state } : undefined;
+      sent.push(message);
+      return { ok: true };
+    } } },
+    notifyTab: async (tabId, message) => notices.push({ tabId, message }),
+    clearAudioQueue: (tabId) => cleared.push(tabId), loadSettings: async () => ({ enabled: false }),
+    cancelTabPretranslationJobs: (tabId) => cancelled.push(tabId)
+  });
+  return { context, sent, notices, cleared, cancelled };
+}
+
+test("stopping before the first audio session is an idempotent success", async () => {
+  for (const offscreen of [false, true]) {
+    const { context: c, sent, cleared } = audioStopHarness({ offscreen });
+    assert.equal((await c.stopAudioCaptureInternal()).ok, true);
+    assert.equal((await c.stopAudioCaptureInternal()).ok, true);
+    assert.equal(sent.length, offscreen ? 2 : 0);
+    assert.equal(cleared.length, 0);
+  }
+});
+
+test("disabling or saving caption-only settings succeeds without an offscreen session", async () => {
+  for (const settings of [{ enabled: false, inputMode: "captionsThenAudio" }, { enabled: true, inputMode: "captions" }]) {
+    const { context: c, sent } = audioStopHarness();
+    functions("src/background/index.ts", ["saveSettingsPatch"], c);
+    const snapshot = { settings, revision: 2, translationConfigRevision: 1 };
+    c.patchSettings = async () => snapshot;
+    c.pretranslateJobs = new Map();
+    c.correctionSessionsByTab = new Map();
+    c.broadcastContentSettings = async () => {};
+    c.stopAudioCapture = () => c.stopAudioCaptureInternal();
+    assert.equal(await c.saveSettingsPatch(settings), snapshot);
+    assert.equal(sent.length, 0);
+  }
+});
+
+test("a missing offscreen response still cleans up the background audio session", async () => {
+  const { context: c, notices, cleared, cancelled } = audioStopHarness({ activeTab: 7, activeVideo: "video" });
+  assert.equal((await c.stopAudioCaptureInternal()).ok, true);
+  assert.equal(c.activeAudioTabId, undefined);
+  assert.equal(c.activeAudioVideoId, undefined);
+  assert.deepEqual(cleared, [7]);
+  assert.deepEqual(cancelled, [7]);
+  assert.equal(notices[0].message.videoId, "video");
+});
+
+test("an idle offscreen document is stopped even when no capture tab is recorded", async () => {
+  const { context: c, sent } = audioStopHarness({ state: { recording: false }, offscreen: true });
+  assert.equal((await c.stopAudioCaptureInternal()).ok, true);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].type, "STOP_AUDIO_CAPTURE");
+  assert.equal(sent[0].target, "offscreen");
+});
+
+test("stale stop commands cannot terminate a newer video session", async () => {
+  const { context: c, sent, cleared } = audioStopHarness({
+    liveTabs: [7], activeTab: 7, activeVideo: "old-video", offscreen: true,
+    state: { recording: true, activeTabId: 7, activeVideoId: "new-video" }
+  });
+  assert.equal((await c.stopAudioCaptureInternal(7, "old-video")).ok, true);
+  assert.equal(sent.length, 0);
+  assert.equal(cleared.length, 0);
+  assert.equal((await c.stopAudioCaptureInternal(7, "new-video")).ok, true);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].videoId, "new-video");
+  assert.deepEqual(cleared, [7]);
+});

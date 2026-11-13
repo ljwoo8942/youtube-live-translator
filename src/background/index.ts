@@ -2436,7 +2436,7 @@ async function stopAudioCaptureInternal(tabId?: number, expectedVideoId?: string
   const liveTabIds = await liveCapturedTabIds();
   const targetTabId = tabId ?? activeAudioTabId ?? liveTabIds[0];
   const offscreenState = await getOffscreenAudioState();
-  const stoppedVideoId = offscreenState?.activeTabId === targetTabId ? offscreenState.activeVideoId : activeAudioVideoId;
+  const stoppedVideoId = offscreenState && offscreenState.activeTabId === targetTabId ? offscreenState.activeVideoId : activeAudioVideoId;
   if (expectedVideoId && stoppedVideoId !== expectedVideoId) {
     return { ok: true };
   }
