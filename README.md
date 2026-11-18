@@ -124,9 +124,9 @@ RTX 5070에서 두 모델의 실제 GPU 모델·입력·출력, HTTP·WebSocket 
 
 Qwen도 기존 HTTP 전사·WebSocket 롤링 오디오 창과 음성 감지, 텍스트 환각·반복 차단을 사용합니다. 결과 시간은 오디오 창의 범위이며 단어별 정렬 정보가 아닙니다. Whisper식 신뢰도 점수는 생성하지 않습니다. 네이티브 Qwen 스트리밍 상태 유지와 별도 강제 정렬 모델은 이번 연동에 포함하지 않았습니다.
 
-### 확장 팝업에서 Qwen 서버 시작·중지
+### 확장 팝업에서 로컬 STT 서버 시작·중지
 
-Windows와 Apple Silicon Mac에서는 Chrome Native Messaging 호스트를 한 번 등록하면 팝업에서 Qwen 서버를 켜고 끌 수 있습니다.
+Windows와 Apple Silicon Mac에서는 Chrome Native Messaging 호스트를 한 번 등록하면 팝업에서 Whisper와 Qwen3-ASR 서버를 켜고 끌 수 있습니다. 기존 Qwen 호스트 등록을 그대로 사용할 수 있습니다.
 
 1. `dist`를 Chrome에 로드하거나 이미 로드한 확장을 새로고침하세요. Chrome의 확장 프로그램 관리 화면에서 개발자 모드를 켜고 이 확장의 ID를 복사합니다.
 2. 프로젝트 폴더에서 다음 명령을 실행하세요. 예시 ID를 복사한 실제 ID로 바꿉니다.
@@ -135,9 +135,11 @@ Windows와 Apple Silicon Mac에서는 Chrome Native Messaging 호스트를 한 �
    npm run stt:native:install -- abcdefghijklmnopabcdefghijklmnop
    ```
 
-3. 전체 설정에서 `로컬 STT (Whisper / Qwen)`, 기본 STT 주소 `http://127.0.0.1:8765/v1` 및 준비된 Qwen 모델을 선택하고 저장하세요. 스트리밍을 켰다면 주소는 `ws://127.0.0.1:8765/v1/audio/stream`을 사용합니다.
-4. YouTube 탭에서 팝업의 `Qwen 서버 시작`을 누르고 첫 사용 시 Chrome의 로컬 프로그램 연결 권한을 허용하세요. 권한 창을 닫으며 팝업이 함께 닫혔다면 다시 열어 시작을 누르세요. 서버 실행 상태가 표시되면 `음성 시작`으로 탭 음성을 인식할 수 있습니다.
-5. 팝업의 `Qwen 서버 중지`는 이 확장에서 연 서버를 종료합니다. 팝업을 닫아도 서버는 유지되며, Chrome 종료나 확장 새로고침 시 함께 종료됩니다.
+3. 전체 설정에서 `로컬 STT (Whisper / Qwen)`, 기본 STT 주소 `http://127.0.0.1:8765/v1` 및 준비된 모델을 선택하고 저장하세요. 스트리밍을 켰다면 주소는 `ws://127.0.0.1:8765/v1/audio/stream`을 사용합니다.
+4. YouTube 탭에서 팝업의 `로컬 STT 시작`을 누르고 첫 사용 시 Chrome의 로컬 프로그램 연결 권한을 허용하세요. 권한 창을 닫으며 팝업이 함께 닫혔다면 다시 열어 시작을 누르세요. 실행 중인 모델과 장치가 표시되면 `음성 시작`으로 탭 음성을 인식할 수 있습니다.
+5. 팝업의 `로컬 STT 중지`는 이 확장에서 연 서버를 종료합니다. 다른 모델로 바꾸려면 먼저 서버를 중지한 뒤 모델을 저장하고 다시 시작하세요. 팝업을 닫아도 서버는 유지되며, Chrome 종료나 확장 새로고침 시 함께 종료됩니다.
+
+팝업에서는 캐시된 모델을 사용합니다. Whisper 모델을 처음 준비할 때는 `YT_TRANSLATOR_STT_MODEL`에 모델 이름을 지정해 `npm run stt:start`를 실행한 뒤 다른 터미널에서 `npm run stt:health`를 실행하세요. 모델 준비가 끝나면 터미널 서버를 종료하세요. Qwen 모델은 `npm run stt:qwen:download`로 준비할 수 있습니다. [운영체제별 모델 준비 명령](local_stt/README.md#run)
 
 이미 8765번에 서버가 실행 중이면 팝업에서 새 서버를 시작할 수 없습니다. 기존 서버를 사용하거나 원래 실행한 터미널에서 종료하세요. 프로젝트를 옮기거나 확장 ID가 바뀌면 호스트를 다시 등록하세요. 등록 범위는 현재 OS 사용자와 입력한 확장 ID입니다. [Chrome Native Messaging 문서](https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging)
 
@@ -319,7 +321,7 @@ npm run stt:health
 | --- | --- |
 | 다른 사이트에서 버튼이 비활성화됨 | YouTube 전용 동작입니다. YouTube 영상 탭에서 팝업을 다시 여세요. |
 | 업데이트 후 이전 화면이 남음 | `npm run build` 후 확장 프로그램과 YouTube 페이지를 모두 새로고침하세요. |
-| STT 서버에 연결되지 않음 | 팝업의 `Qwen 서버 시작` 또는 `npm run stt:start`로 서버를 켠 뒤 `npm run stt:health`로 상태와 실제 장치를 확인하세요. |
+| STT 서버에 연결되지 않음 | 팝업의 `로컬 STT 시작` 또는 `npm run stt:start`로 서버를 켠 뒤 `npm run stt:health`로 상태와 실제 장치를 확인하세요. |
 | Chrome 연결 프로그램을 등록하라는 메시지가 표시됨 | 확장 관리 화면에서 ID를 확인하고 `npm run stt:native:install -- 실제ID`를 실행하세요. |
 | 선택한 모델이 준비되지 않았다고 표시됨 | Qwen은 `npm run stt:qwen:download`, Whisper는 서버 시작 모델 지정 후 상태 확인으로 준비하고, 확장에서도 모델 선택 후 저장하세요. |
 | 외부 API가 연결되지 않음 | URL·엔드포인트·접근 권한·인증 방식을 확인하세요. 401/403이면 키와 제공자 권한도 확인하세요. |

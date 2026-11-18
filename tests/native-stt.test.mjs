@@ -73,18 +73,20 @@ function workerHarness({ model = "qwen3-asr-0.6b", baseUrl = "http://127.0.0.1:8
   };
 }
 
-test("popup starts the saved Qwen model once and can stop it after reopening", { timeout: 2000 }, async () => {
-  const worker = workerHarness({ model: "qwen3-asr-1.7b" });
-  assert.equal((await worker.send("status")).state, "stopped");
-  const started = await worker.send("start", popup, { model: "rejected-value" });
-  assert.equal(started.state, "running");
-  assert.equal(started.model, "qwen3-asr-1.7b");
-  assert.equal((await worker.send("status")).device, "cuda");
-  assert.equal((await worker.send("start")).state, "running");
-  assert.equal((await worker.send("stop")).state, "stopped");
-  assert.equal((await worker.send("stop")).state, "stopped");
-  assert.deepEqual(worker.commands, [{ action: "start", model: "qwen3-asr-1.7b" }, { action: "stop" }]);
-});
+for (const model of ["qwen3-asr-1.7b", "base", "large-v3-turbo"]) {
+  test(`popup starts the saved ${model} model once and can stop it after reopening`, { timeout: 2000 }, async () => {
+    const worker = workerHarness({ model });
+    assert.equal((await worker.send("status")).state, "stopped");
+    const started = await worker.send("start", popup, { model: "rejected-value" });
+    assert.equal(started.state, "running");
+    assert.equal(started.model, model);
+    assert.equal((await worker.send("status")).device, "cuda");
+    assert.equal((await worker.send("start")).state, "running");
+    assert.equal((await worker.send("stop")).state, "stopped");
+    assert.equal((await worker.send("stop")).state, "stopped");
+    assert.deepEqual(worker.commands, [{ action: "start", model }, { action: "stop" }]);
+  });
+}
 
 test("content scripts, foreign senders and incompatible settings cannot start the host", { timeout: 2000 }, async () => {
   const worker = workerHarness();
@@ -93,7 +95,7 @@ test("content scripts, foreign senders and incompatible settings cannot start th
   assert.equal((await worker.send("arbitrary-command")).ok, false);
   assert.deepEqual(worker.commands, []);
   for (const configured of [
-    workerHarness({ model: "small" }),
+    workerHarness({ model: "other/model" }),
     workerHarness({ baseUrl: "http://127.0.0.1:8080/v1" }),
     workerHarness({ baseUrl: "https://example.test/v1" })
   ]) {

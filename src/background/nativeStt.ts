@@ -2,6 +2,7 @@ import type { LocalSttServerState } from "../shared/messages";
 import type { TranslatorSettings } from "../shared/types";
 
 const HOST_NAME = "com.yt_live_translator.stt";
+const SUPPORTED_MODELS = ["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo", "qwen3-asr-0.6b", "qwen3-asr-1.7b"];
 let port: chrome.runtime.Port | undefined;
 let running: Extract<LocalSttServerState, { state: "running" }> | undefined;
 
@@ -67,8 +68,8 @@ function disconnect(connection: chrome.runtime.Port): void {
 export async function startLocalSttServer(settings: TranslatorSettings): Promise<LocalSttServerState> {
   if (running) return running;
   const model = settings.whisper.model;
-  if (model !== "qwen3-asr-0.6b" && model !== "qwen3-asr-1.7b") {
-    throw new Error("전체 설정에서 Qwen3-ASR 0.6B 또는 1.7B를 선택하고 저장하세요.");
+  if (!SUPPORTED_MODELS.includes(model)) {
+    throw new Error("전체 설정에서 지원하는 Whisper 또는 Qwen 모델을 선택하고 저장하세요.");
   }
   if (!usesNativeSttEndpoint(settings)) {
     throw new Error("전체 설정에서 로컬 STT (Whisper / Qwen)와 기본 8765번 STT 주소를 선택하고 저장하세요.");
@@ -87,7 +88,7 @@ export async function startLocalSttServer(settings: TranslatorSettings): Promise
     const reply = await request(connection, { action: "start", model }, 120_000);
     if (port !== connection || reply.state !== "running" || reply.model !== model ||
         typeof reply.device !== "string" || typeof reply.computeType !== "string") {
-      throw new Error("Qwen 서버 시작 응답이 올바르지 않습니다.");
+      throw new Error("로컬 STT 서버 시작 응답이 올바르지 않습니다.");
     }
     running = { state: "running", model, device: reply.device, computeType: reply.computeType };
     return running;
@@ -102,7 +103,7 @@ export async function stopLocalSttServer(): Promise<LocalSttServerState> {
   if (!connection) return { state: "stopped" };
   try {
     const reply = await request(connection, { action: "stop" }, 10_000);
-    if (reply.state !== "stopped") throw new Error("Qwen 서버 중지 응답이 올바르지 않습니다.");
+    if (reply.state !== "stopped") throw new Error("로컬 STT 서버 중지 응답이 올바르지 않습니다.");
     return { state: "stopped" };
   } finally {
     disconnect(connection);

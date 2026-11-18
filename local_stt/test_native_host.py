@@ -13,9 +13,13 @@ from local_stt import native_host
 
 class NativeHostTests(unittest.TestCase):
     def test_disconnect_and_stop_release_the_server(self):
-        model = "qwen3-asr-1.7b"
-        for stop in (False, True):
-            with self.subTest(stop=stop):
+        for model, stop in (
+            ("qwen3-asr-1.7b", False),
+            ("qwen3-asr-1.7b", True),
+            ("base", True),
+            ("large-v3-turbo", False),
+        ):
+            with self.subTest(model=model, stop=stop):
                 source, output = io.BytesIO(), io.BytesIO()
                 native_host.write_message(source, {"action": "start", "model": model})
                 if stop:
@@ -48,6 +52,7 @@ class NativeHostTests(unittest.TestCase):
         for request in (
             {"action": "stop"},
             {"action": "start", "model": "other/model"},
+            {"action": "start", "model": "../base"},
             {"action": "start", "model": "qwen3-asr-0.6b", "port": 8888},
             {"action": "start", "model": ["qwen3-asr-0.6b"]},
         ):

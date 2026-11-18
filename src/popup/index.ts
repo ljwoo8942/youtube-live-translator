@@ -89,18 +89,18 @@ function setStatus(text: string): void {
 }
 
 function localSttStatusText(state: LocalSttServerState): string {
-  if (state.state === "running") return `Qwen 서버 실행 중 · ${state.device} / ${state.computeType}`;
-  if (state.state === "starting") return "Qwen 서버를 시작하는 중입니다.";
-  return "이 확장에서 실행 중인 Qwen 서버가 없습니다.";
+  if (state.state === "running") return `로컬 STT 실행 중 · ${state.model} · ${state.device} / ${state.computeType}`;
+  if (state.state === "starting") return "로컬 STT 서버를 시작하는 중입니다.";
+  return "이 확장에서 실행 중인 로컬 STT 서버가 없습니다.";
 }
 
 async function controlLocalSttServer(action: "start" | "stop"): Promise<void> {
   if (action === "start" && !(await chrome.permissions.request({ permissions: ["nativeMessaging"] }))) {
-    throw new Error("Qwen 서버를 시작하려면 Chrome의 로컬 프로그램 연결 권한을 허용하세요.");
+    throw new Error("로컬 STT 서버를 시작하려면 Chrome의 로컬 프로그램 연결 권한을 허용하세요.");
   }
-  if (action === "start") setStatus("Qwen 모델을 불러오는 중입니다.");
+  if (action === "start") setStatus("로컬 STT 모델을 불러오는 중입니다.");
   const response = await chrome.runtime.sendMessage<MessageResponse<LocalSttServerState>>({ type: "LOCAL_STT_SERVER", action });
-  if (!response?.ok) throw new Error(response?.error ?? "Qwen 서버 응답을 받지 못했습니다.");
+  if (!response?.ok) throw new Error(response?.error ?? "로컬 STT 서버 응답을 받지 못했습니다.");
   setStatus(localSttStatusText(response));
 }
 
@@ -304,8 +304,8 @@ function render(): void {
         <button id="stopAudio">음성 중지</button>
       </div>
       <div class="actions">
-        <button id="startLocalSttServer">Qwen 서버 시작</button>
-        <button id="stopLocalSttServer">Qwen 서버 중지</button>
+        <button id="startLocalSttServer">로컬 STT 시작</button>
+        <button id="stopLocalSttServer">로컬 STT 중지</button>
       </div>
       <div class="actions">
         <button id="options">전체 설정</button>

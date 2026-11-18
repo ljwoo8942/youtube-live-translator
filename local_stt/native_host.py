@@ -59,7 +59,7 @@ def install_host(extension_id: str) -> Path:
     manifest_path.write_text(
         json.dumps({
             "name": HOST_NAME,
-            "description": "YouTube Live Translator local Qwen STT",
+            "description": "YouTube Live Translator local STT",
             "path": str(launcher),
             "type": "stdio",
             "allowed_origins": [f"chrome-extension://{extension_id}/"],
@@ -104,7 +104,7 @@ def write_message(output: BinaryIO, message: dict) -> None:
 @contextmanager
 def run_server(model: str):
     import uvicorn
-    from local_stt.qwen_backend import cached_models, require_supported_platform
+    from local_stt.qwen_backend import MODEL_REPOSITORIES as QWEN_MODELS, cached_models, require_supported_platform
 
     require_supported_platform()
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
@@ -122,11 +122,11 @@ def run_server(model: str):
         os.environ["YT_TRANSLATOR_STT_MODEL"] = model
         from local_stt import app as stt
 
-        if model not in cached_models(stt.DEFAULT_DEVICE):
+        if model in QWEN_MODELS and model not in cached_models(stt.DEFAULT_DEVICE):
             raise RuntimeError(f"{model}이 준비되지 않았습니다. npm run stt:qwen:download를 실행하세요.")
         health = stt.health()
         if not health["ok"] or health["loaded_model"] != model:
-            raise RuntimeError(health.get("error") or f"{model} 모델을 불러오지 못했습니다.")
+            raise RuntimeError(health.get("hint") or health.get("error") or f"{model} 모델을 불러오지 못했습니다.")
 
         server = uvicorn.Server(uvicorn.Config(
             stt.app, workers=1, access_log=False, proxy_headers=False, timeout_graceful_shutdown=2,
@@ -138,13 +138,13 @@ def run_server(model: str):
             while not server.started and runner.is_alive() and time.monotonic() < deadline:
                 time.sleep(0.05)
             if not server.started:
-                raise RuntimeError("Qwen STT 서버가 시작되지 않았습니다.")
+                raise RuntimeError("로컬 STT 서버가 시작되지 않았습니다.")
             yield {"model": model, "device": health["device"], "computeType": health["compute_type"]}
         finally:
             server.should_exit = True
             runner.join(timeout=5)
             if runner.is_alive():
-                raise RuntimeError("Qwen STT 서버가 정상 종료에 응답하지 않아 프로세스를 종료합니다.")
+                raise RuntimeError("로컬 STT 서버가 정상 종료에 응답하지 않아 프로세스를 종료합니다.")
 
 
 def serve(source: BinaryIO, output: BinaryIO) -> None:
@@ -152,14 +152,15 @@ def serve(source: BinaryIO, output: BinaryIO) -> None:
         request = read_message(source)
         if request is None:
             return
-        from local_stt.qwen_backend import MODEL_REPOSITORIES
+        from local_stt.mlx_backend import MODEL_REPOSITORIES as WHISPER_MODELS
+        from local_stt.qwen_backend import MODEL_REPOSITORIES as QWEN_MODELS
 
         model = request.get("model")
         if (
             set(request) != {"action", "model"} or request["action"] != "start" or
-            not isinstance(model, str) or model not in MODEL_REPOSITORIES
+            not isinstance(model, str) or (model not in WHISPER_MODELS and model not in QWEN_MODELS)
         ):
-            raise ValueError("Qwen 0.6B 또는 1.7B 서버 시작만 지원합니다.")
+            raise ValueError("지원하는 Whisper 또는 Qwen 모델을 선택하세요.")
         with run_server(model) as running:
             write_message(output, {"ok": True, "state": "running", **running})
             request = read_message(source)
