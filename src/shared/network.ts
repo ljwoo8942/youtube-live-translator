@@ -1,3 +1,5 @@
+export const LOCAL_STT_HEADERS = { "X-YT-Translator-Local-STT": "1" };
+
 // Include the response body in the deadline; providers return complete JSON, not streams.
 export async function fetchWithTimeout(url: string, init?: RequestInit, timeoutMs = 60_000): Promise<Response> {
   const controller = new AbortController();

@@ -5,6 +5,7 @@ import test from "node:test";
 import { setImmediate } from "node:timers/promises";
 import ts from "typescript";
 import { DEFAULT_SETTINGS } from "../src/shared/defaults.ts";
+import { LOCAL_STT_HEADERS } from "../src/shared/network.ts";
 
 const source = readFileSync(new URL("../src/options/index.ts", import.meta.url), "utf8");
 function functions(names, globals) {
@@ -69,18 +70,23 @@ test("pipeline diagnostic shares STT routing and reports its limited connection 
 });
 
 test("local server probe reports unprepared selection without replacing model or provider", async () => {
-  const next = currentSettings(), statuses = [];
+  const next = currentSettings(), statuses = [], requests = [];
   const { probeFasterWhisper } = functions(["probeFasterWhisper"], {
     collectSettings: () => next, normalizeOpenAiBaseUrl: (value) => value,
     joinUrl: (base, tail) => base + tail, LOCAL_STT_START_HINT: "hint",
-    fetchText: async (url) => ({ response: { ok: true }, text: JSON.stringify(url.endsWith("/health")
-      ? { ok: true, loaded_model: "small", cached_models: ["small"], backend: "faster-whisper", device: "cpu", compute_type: "int8" }
-      : { data: [{ id: "small" }] }) }), stringArray: (value) => value ?? [],
+    isLocalBaseUrl: () => true, LOCAL_STT_HEADERS,
+    fetchText: async (url, init) => {
+      requests.push(init.headers);
+      return { response: { ok: true }, text: JSON.stringify(url.endsWith("/health")
+        ? { ok: true, loaded_model: "small", cached_models: ["small"], backend: "faster-whisper", device: "cpu", compute_type: "int8" }
+        : { data: [{ id: "small" }] }) };
+    }, stringArray: (value) => value ?? [],
     setStatus: (value) => statuses.push(value), setInput: () => assert.fail("probe changed selection")
   });
   await probeFasterWhisper();
   assert.equal(next.whisper.model, "qwen3-asr-1.7b");
   assert.match(statuses.at(-1), /선택 모델 준비 필요/);
+  assert.deepEqual(requests, [LOCAL_STT_HEADERS, LOCAL_STT_HEADERS]);
 });
 
 test("a failed STT connection does not run a translation request or change settings", async () => {

@@ -1,7 +1,7 @@
 import { DEFAULT_SETTINGS } from "../shared/defaults";
 import { diffSettings, loadSettings } from "../shared/storage";
 import { requestProviderPermissions } from "../shared/providerPermissions";
-import { fetchWithTimeout } from "../shared/network";
+import { fetchWithTimeout, LOCAL_STT_HEADERS } from "../shared/network";
 import { transcribeAudio } from "../background/providers";
 import type {
   ApiAuthHeaderMode,
@@ -561,7 +561,7 @@ function render(): void {
         <div class="flow-step">
           <span class="flow-index">1</span>
           <strong>탭 오디오</strong>
-          <span>YouTube</span>
+          <span>YouTube · 치지직</span>
         </div>
         <div class="flow-step">
           <span class="flow-index">2</span>
@@ -607,7 +607,7 @@ function render(): void {
             </label>
             <label class="check">
               <input id="miniControlsEnabled" type="checkbox" />
-              <span>YouTube 화면 미니 컨트롤 표시</span>
+              <span>영상 미니 컨트롤 표시</span>
             </label>
             <label class="check">
               <input id="streamingSttEnabled" type="checkbox" />
@@ -803,7 +803,7 @@ function render(): void {
             <button id="apiSttTest" type="button">API STT 연결 테스트</button>
             <button id="apiPipelineTest" type="button">API STT + 번역 연결 테스트</button>
           </div>
-          <span class="hint">YouTube 자체 자막이 없을 때 탭 음성을 API STT로 인식하고, AI API 번역 자막으로 표시합니다.</span>
+          <span class="hint">치지직 또는 공식 자막이 없는 YouTube에서 탭 음성을 API STT로 인식하고, AI API로 번역합니다.</span>
         </section>
 
         <section class="section">
@@ -1106,7 +1106,7 @@ async function saveSettingsPatch(patch: Partial<TranslatorSettings>): Promise<Tr
 async function saveCurrentSettings(): Promise<void> {
   const nextSettings = collectSettings();
   settings = await saveSettingsPatch(diffSettings(settings, nextSettings));
-  setStatus("설정을 저장했습니다. YouTube 탭에 바로 반영됩니다.");
+  setStatus("설정을 저장했습니다. YouTube와 치지직 탭에 바로 반영됩니다.");
 }
 
 async function testTranslation(next = collectSettings(), label = "번역"): Promise<void> {
@@ -1147,10 +1147,11 @@ async function testLmStudioTranslation(): Promise<void> {
 async function probeFasterWhisper(next = collectSettings()): Promise<void> {
   const baseUrl = normalizeOpenAiBaseUrl(next.whisper.baseUrl);
   const healthUrl = joinUrl(baseUrl.replace(/\/v1\/?$/, ""), "/health");
+  const init = isLocalBaseUrl(baseUrl) ? { headers: LOCAL_STT_HEADERS } : undefined;
   setStatus("로컬 STT 서버를 확인하는 중입니다...");
   const [healthResult, modelsResult] = await Promise.all([
-    fetchText(healthUrl, undefined, "로컬 STT 서버", LOCAL_STT_START_HINT),
-    fetchText(joinUrl(baseUrl, "/models"), undefined, "로컬 STT 서버", LOCAL_STT_START_HINT)
+    fetchText(healthUrl, init, "로컬 STT 서버", LOCAL_STT_START_HINT),
+    fetchText(joinUrl(baseUrl, "/models"), init, "로컬 STT 서버", LOCAL_STT_START_HINT)
   ]);
   if (!healthResult.response.ok) throw new Error(`로컬 STT health 실패: HTTP ${healthResult.response.status} ${healthResult.text.slice(0, 180)}`);
   if (!modelsResult.response.ok) throw new Error(`로컬 STT models 실패: HTTP ${modelsResult.response.status} ${modelsResult.text.slice(0, 180)}`);

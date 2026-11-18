@@ -17,6 +17,20 @@ const segment = { id: "one", source: "youtubeTimedText", startMs: 0, endMs: 1000
 const segments = [segment, { ...segment, id: "two", text: "ありがとう" }];
 const audio = new ArrayBuffer(4);
 
+test("local STT HTTP checks and uploads identify extension requests without adding headers to remote STT", async (t) => {
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    requests.push({ url, extensionRequest: new Headers(init.headers).get("X-YT-Translator-Local-STT") });
+    return Response.json({ ok: true, text: "speech" });
+  });
+  const settings = settingsFor("whisper", "stt");
+  await assertTranscriptionReady(settings);
+  await transcribeAudio(settings, audio, "audio/webm");
+  settings.whisper.baseUrl = "https://stt.example.com/v1";
+  await transcribeAudio(settings, audio, "audio/webm");
+  assert.deepEqual(requests.map((request) => request.extensionRequest), ["1", "1", null]);
+});
+
 function settingsFor(provider, kind = "translation") {
   const settings = structuredClone(DEFAULT_SETTINGS);
   settings.openai.apiKey = "test-key";

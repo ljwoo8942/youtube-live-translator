@@ -71,6 +71,7 @@ MAX_UPLOAD_BYTES = max(1, int(os.environ.get("YT_TRANSLATOR_STT_MAX_UPLOAD_BYTES
 MAX_STREAM_CHUNK_BYTES = max(1, int(os.environ.get("YT_TRANSLATOR_STT_MAX_STREAM_CHUNK_BYTES", str(256 * 1024))))
 MAX_DECODED_AUDIO_SECONDS = max(1, int(os.environ.get("YT_TRANSLATOR_STT_MAX_AUDIO_SECONDS", "60")))
 CHROME_EXTENSION_ORIGIN = re.compile(r"^chrome-extension://[a-p]{32}$")
+LOCAL_STT_CLIENT_HEADER = "X-YT-Translator-Local-STT"
 EMPTY_RETRY_NO_VAD = os.environ.get("YT_TRANSLATOR_STT_EMPTY_RETRY_NO_VAD", "0") not in {"0", "false", "False"}
 ALLOW_HEAVY_CACHED_FALLBACK = os.environ.get("YT_TRANSLATOR_STT_ALLOW_HEAVY_FALLBACK", "0") in {"1", "true", "True"}
 LIVE_VAD_THRESHOLD = float(os.environ.get("YT_TRANSLATOR_STT_LIVE_VAD_THRESHOLD", "0.4"))
@@ -344,9 +345,18 @@ def _allowed_browser_origin(origin: str | None) -> bool:
 
 @app.middleware("http")
 async def restrict_browser_origins(request: Request, call_next: Any) -> Any:
-    if not _allowed_browser_origin(request.headers.get("origin")):
-        return JSONResponse(status_code=403, content={"detail": "Browser origin is not allowed."})
-    return await call_next(request)
+    origin = request.headers.get("origin")
+    if _allowed_browser_origin(origin):
+        return await call_next(request)
+    # A web page needs a permitted preflight to set this header across origins.
+    if (
+        origin is None
+        and request.method in {"GET", "POST"}
+        and request.url.hostname in {"127.0.0.1", "localhost", "::1"}
+        and request.headers.get(LOCAL_STT_CLIENT_HEADER) == "1"
+    ):
+        return await call_next(request)
+    return JSONResponse(status_code=403, content={"detail": "Browser origin is not allowed."})
 
 _model_lock = threading.Lock()
 # ponytail: one inference worker bounds CPU/GPU work; use a queue if parallel throughput is needed.

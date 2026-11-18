@@ -1,4 +1,5 @@
 import type { CaptionSegment, ContentSettings, PageCaptionSnapshot, PageCaptionTrack } from "../shared/types";
+import { getVideoPage } from "../shared/videoSites";
 import { findVideoElement } from "./overlay";
 
 type CaptionTrack = PageCaptionTrack & {
@@ -39,18 +40,8 @@ const TIMED_TEXT_DISPLAY_LEAD_MS = 1100;
 const TIMED_TEXT_DISPLAY_TRAILING_GRACE_MS = 900;
 
 function getVideoId(): string | undefined {
-  const url = new URL(location.href);
-  const watchId = url.searchParams.get("v");
-  if (watchId) {
-    return watchId;
-  }
-
-  const shortsMatch = location.pathname.match(/\/shorts\/([^/?]+)/);
-  return shortsMatch?.[1];
-}
-
-export function getCurrentVideoId(): string | undefined {
-  return getVideoId();
+  const page = getVideoPage(location.href);
+  return page?.site === "youtube" ? page.videoId : undefined;
 }
 
 function findBalancedJson(source: string, marker: string): string | undefined {

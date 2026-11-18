@@ -82,6 +82,19 @@ class ModeConfigurationTests(unittest.TestCase):
         self.assertEqual(missing_origin.status_code, 403)
         load_model.assert_not_called()
 
+    def test_loopback_extension_http_requests_can_omit_origin(self) -> None:
+        client = TestClient(app.app, base_url="http://127.0.0.1:8765")
+        headers = {"X-YT-Translator-Local-STT": "1"}
+        self.assertEqual(client.get("/missing", headers=headers).status_code, 404)
+        self.assertEqual(client.post("/v1/audio/transcriptions", headers=headers).status_code, 422)
+        self.assertEqual(client.get("/missing", headers={**headers, "Origin": "https://example.com"}).status_code, 403)
+        self.assertEqual(TestClient(app.app).get("/missing", headers=headers).status_code, 403)
+        self.assertEqual(client.options("/health", headers={
+            "Origin": "https://example.com",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "X-YT-Translator-Local-STT",
+        }).status_code, 403)
+
     def test_requested_models_must_be_configured_or_cached(self) -> None:
         with mock.patch.object(app, "_cached_models", return_value=["medium"]):
             self.assertEqual(app._requested_model_name("medium"), "medium")

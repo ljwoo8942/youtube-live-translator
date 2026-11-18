@@ -1,4 +1,9 @@
 import type { CaptionSegment, ContentSettings } from "../shared/types";
+import { getVideoPage } from "../shared/videoSites";
+
+const isChzzk = getVideoPage(location.href)?.site === "chzzk";
+const CHZZK_PLAYER_SELECTOR = ".chzzk_player .pzp-pc";
+const CHZZK_VIDEO_SELECTOR = `${CHZZK_PLAYER_SELECTOR} video.webplayer-internal-video`;
 
 export class TranslatorOverlay {
   private host: HTMLDivElement | undefined;
@@ -534,6 +539,8 @@ export class TranslatorOverlay {
 }
 
 export function findPlayerElement(): HTMLElement | null {
+  if (isChzzk) return findVideoElement()?.closest<HTMLElement>(CHZZK_PLAYER_SELECTOR) ?? null;
+
   const fullscreenPlayer = findPlayerInScope(document.fullscreenElement);
   if (fullscreenPlayer) {
     return fullscreenPlayer;
@@ -584,10 +591,11 @@ function findVideoInScope(scope: ParentNode | Element | null): HTMLVideoElement 
     return null;
   }
 
+  const selector = isChzzk ? CHZZK_VIDEO_SELECTOR : "video.html5-main-video, video";
   const videos =
     scope instanceof HTMLVideoElement
-      ? [scope]
-      : scope.querySelectorAll<HTMLVideoElement>("video.html5-main-video, video");
+      ? scope.matches(selector) ? [scope] : []
+      : scope.querySelectorAll<HTMLVideoElement>(selector);
   let bestVideo: HTMLVideoElement | null = null;
   let bestScore = -1;
   for (const video of videos) {

@@ -1,11 +1,12 @@
 import { loadSettings } from "../shared/storage";
 import type { LocalSttServerState, MessageResponse } from "../shared/messages";
 import type { ContentMode, InputMode, SttProvider, TranslationProvider, TranslatorSettings } from "../shared/types";
+import { getVideoPage } from "../shared/videoSites";
 import "./style.css";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 let settings: TranslatorSettings;
-let currentTabIsYouTube = false;
+let currentTabPage: ReturnType<typeof getVideoPage>;
 let correctionEnabled = true;
 let correctionCount = 0;
 let actionPending = false;
@@ -13,18 +14,6 @@ let popupClosing = false;
 
 function activeTab(): Promise<chrome.tabs.Tab | undefined> {
   return chrome.tabs.query({ active: true, currentWindow: true }).then((tabs) => tabs[0]);
-}
-
-function isSupportedYouTubeUrl(url?: string): boolean {
-  if (!url) {
-    return false;
-  }
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === "https:" && ["www.youtube.com", "m.youtube.com"].includes(parsed.hostname);
-  } catch {
-    return false;
-  }
 }
 
 async function persist(patch: Partial<TranslatorSettings>): Promise<void> {
@@ -44,7 +33,7 @@ async function ensureTabCapturePermission(): Promise<void> {
   }
   const granted = await chrome.permissions.request({ permissions: ["tabCapture"] });
   if (!granted) {
-    throw new Error("음성 자막을 사용하려면 YouTube 탭 캡처 권한을 허용해야 합니다.");
+    throw new Error("음성 자막을 사용하려면 영상 탭 캡처 권한을 허용해야 합니다.");
   }
 }
 
@@ -55,8 +44,9 @@ type PreparedAudioCapture = {
 
 async function prepareAudioCapture(): Promise<PreparedAudioCapture> {
   const tab = await activeTab();
-  if (!isSupportedYouTubeUrl(tab?.url)) {
-    return {};
+  const page = getVideoPage(tab?.url);
+  if (!page?.videoId) {
+    throw new Error("YouTube 또는 치지직 영상 재생 페이지에서 음성 시작을 눌러 주세요.");
   }
   await ensureTabCapturePermission();
   const prepared = tab?.id
@@ -64,6 +54,10 @@ async function prepareAudioCapture(): Promise<PreparedAudioCapture> {
         .sendMessage<MessageResponse<{ videoId: string }>>(tab.id, { type: "PREPARE_AUDIO_CAPTURE" })
         .catch(() => undefined)
     : undefined;
+  if (prepared && !prepared.ok) throw new Error(prepared.error);
+  if (page.site === "chzzk" && !prepared?.ok) {
+    throw new Error("치지직 영상 탭을 새로고침한 뒤 다시 시도하세요.");
+  }
   return {
     tabId: tab?.id,
     videoId: prepared?.ok ? prepared.videoId : undefined
@@ -241,22 +235,21 @@ function render(): void {
     return;
   }
 
-  if (!currentTabIsYouTube) {
+  if (!currentTabPage) {
     app.innerHTML = `
       <section class="shell">
         <div class="global-nav">
           <span class="brand">YT Translator</span>
         </div>
         <section class="hero-tile">
-          <p class="eyebrow">YouTube only</p>
-          <h1>YouTube에서만 작동합니다</h1>
-          <p class="tagline">인강 사이트나 다른 웹사이트에서는 자막/음성 캡처 기능을 사용하지 않습니다.</p>
+          <h1>YouTube와 치지직 지원</h1>
+          <p class="tagline">영상 재생 탭에서 확장 팝업을 열어 주세요.</p>
         </section>
         <div class="actions">
           <button id="options" class="primary">전체 설정</button>
           <button id="corrections">교정 사전</button>
         </div>
-        <div id="status" class="status" role="status" aria-live="polite" aria-atomic="true">YouTube 영상 탭에서 다시 열어 주세요.</div>
+        <div id="status" class="status" role="status" aria-live="polite" aria-atomic="true"></div>
       </section>
     `;
     document.querySelector("#options")?.addEventListener("click", () => {
@@ -270,6 +263,7 @@ function render(): void {
     return;
   }
 
+  const isChzzk = currentTabPage.site === "chzzk";
   const isRecommendedFlow = settings.translationProvider === "openai" && settings.sttProvider === "whisper";
 
   app.innerHTML = `
@@ -283,7 +277,7 @@ function render(): void {
       </div>
 
       <section class="hero-tile">
-        <p class="eyebrow">YouTube Live Translator</p>
+        <p class="eyebrow">${isChzzk ? "치지직" : "YouTube Live Translator"}</p>
         <h1>실시간 자막</h1>
         <p class="tagline">${isRecommendedFlow ? "로컬 STT + 번역 API" : "사용자 지정 흐름"}</p>
       </section>
@@ -319,7 +313,7 @@ function render(): void {
           <strong>${isRecommendedFlow ? "권장 흐름" : "사용자 설정"}</strong>
         </div>
         <div class="status-metrics">
-          <span>${escapeHtml(inputModeLabel(settings.inputMode))}</span>
+          <span>${isChzzk && settings.inputMode !== "captions" ? "탭 음성" : escapeHtml(inputModeLabel(settings.inputMode))}</span>
           <span>${escapeHtml(contentModeLabel(settings.contentMode))}</span>
           <span>${escapeHtml(sttProviderLabel(settings.sttProvider))}</span>
           <span>${escapeHtml(sttModelLabel(settings))}</span>
@@ -335,9 +329,9 @@ function render(): void {
         <label>
           입력 방식
           <select id="inputMode">
-            <option value="captions">선택한 공식 자막만 사용</option>
-            <option value="captionsThenAudio">선택한 공식 자막 우선 + 없으면 음성</option>
-            <option value="audio">음성만 - YouTube 자막 무시</option>
+            <option value="captions">선택한 공식 자막만 사용${isChzzk ? " (YouTube용)" : ""}</option>
+            <option value="captionsThenAudio">${isChzzk ? "치지직 탭 음성 (YouTube는 자막 우선)" : "선택한 공식 자막 우선 + 없으면 음성"}</option>
+            <option value="audio">음성만 - 탭 음성 인식</option>
           </select>
         </label>
         <label>
@@ -421,7 +415,7 @@ function render(): void {
         closePopupAfterSuccess();
         return;
       }
-      if (inputMode?.value === "audio") {
+      if (inputMode?.value === "audio" || (isChzzk && settings.inputMode === "captionsThenAudio" && currentTabPage?.videoId)) {
         const prepared = await prepareAudioCapture();
         await persist({ enabled: true });
         const response = await startPreparedAudioCapture(prepared);
@@ -487,9 +481,10 @@ function render(): void {
   document.querySelector("#startAudio")?.addEventListener("click", () => {
     runAction(async () => {
       const prepared = await prepareAudioCapture();
+      const captureInputMode = isChzzk && settings.inputMode === "captionsThenAudio" ? "captionsThenAudio" : "audio";
       await persist({
         enabled: true,
-        inputMode: "audio",
+        inputMode: captureInputMode,
         contentMode: (contentMode?.value ?? settings.contentMode) as ContentMode,
         translationProvider: (translationProvider?.value ?? settings.translationProvider) as TranslationProvider,
         sttProvider: (sttProvider?.value ?? settings.sttProvider) as SttProvider,
@@ -497,7 +492,7 @@ function render(): void {
         targetLanguage: targetLanguage?.value.trim() || "ko"
       });
       if (enabled) enabled.checked = true;
-      if (inputMode) inputMode.value = "audio";
+      if (inputMode) inputMode.value = captureInputMode;
 
       const response = await startPreparedAudioCapture(prepared);
       const mode = response?.ok && response.mode ? ` (${response.mode})` : "";
@@ -541,7 +536,7 @@ function render(): void {
 }
 
 async function main(): Promise<void> {
-  currentTabIsYouTube = isSupportedYouTubeUrl((await activeTab())?.url);
+  currentTabPage = getVideoPage((await activeTab())?.url);
   const [loadedSettings, correctionStatus] = await Promise.all([
     loadSettings(),
     chrome.runtime.sendMessage<MessageResponse<{ enabled: boolean; count: number }>>({
@@ -554,7 +549,7 @@ async function main(): Promise<void> {
     correctionCount = correctionStatus.count;
   }
   render();
-  if (currentTabIsYouTube) {
+  if (currentTabPage) {
     void chrome.runtime.sendMessage<MessageResponse<LocalSttServerState>>({ type: "LOCAL_STT_SERVER", action: "status" })
       .then((response) => {
         if (!actionPending && !popupClosing && response?.ok && response.state !== "stopped" &&

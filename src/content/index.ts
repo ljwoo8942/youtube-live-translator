@@ -1,10 +1,10 @@
 import type { CaptionSegment, ContentSettings, MiniControlSettingsPatch, PageCaptionSnapshot } from "../shared/types";
 import type { CaptionTranslationEntry, MessageResponse, RuntimeMessage } from "../shared/messages";
+import { getVideoPage } from "../shared/videoSites";
 import { TranslatorOverlay, findPlayerElement, findVideoElement } from "./overlay";
 import {
   fetchTimedTextSegments,
   fetchTimedTextSegmentsWithMetadata,
-  getCurrentVideoId,
   getCurrentTimedTextSegment,
   getSelectedOfficialCaptionTrackKey,
   hashCaptionSegments,
@@ -15,8 +15,10 @@ import {
 } from "./youtubeCaptions";
 const SETTINGS_KEY = "translatorSettings";
 const BLOCKED_HALLUCINATION_ERROR = "환각 의심 번역 결과를 차단했습니다.";
-const CONTENT_SCRIPT_VERSION = 29;
+const CONTENT_SCRIPT_VERSION = 30;
 const CONTENT_BOOTSTRAP_FLAG = "__yt_live_translator_content_bootstrapped__";
+const videoSite = getVideoPage(location.href)?.site;
+const isYouTubeSite = videoSite === "youtube";
 const overlay = new TranslatorOverlay();
 const AUDIO_FALLBACK_INITIAL_WAIT_MS = 2200;
 const AUDIO_FALLBACK_NO_CAPTION_WAIT_MS = 250;
@@ -195,7 +197,7 @@ function prepareCaptionLyricsAssist(videoId: string): void {
 }
 
 function currentWatchVideoId(): string {
-  return getCurrentVideoId() ?? "";
+  return getVideoPage(location.href)?.videoId ?? "";
 }
 
 function clearCaptionTrackRefreshTimers(): void {
@@ -214,7 +216,7 @@ function clearVideoSessionCaptionLoadTimers(): void {
 
 function scheduleVideoSessionCaptionLoads(videoId: string): void {
   clearVideoSessionCaptionLoadTimers();
-  if (!settings.enabled || settings.inputMode === "audio" || !videoId) {
+  if (!isYouTubeSite || !settings.enabled || settings.inputMode === "audio" || !videoId) {
     return;
   }
 
@@ -238,6 +240,7 @@ function scheduleVideoSessionCaptionLoads(videoId: string): void {
 }
 
 async function cancelPretranslation(keepVideoId?: string): Promise<void> {
+  if (!isYouTubeSite) return;
   await chrome.runtime.sendMessage({ type: "CANCEL_PRETRANSLATION", keepVideoId }).catch(() => undefined);
 }
 
@@ -275,7 +278,7 @@ function beginVideoSession(videoId: string): void {
   overlay.clear();
   scheduleOverlayRefresh();
 
-  if (settings.enabled && videoId && settings.inputMode !== "audio") {
+  if (isYouTubeSite && settings.enabled && videoId && settings.inputMode !== "audio") {
     overlay.showStatus("새 영상의 공식 자막을 확인하는 중...", settings);
     scheduleVideoSessionCaptionLoads(videoId);
   }
@@ -319,7 +322,8 @@ function shouldAcceptAudioSegment(segment?: CaptionSegment): boolean {
       audioCaptureRequested &&
       !audioStopRequested &&
       !audioCaptureSuppressed &&
-      isYouTubeWatchPage() &&
+      currentWatchVideoId() &&
+      settings.inputMode !== "captions" &&
       (settings.inputMode === "audio" || timedTextSegments.length === 0)
   );
 }
@@ -348,6 +352,7 @@ function controlStatusText(): string {
   const mode = contentModeStatusLabel();
   const turnMode = settings.speakerTurnDetection && settings.contentMode !== "lyrics" ? " · 발화 분리" : "";
   if (settings.inputMode === "captions") {
+    if (!isYouTubeSite) return "음성 시작으로 자막을 표시하세요.";
     return withLyricsAssistStatus(`선택한 공식 자막만 사용 · ${mode}${turnMode}`);
   }
   if (timedTextSegments.length > 0) {
@@ -363,7 +368,7 @@ function controlStatusText(): string {
 }
 
 function ensureOverlay(): void {
-  if (!isYouTubeWatchPage()) {
+  if (!currentWatchVideoId()) {
     overlay.destroy();
     return;
   }
@@ -759,7 +764,7 @@ async function processCaptionSegment(segment: Parameters<typeof overlay.showTran
 }
 
 async function loadTimedText(expectedVideoId = activeVideoId): Promise<void> {
-  if (!expectedVideoId || expectedVideoId !== activeVideoId || expectedVideoId !== currentWatchVideoId()) {
+  if (!isYouTubeSite || !expectedVideoId || expectedVideoId !== activeVideoId || expectedVideoId !== currentWatchVideoId()) {
     return;
   }
   prepareCaptionLyricsAssist(expectedVideoId);
@@ -927,7 +932,7 @@ function shouldStartAudioFallback(): boolean {
     return false;
   }
 
-  if (settings.inputMode === "audio") {
+  if (!isYouTubeSite || settings.inputMode === "audio") {
     return true;
   }
   if (timedTextLoading || timedTextSegments.length > 0) {
@@ -971,7 +976,7 @@ async function startAudioFallbackIfNeeded(): Promise<void> {
     audioCaptureSuppressed ||
     stoppingAudioCapture ||
     Date.now() < manualAudioStartPendingUntil ||
-    !isYouTubeWatchPage() ||
+    !currentWatchVideoId() ||
     document.visibilityState !== "visible"
   ) {
     return;
@@ -1078,7 +1083,7 @@ async function disableTranslator(): Promise<void> {
   audioStartBlockedUntil = 0;
   manualAudioStartPendingUntil = 0;
   await chrome.runtime.sendMessage({ type: "STOP_AUDIO_CAPTURE" }).catch(() => undefined);
-  if (settings.miniControlsEnabled && isYouTubeWatchPage()) {
+  if (settings.miniControlsEnabled && currentWatchVideoId()) {
     ensureOverlay();
     overlay.clear();
     overlay.setControlStatus(controlStatusText(), settings);
@@ -1091,7 +1096,7 @@ function shouldReloadTimedTextForSettingsChange(
   previousSettings: ContentSettings,
   nextSettings: ContentSettings
 ): boolean {
-  if (nextSettings.inputMode === "audio") {
+  if (!isYouTubeSite || nextSettings.inputMode === "audio") {
     return false;
   }
   if (!previousSettings.enabled && nextSettings.enabled) {
@@ -1216,7 +1221,7 @@ function handleVideoElementChange(): void {
   observedVideoElement = nextVideoElement;
 
   const videoId = currentWatchVideoId();
-  if (!videoId || !settings.enabled || !isYouTubeWatchPage()) {
+  if (!videoId || !settings.enabled) {
     return;
   }
   if (videoId !== activeVideoId) {
@@ -1225,7 +1230,7 @@ function handleVideoElementChange(): void {
   }
   // The URL change owns the video session. Replacing the media element for the
   // same video must not invalidate captions or restart tab audio capture.
-  if (settings.inputMode !== "audio" && (timedTextVideoId !== videoId || timedTextSegments.length === 0)) {
+  if (isYouTubeSite && settings.inputMode !== "audio" && (timedTextVideoId !== videoId || timedTextSegments.length === 0)) {
     scheduleVideoSessionCaptionLoads(videoId);
     void runTick();
   }
@@ -1244,7 +1249,7 @@ async function tick(): Promise<void> {
   handleUrlChange();
   handleVideoElementChange();
 
-  if (!isYouTubeWatchPage()) {
+  if (!activeVideoId) {
     await stopAudioFallback();
     overlay.destroy();
     return;
@@ -1267,7 +1272,7 @@ async function tick(): Promise<void> {
     await stopAudioFallback();
   }
 
-  if (settings.inputMode !== "audio") {
+  if (isYouTubeSite && settings.inputMode !== "audio") {
     reloadTimedTextIfSelectedTrackChanged();
     retryTimedTextIfNeeded();
 
@@ -1363,6 +1368,7 @@ function handleFullscreenPointerIntent(event: PointerEvent): void {
 }
 
 function handleFullscreenChange(): void {
+  if (!isYouTubeSite) scheduleOverlayRefresh();
   if (resumeAudioAfterFullscreenIntentRequested && document.fullscreenElement) {
     scheduleFullscreenAudioResume(FULLSCREEN_AUDIO_RESUME_DELAY_MS);
   }
@@ -1373,7 +1379,9 @@ function isOverlayMutationElement(element: Element): boolean {
 }
 
 function mutationTouchesPlayer(mutation: MutationRecord): boolean {
-  const selector = "#movie_player, .html5-video-player, video, .ytp-caption-segment, .captions-text";
+  const selector = videoSite === "chzzk"
+    ? ".chzzk_player, video"
+    : "#movie_player, .html5-video-player, video, .ytp-caption-segment, .captions-text";
   let changedElementCount = 0;
   let onlyOverlayElements = true;
   for (const nodes of [mutation.addedNodes, mutation.removedNodes]) {
@@ -1630,7 +1638,7 @@ function installObservers(): void {
           audioCaptureSuppressed ||
           !settings.enabled ||
           settings.inputMode === "captions" ||
-          !isYouTubeWatchPage();
+          !currentWatchVideoId();
         if (shouldStopRecording) {
           audioCaptureRequested = false;
           void chrome.runtime
@@ -1660,6 +1668,11 @@ function installObservers(): void {
     }
 
     if (message.type === "PREPARE_AUDIO_CAPTURE") {
+      handleUrlChange();
+      if (videoSite === "chzzk" && !findVideoElement()) {
+        sendResponse({ ok: false, error: "치지직 본편이 재생된 뒤 음성 시작을 눌러 주세요." });
+        return;
+      }
       audioStopRequested = false;
       audioCaptureSuppressed = false;
       manualAudioStartPendingUntil = Date.now() + MANUAL_AUDIO_START_PENDING_MS;

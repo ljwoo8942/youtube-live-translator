@@ -87,7 +87,7 @@ When the extension sends `content_mode=lyrics`, the server switches to a song-fr
 
 The extension deliberately omits the fixed language in lyrics mode for mixed-language songs, even if a source language was selected. In other modes it forwards the selected language.
 
-The server accepts Chrome extension origins only. HTTP uploads are limited to 16 MiB and 60 seconds of decoded audio, WebSocket frames to 256 KiB, and CPU/GPU inference is serialized. Override these ceilings with `YT_TRANSLATOR_STT_MAX_UPLOAD_BYTES`, `YT_TRANSLATOR_STT_MAX_AUDIO_SECONDS`, and `YT_TRANSLATOR_STT_MAX_STREAM_CHUNK_BYTES` only when needed. The bundled health-check commands supply the required origin header.
+The server validates Chrome extension origins. Loopback HTTP requests use an explicit extension client header when Chrome omits the Origin header. Browser requests from other origins are blocked before inference. HTTP uploads are limited to 16 MiB and 60 seconds of decoded audio, WebSocket frames to 256 KiB, and CPU/GPU inference is serialized. Override these ceilings with `YT_TRANSLATOR_STT_MAX_UPLOAD_BYTES`, `YT_TRANSLATOR_STT_MAX_AUDIO_SECONDS`, and `YT_TRANSLATOR_STT_MAX_STREAM_CHUNK_BYTES` only when needed. The bundled health-check commands send a Chrome extension origin.
 
 The HTTP request body is capped before multipart parsing, allowing 64 KiB of multipart metadata in addition to the file limit. Decoding stops at the audio duration limit and returns HTTP 413. Streaming audio reception continues during inference; only the latest bounded audio window is decoded, and reset/disconnect discards stale results.
 

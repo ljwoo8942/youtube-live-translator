@@ -3,6 +3,7 @@ import type { CaptionSegment, PageCaptionSnapshot, PageCaptionTrack, TranslatorS
 import type { CaptionTranslationEntry, MessageResponse, RuntimeMessage } from "../shared/messages";
 import { BLOCKED_HALLUCINATION_ERROR, getErrorMessage } from "../shared/messages";
 import { TRANSLATION_PROMPT_VERSION } from "../shared/translationVersion";
+import { getVideoPage, isChzzkVideoId, VIDEO_SITE_MATCHES } from "../shared/videoSites";
 import { assertTranscriptionReady, assertTranslationReady, transcribeAudio, translateSegment, translateSegments } from "./providers";
 import { getLocalSttServerState, startLocalSttServer, stopLocalSttServer, usesNativeSttEndpoint } from "./nativeStt";
 import {
@@ -665,6 +666,7 @@ function startCorrectionSession(tabId: number, videoId: string): CorrectionSessi
     appliedNotified: false
   };
   correctionSessionsByTab.set(tabId, state);
+  if (isChzzkVideoId(videoId)) return state;
   state.ready = (async () => {
     const preferences = await getCorrectionPreferences();
     if (!preferences.enabled || correctionSessionsByTab.get(tabId) !== state) {
@@ -744,7 +746,7 @@ async function correctionEntriesForSegments(
 }
 
 async function prepareLyricsAssist(tabId: number, videoId: string, settings: TranslatorSettings): Promise<void> {
-  if (!settings.lyricsAssistEnabled || settings.contentMode === "spoken") {
+  if (isChzzkVideoId(videoId) || !settings.lyricsAssistEnabled || settings.contentMode === "spoken") {
     lyricsAssistByTab.delete(tabId);
     return;
   }
@@ -916,28 +918,19 @@ async function getOffscreenAudioState(): Promise<OffscreenAudioState | undefined
   }
 }
 
-function isSupportedYouTubeUrl(url?: string): boolean {
-  if (!url) {
-    return false;
-  }
-
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === "https:" && ["www.youtube.com", "m.youtube.com"].includes(parsed.hostname);
-  } catch {
-    return false;
-  }
-}
-
-async function stopAudioCaptureOutsideYouTube(tabId: number, url?: string): Promise<void> {
-  const tabUrl = url ?? (await getTabUrl(tabId));
-  if (isSupportedYouTubeUrl(tabUrl)) {
+async function stopAudioCaptureOutsideVideoSite(
+  tabId: number,
+  url?: string,
+  captureVideoId = activeAudioTabId === tabId ? activeAudioVideoId : undefined
+): Promise<void> {
+  const videoId = getVideoPage(url ?? (await getTabUrl(tabId)))?.videoId;
+  if (videoId && (!captureVideoId || isChzzkVideoId(videoId) === isChzzkVideoId(captureVideoId))) {
     return;
   }
-  if (activeAudioTabId !== tabId && !(await liveCapturedTabIds()).includes(tabId)) {
+  if (!captureVideoId && activeAudioTabId !== tabId && !(await liveCapturedTabIds()).includes(tabId)) {
     return;
   }
-  await stopAudioCapture(tabId);
+  await stopAudioCapture(tabId, captureVideoId);
 }
 
 async function stopStaleAudioCaptureOnStartup(): Promise<void> {
@@ -945,22 +938,12 @@ async function stopStaleAudioCaptureOnStartup(): Promise<void> {
   if (!state?.recording || !state.activeTabId) {
     return;
   }
-  await stopAudioCaptureOutsideYouTube(state.activeTabId);
+  await stopAudioCaptureOutsideVideoSite(state.activeTabId, undefined, state.activeVideoId);
 }
 
 function youtubeVideoIdFromUrl(url?: string): string | undefined {
-  if (!url) {
-    return undefined;
-  }
-  try {
-    const parsed = new URL(url);
-    if (!isSupportedYouTubeUrl(url)) {
-      return undefined;
-    }
-    return parsed.searchParams.get("v") ?? parsed.pathname.match(/^\/shorts\/([^/?]+)/)?.[1];
-  } catch {
-    return undefined;
-  }
+  const page = getVideoPage(url);
+  return page?.site === "youtube" ? page.videoId : undefined;
 }
 
 async function currentYouTubeMedia(): Promise<CorrectionMediaContext | undefined> {
@@ -998,13 +981,13 @@ async function broadcastCorrectionLibraryUpdated(): Promise<void> {
 
 async function updateActionAvailability(tabId: number, url?: string): Promise<void> {
   const tabUrl = url ?? (await getTabUrl(tabId));
-  const isYouTube = isSupportedYouTubeUrl(tabUrl);
+  const supported = Boolean(getVideoPage(tabUrl));
   try {
     await chrome.action.setTitle({
       tabId,
-      title: isYouTube ? "YouTube Live Translator" : "YouTube에서만 사용할 수 있습니다"
+      title: supported ? "YouTube Live Translator" : "YouTube와 치지직에서 사용할 수 있습니다"
     });
-    if (isYouTube) {
+    if (supported) {
       await chrome.action.enable(tabId);
     } else {
       await chrome.action.disable(tabId);
@@ -2184,10 +2167,13 @@ async function reconfigureAudioCaptureInternal(
   expectedVideoId?: string,
   startIfMissing = false
 ): Promise<MessageResponse<{ tabId: number; mode?: string }>> {
-  const tabUrl = await getTabUrl(tabId);
-  if (!isSupportedYouTubeUrl(tabUrl)) {
+  const currentVideoId = getVideoPage(await getTabUrl(tabId))?.videoId;
+  if (!currentVideoId) {
     await stopAudioCaptureInternal(tabId);
-    return { ok: false, error: "YouTube 영상 탭에서만 음성 자막을 유지할 수 있습니다." };
+    return { ok: false, error: "YouTube 또는 치지직 재생 탭에서 음성 자막을 다시 시작하세요." };
+  }
+  if (currentVideoId !== videoId) {
+    return { ok: false, error: "영상이 바뀌었습니다. 현재 재생 탭에서 다시 시작하세요." };
   }
 
   const state = await getOffscreenAudioState();
@@ -2200,6 +2186,10 @@ async function reconfigureAudioCaptureInternal(
       return startAudioCaptureInternal(undefined, tabId, videoId);
     }
     return { ok: false, error: "재구성할 활성 오디오 캡처 세션이 없습니다." };
+  }
+  if (state.activeVideoId && isChzzkVideoId(state.activeVideoId) !== isChzzkVideoId(videoId)) {
+    await stopAudioCaptureInternal(tabId, state.activeVideoId);
+    return { ok: false, error: "영상 사이트가 바뀌었습니다. 팝업에서 음성 자막을 다시 시작하세요." };
   }
 
   const settings = await loadSettings();
@@ -2261,22 +2251,21 @@ async function startAudioCaptureInternal(
 ): Promise<MessageResponse<{ tabId: number; mode?: string }>> {
   const tabId = requestedTabId ?? senderTabId;
   if (!tabId) {
-    return { ok: false, error: "오디오를 캡처할 YouTube 탭을 찾지 못했습니다." };
+    return { ok: false, error: "음성을 인식할 영상 탭을 찾지 못했습니다." };
   }
 
-  const tabUrl = await getTabUrl(tabId);
-  if (!isSupportedYouTubeUrl(tabUrl)) {
-    return { ok: false, error: "YouTube 영상 탭에서만 음성 자막을 시작할 수 있습니다." };
-  }
-  const videoId = requestedVideoId ?? youtubeVideoIdFromUrl(tabUrl);
+  const videoId = getVideoPage(await getTabUrl(tabId))?.videoId;
   if (!videoId) {
-    return { ok: false, error: "재생 중인 YouTube 영상 ID를 확인하지 못했습니다." };
+    return { ok: false, error: "YouTube 또는 치지직 영상 재생 페이지에서 음성 자막을 시작하세요." };
+  }
+  if (requestedVideoId && requestedVideoId !== videoId) {
+    return { ok: false, error: "영상이 바뀌었습니다. 현재 재생 탭에서 다시 시작하세요." };
   }
 
   if (!(await ensureTabCapturePermission(canRequestTabCapturePermission))) {
     return {
       ok: false,
-      error: "음성 캡처 권한이 없습니다. YouTube 탭에서 확장 팝업의 음성 시작 버튼을 눌러 권한을 허용하세요."
+      error: "음성 캡처 권한이 없습니다. 재생 탭에서 확장 팝업의 음성 시작을 눌러 권한을 허용하세요."
     };
   }
 
@@ -2292,7 +2281,7 @@ async function startAudioCaptureInternal(
     if (state?.activeVideoId === videoId) {
       return reuseAudioCapture(tabId, videoId, state);
     }
-    if (state?.activeVideoId) {
+    if (state?.activeVideoId && isChzzkVideoId(state.activeVideoId) === isChzzkVideoId(videoId)) {
       return reconfigureAudioCaptureInternal(tabId, videoId, state.activeVideoId);
     }
     await stopAudioCaptureInternal(tabId);
@@ -2318,6 +2307,9 @@ async function startAudioCaptureInternal(
   }
 
   await ensureOffscreenDocument();
+  if (getVideoPage(await getTabUrl(tabId))?.videoId !== videoId) {
+    return { ok: false, error: "영상이 바뀌었습니다. 현재 재생 탭에서 다시 시작하세요." };
+  }
 
   let streamId: string;
   try {
@@ -2331,14 +2323,14 @@ async function startAudioCaptureInternal(
         if (state?.activeVideoId === videoId) {
           return reuseAudioCapture(tabId, videoId, state);
         }
-        if (state?.activeVideoId) {
+        if (state?.activeVideoId && isChzzkVideoId(state.activeVideoId) === isChzzkVideoId(videoId)) {
           return reconfigureAudioCaptureInternal(tabId, videoId, state.activeVideoId);
         }
       }
       return {
         ok: false,
         error:
-          "이 YouTube 탭에 이미 다른 오디오 캡처가 활성화되어 있습니다. 확장 팝업의 음성 중지를 누르거나 YouTube 탭/확장프로그램을 새로고침한 뒤 다시 시작하세요."
+          "이 영상 탭에 이미 오디오 캡처가 있습니다. 팝업에서 음성 중지를 누르거나 영상 탭을 새로고침한 뒤 다시 시작하세요."
       };
     }
     throw error;
@@ -2398,9 +2390,9 @@ async function startAudioCapture(
 ): Promise<MessageResponse<{ tabId: number; mode?: string }>> {
   const tabId = requestedTabId ?? senderTabId;
   if (!tabId) {
-    return { ok: false, error: "오디오를 캡처할 YouTube 탭을 찾지 못했습니다." };
+    return { ok: false, error: "음성을 인식할 영상 탭을 찾지 못했습니다." };
   }
-  const videoId = requestedVideoId ?? youtubeVideoIdFromUrl(await getTabUrl(tabId));
+  const videoId = requestedVideoId ?? getVideoPage(await getTabUrl(tabId))?.videoId;
 
   if (startingAudioCapture?.tabId === tabId && startingAudioCapture.videoId === videoId) {
     return startingAudioCapture.promise;
@@ -2426,7 +2418,7 @@ function reconfigureAudioCapture(
   startIfMissing = false
 ): Promise<MessageResponse<{ tabId: number; mode?: string }>> {
   if (!tabId) {
-    return Promise.resolve({ ok: false, error: "오디오를 캡처 중인 YouTube 탭을 찾지 못했습니다." });
+    return Promise.resolve({ ok: false, error: "오디오를 캡처 중인 영상 탭을 찾지 못했습니다." });
   }
   return enqueueAudioLifecycle(() =>
     reconfigureAudioCaptureInternal(tabId, videoId, expectedVideoId, startIfMissing)
@@ -2504,7 +2496,7 @@ async function broadcastContentSettings(settings: TranslatorSettings, revision: 
     pretranslateJobs.clear();
   }
   lastTranslationConfigRevision = translationConfigRevision;
-  const tabs = await chrome.tabs.query({ url: ["*://www.youtube.com/*", "*://m.youtube.com/*"] });
+  const tabs = await chrome.tabs.query({ url: VIDEO_SITE_MATCHES });
   const message: RuntimeMessage = {
     type: "SETTINGS_UPDATED",
     settings: toContentSettings(settings, translationConfigRevision),
@@ -2563,7 +2555,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     cancelTabPretranslationJobs(tabId);
   }
   if (changeInfo.url || changeInfo.status === "loading") {
-    void stopAudioCaptureOutsideYouTube(tabId, tabUrl);
+    void stopAudioCaptureOutsideVideoSite(tabId, tabUrl);
   }
   if (tabUrl) {
     void updateActionAvailability(tabId, tabUrl);
@@ -3014,7 +3006,7 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
       }
 
       if (message.type === "GET_PAGE_CAPTION_SNAPSHOT") {
-        if (!sender.tab?.id) {
+        if (!sender.tab?.id || youtubeVideoIdFromUrl(sender.tab.url) !== message.videoId) {
           sendResponse({ ok: false, error: "YouTube 탭을 찾지 못했습니다." });
           return;
         }
@@ -3023,7 +3015,7 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
       }
 
       if (message.type === "PREPARE_CAPTION_LYRICS_ASSIST") {
-        if (!sender.tab?.id) {
+        if (!sender.tab?.id || youtubeVideoIdFromUrl(sender.tab.url) !== message.videoId) {
           sendResponse({ ok: false, error: "YouTube 탭을 찾지 못했습니다." });
           return;
         }
@@ -3042,16 +3034,16 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
       if (message.type === "CAPTION_SEGMENT") {
         const tabId = sender.tab?.id;
         const videoId = youtubeVideoIdFromUrl(sender.tab?.url);
-        const controller = tabId ? captionRequestController(tabId) : new AbortController();
+        if (!tabId || !videoId) {
+          sendResponse({ ok: false, error: "공식 자막을 처리할 YouTube 영상을 찾지 못했습니다." });
+          return;
+        }
+        const controller = captionRequestController(tabId);
         const snapshot = await loadSettingsSnapshot();
         const settings = snapshot.settings;
         lastTranslationConfigRevision ??= snapshot.translationConfigRevision;
-        const [segment] =
-          tabId && videoId
-            ? await addCaptionLyricsAssist(tabId, videoId, settings, [message.segment])
-            : [message.segment];
-        const correction =
-          settings.enabled && tabId && videoId ? await matchUserCorrection(tabId, videoId, segment, true) : undefined;
+        const [segment] = await addCaptionLyricsAssist(tabId, videoId, settings, [message.segment]);
+        const correction = settings.enabled ? await matchUserCorrection(tabId, videoId, segment, true) : undefined;
         controller.signal.throwIfAborted();
         if (correction) {
           sendResponse({
@@ -3066,6 +3058,10 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
       }
 
       if (message.type === "PRETRANSLATE_CAPTIONS") {
+        if (youtubeVideoIdFromUrl(sender.tab?.url) !== message.videoId) {
+          sendResponse({ ok: false, error: "선번역을 요청한 YouTube 영상을 찾지 못했습니다." });
+          return;
+        }
         sendResponse(await handlePretranslateCaptions(message, sender.tab?.id));
         return;
       }

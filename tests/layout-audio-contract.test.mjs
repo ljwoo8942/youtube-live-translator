@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { getVideoPage, VIDEO_SITE_MATCHES } from "../src/shared/videoSites.ts";
 import {
   assistOfficialCaptionSegment,
   assistLyricsSegment,
@@ -298,7 +299,7 @@ test("overlay-only setting changes do not reload captions or restart audio", () 
     content,
     /function shouldReloadTimedTextForSettingsChange\(\s*previousSettings: ContentSettings,\s*nextSettings: ContentSettings\s*\)/
   );
-  assert.match(content, /if \(nextSettings\.inputMode === "audio"\) \{\s*return false;/);
+  assert.match(content, /if \(!isYouTubeSite \|\| nextSettings\.inputMode === "audio"\) \{\s*return false;/);
   assert.match(
     content,
     /previousSettings\.inputMode !== nextSettings\.inputMode \|\|[\s\S]*?previousSettings\.sourceLanguage !== nextSettings\.sourceLanguage \|\|[\s\S]*?previousSettings\.contentMode !== nextSettings\.contentMode/
@@ -489,34 +490,48 @@ test("manual audio start clears stale stop intent before starting tab capture", 
   assert.match(popup, /videoId:\s*prepared\.videoId/);
 });
 
-test("popup does not request tab capture permission outside YouTube", () => {
+test("popup checks the playback URL before requesting capture permission", () => {
   const prepareStart = popup.indexOf("async function prepareAudioCapture");
   const prepareEnd = popup.indexOf("function startPreparedAudioCapture", prepareStart);
   const prepareAudio = popup.slice(prepareStart, prepareEnd);
   assert.ok(prepareStart >= 0);
   assert.match(
     prepareAudio,
-    /const tab = await activeTab\(\);[\s\S]*?if \(!isSupportedYouTubeUrl\(tab\?\.url\)\) \{[\s\S]*?return \{\};[\s\S]*?await ensureTabCapturePermission\(\);/
+    /const page = getVideoPage\(tab\?\.url\);[\s\S]*?if \(!page\?\.videoId\) \{[\s\S]*?throw new Error[\s\S]*?await ensureTabCapturePermission\(\);/
   );
 });
 
-test("tab capture is limited to YouTube and stops when a captured tab leaves YouTube", () => {
-  assert.match(
-    manifest,
-    /"matches":\s*\["https:\/\/www\.youtube\.com\/\*",\s*"https:\/\/m\.youtube\.com\/\*"\]/
-  );
-  assert.doesNotMatch(manifest, /"matches":\s*\[[^\]]*"https:\/\/\*\/\*"/);
+test("content injection and settings broadcasts target the three supported hosts", () => {
+  const manifestConfig = JSON.parse(manifest);
+  assert.deepEqual(manifestConfig.content_scripts[0].matches, VIDEO_SITE_MATCHES);
+  assert.ok(VIDEO_SITE_MATCHES.includes("https://chzzk.naver.com/*"));
+  assert.ok(manifestConfig.host_permissions.includes("https://chzzk.naver.com/*"));
+  assert.doesNotMatch(manifest, /https:\/\/\*\.naver\.com/);
+  assert.match(background, /chrome\.tabs\.query\(\{ url: VIDEO_SITE_MATCHES \}\)/);
+});
+
+test("playback IDs keep YouTube and CHZZK videos separate", () => {
+  const channel = "1234abcd".repeat(4);
+  assert.deepEqual(getVideoPage(`https://chzzk.naver.com/live/${channel}?t=1`), { site: "chzzk", videoId: `chzzk:live:${channel}` });
+  assert.equal(getVideoPage("https://chzzk.naver.com/video/42")?.videoId, "chzzk:video:42");
+  assert.equal(getVideoPage("https://chzzk.naver.com/video/42/other")?.videoId, undefined);
+  assert.equal(getVideoPage("https://chzzk.naver.com/lives?v=other")?.videoId, undefined);
+  assert.equal(getVideoPage("https://www.youtube.com/watch?v=42")?.videoId, "42");
+  assert.equal(getVideoPage("https://m.youtube.com/shorts/abc_123")?.videoId, "abc_123");
+  assert.equal(getVideoPage("https://www.youtube.com/watch?v=chzzk%3Avideo%3A42")?.videoId, undefined);
+  assert.equal(getVideoPage("https://game.naver.com/video/42"), undefined);
+  assert.equal(getVideoPage("http://chzzk.naver.com/video/42"), undefined);
+  assert.equal(getVideoPage("blob:https://www.youtube.com/opaque?v=example"), undefined);
+});
+
+test("tab navigation and service worker startup check the capture scope", () => {
   assert.match(
     background,
-    /async function stopAudioCaptureOutsideYouTube\(tabId: number, url\?: string\): Promise<void> \{[\s\S]*?if \(isSupportedYouTubeUrl\(tabUrl\)\) \{[\s\S]*?return;[\s\S]*?await stopAudioCapture\(tabId\);/
+    /chrome\.tabs\.onUpdated\.addListener\(\(tabId, changeInfo, tab\) => \{[\s\S]*?changeInfo\.url \|\| changeInfo\.status === "loading"[\s\S]*?stopAudioCaptureOutsideVideoSite\(tabId, tabUrl\)/
   );
   assert.match(
     background,
-    /chrome\.tabs\.onUpdated\.addListener\(\(tabId, changeInfo, tab\) => \{[\s\S]*?changeInfo\.url \|\| changeInfo\.status === "loading"[\s\S]*?stopAudioCaptureOutsideYouTube\(tabId, tabUrl\)/
-  );
-  assert.match(
-    background,
-    /async function stopStaleAudioCaptureOnStartup\(\): Promise<void> \{[\s\S]*?getOffscreenAudioState\(\)[\s\S]*?state\?\.recording[\s\S]*?state\.activeTabId[\s\S]*?await stopAudioCaptureOutsideYouTube\(state\.activeTabId\);/
+    /async function stopStaleAudioCaptureOnStartup\(\): Promise<void> \{[\s\S]*?getOffscreenAudioState\(\)[\s\S]*?state\?\.recording[\s\S]*?state\.activeTabId[\s\S]*?await stopAudioCaptureOutsideVideoSite\(state\.activeTabId, undefined, state\.activeVideoId\);/
   );
   assert.match(background, /void stopStaleAudioCaptureOnStartup\(\);/);
   const reconfigureStart = background.indexOf("async function reconfigureAudioCaptureInternal");
@@ -525,7 +540,7 @@ test("tab capture is limited to YouTube and stops when a captured tab leaves You
   assert.ok(reconfigureStart >= 0);
   assert.match(
     reconfigureCapture,
-    /const tabUrl = await getTabUrl\(tabId\);[\s\S]*?if \(!isSupportedYouTubeUrl\(tabUrl\)\) \{[\s\S]*?await stopAudioCaptureInternal\(tabId\);[\s\S]*?return \{ ok: false, error: "YouTube 영상 탭에서만 음성 자막을 유지할 수 있습니다\." \};/
+    /const currentVideoId = getVideoPage\(await getTabUrl\(tabId\)\)\?\.videoId;\s*if \(!currentVideoId\) \{\s*await stopAudioCaptureInternal\(tabId\);/
   );
 });
 

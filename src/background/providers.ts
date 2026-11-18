@@ -1,6 +1,6 @@
 import type { ApiAuthHeaderMode, CaptionSegment, TranslationProvider, TranslatorSettings } from "../shared/types";
 import type { CaptionTranslationEntry } from "../shared/messages";
-import { fetchWithTimeout } from "../shared/network";
+import { fetchWithTimeout, LOCAL_STT_HEADERS } from "../shared/network";
 
 type JsonObject = Record<string, unknown>;
 type OpenAiCompatibleConfig = {
@@ -49,7 +49,7 @@ function joinOpenAiUrl(baseUrl: string, path: string): string {
   return joinUrl(normalizeOpenAiBaseUrl(baseUrl), path);
 }
 
-function authHeaders(apiKey: string, mode: ApiAuthHeaderMode = "bearer"): HeadersInit {
+function authHeaders(apiKey: string, mode: ApiAuthHeaderMode = "bearer"): Record<string, string> {
   if (!apiKey || mode === "none") {
     return {};
   }
@@ -1428,17 +1428,18 @@ async function transcribeOpenAiCompatible(config: {
   }
 
   const sttUrl = joinOpenAiUrl(config.baseUrl, config.endpoint);
+  const isLocal = isLocalBaseUrl(sttUrl);
   let response: Response;
   try {
     response = await fetchWithTimeout(sttUrl, {
       method: "POST",
       signal: config.signal,
-      headers: authHeaders(config.apiKey, config.authHeaderMode),
+      headers: { ...authHeaders(config.apiKey, config.authHeaderMode), ...(isLocal ? LOCAL_STT_HEADERS : {}) },
       body: form
-    }, isLocalBaseUrl(config.baseUrl) ? 120_000 : 60_000);
+    }, isLocal ? 120_000 : 60_000);
   } catch (error) {
     throwIfCancelled(error, config.signal);
-    if (isLocalBaseUrl(config.baseUrl)) {
+    if (isLocal) {
       throw localSttConnectionError(error);
     }
     throw apiConnectionError(error, "STT API", sttUrl);
@@ -1568,7 +1569,7 @@ export async function assertTranscriptionReady(settings: TranslatorSettings, sig
 
   let response: Response;
   try {
-    response = await fetchWithTimeout(healthUrl, { signal }, 45_000);
+    response = await fetchWithTimeout(healthUrl, { signal, headers: LOCAL_STT_HEADERS }, 45_000);
   } catch (error) {
     throwIfCancelled(error, signal);
     throw localSttConnectionError(error);
