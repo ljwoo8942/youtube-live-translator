@@ -4,6 +4,7 @@ import type { CaptionTranslationEntry, MessageResponse, RuntimeMessage } from ".
 import { BLOCKED_HALLUCINATION_ERROR, getErrorMessage } from "../shared/messages";
 import { TRANSLATION_PROMPT_VERSION } from "../shared/translationVersion";
 import { assertTranscriptionReady, assertTranslationReady, transcribeAudio, translateSegment, translateSegments } from "./providers";
+import { getLocalSttServerState, startLocalSttServer, stopLocalSttServer, usesNativeSttEndpoint } from "./nativeStt";
 import {
   createCaptionCacheContext,
   getCachedCaptionTranslations,
@@ -3112,6 +3113,38 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
 
       if (message.type === "STOP_AUDIO_CAPTURE") {
         sendResponse(await stopAudioCapture(message.tabId ?? sender.tab?.id, message.videoId));
+        return;
+      }
+
+      if (message.type === "LOCAL_STT_SERVER") {
+        if (sender.id !== chrome.runtime.id || sender.url !== chrome.runtime.getURL("popup.html")) {
+          sendResponse({ ok: false, error: "팝업에서만 로컬 STT 서버를 제어할 수 있습니다." });
+          return;
+        }
+        if (message.action === "status") {
+          sendResponse({ ok: true, ...getLocalSttServerState() });
+          return;
+        }
+        if (message.action !== "start" && message.action !== "stop") {
+          sendResponse({ ok: false, error: "지원하지 않는 로컬 STT 서버 명령입니다." });
+          return;
+        }
+        const state = await enqueueAudioLifecycle(async () => {
+          if (message.action === "start") return startLocalSttServer(await loadSettings());
+          const tabId = activeAudioTabId;
+          if (tabId && getLocalSttServerState().state === "running") {
+            try {
+              if (usesNativeSttEndpoint(await loadSettings())) {
+                await notifyTab(tabId, { type: "PREPARE_AUDIO_STOP" });
+                await stopAudioCaptureInternal(tabId);
+              }
+            } catch (error) {
+              console.debug("Local STT capture cleanup failed", error);
+            }
+          }
+          return stopLocalSttServer();
+        });
+        sendResponse({ ok: true, ...state });
         return;
       }
 

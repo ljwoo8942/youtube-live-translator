@@ -1,5 +1,5 @@
 import { loadSettings } from "../shared/storage";
-import type { MessageResponse } from "../shared/messages";
+import type { LocalSttServerState, MessageResponse } from "../shared/messages";
 import type { ContentMode, InputMode, SttProvider, TranslationProvider, TranslatorSettings } from "../shared/types";
 import "./style.css";
 
@@ -86,6 +86,22 @@ function setStatus(text: string): void {
   if (node) {
     node.textContent = text;
   }
+}
+
+function localSttStatusText(state: LocalSttServerState): string {
+  if (state.state === "running") return `Qwen 서버 실행 중 · ${state.device} / ${state.computeType}`;
+  if (state.state === "starting") return "Qwen 서버를 시작하는 중입니다.";
+  return "이 확장에서 실행 중인 Qwen 서버가 없습니다.";
+}
+
+async function controlLocalSttServer(action: "start" | "stop"): Promise<void> {
+  if (action === "start" && !(await chrome.permissions.request({ permissions: ["nativeMessaging"] }))) {
+    throw new Error("Qwen 서버를 시작하려면 Chrome의 로컬 프로그램 연결 권한을 허용하세요.");
+  }
+  if (action === "start") setStatus("Qwen 모델을 불러오는 중입니다.");
+  const response = await chrome.runtime.sendMessage<MessageResponse<LocalSttServerState>>({ type: "LOCAL_STT_SERVER", action });
+  if (!response?.ok) throw new Error(response?.error ?? "Qwen 서버 응답을 받지 못했습니다.");
+  setStatus(localSttStatusText(response));
 }
 
 function closePopupAfterSuccess(): void {
@@ -288,6 +304,10 @@ function render(): void {
         <button id="stopAudio">음성 중지</button>
       </div>
       <div class="actions">
+        <button id="startLocalSttServer">Qwen 서버 시작</button>
+        <button id="stopLocalSttServer">Qwen 서버 중지</button>
+      </div>
+      <div class="actions">
         <button id="options">전체 설정</button>
         <button id="corrections">교정 사전</button>
       </div>
@@ -488,6 +508,13 @@ function render(): void {
     });
   });
 
+  document.querySelector("#startLocalSttServer")?.addEventListener("click", () => {
+    runAction(() => controlLocalSttServer("start"));
+  });
+  document.querySelector("#stopLocalSttServer")?.addEventListener("click", () => {
+    runAction(() => controlLocalSttServer("stop"));
+  });
+
   document.querySelector("#stopAudio")?.addEventListener("click", () => {
     runAction(async () => {
       const tab = await activeTab();
@@ -527,6 +554,16 @@ async function main(): Promise<void> {
     correctionCount = correctionStatus.count;
   }
   render();
+  if (currentTabIsYouTube) {
+    void chrome.runtime.sendMessage<MessageResponse<LocalSttServerState>>({ type: "LOCAL_STT_SERVER", action: "status" })
+      .then((response) => {
+        if (!actionPending && !popupClosing && response?.ok && response.state !== "stopped" &&
+            !document.querySelector("#status")?.textContent) {
+          setStatus(localSttStatusText(response));
+        }
+      })
+      .catch(() => undefined);
+  }
 }
 
 void main().catch((error) => {

@@ -11,12 +11,26 @@ declare namespace chrome {
       documentUrls?: string[];
     };
 
+    type Port = {
+      postMessage(message: unknown): void;
+      disconnect(): void;
+      onMessage: {
+        addListener(callback: (message: unknown) => void): void;
+        removeListener(callback: (message: unknown) => void): void;
+      };
+      onDisconnect: {
+        addListener(callback: () => void): void;
+        removeListener(callback: () => void): void;
+      };
+    };
+
     const id: string;
     const lastError: { message?: string } | undefined;
 
     function getURL(path: string): string;
     function openOptionsPage(): Promise<void>;
     function sendMessage<T = unknown>(message: unknown): Promise<T>;
+    function connectNative(application: string): Port;
     function getContexts(filter: ExtensionContext): Promise<unknown[]>;
 
     const onMessage: {

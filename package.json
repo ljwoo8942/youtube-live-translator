@@ -18,7 +18,8 @@
     "stt:dev": "npm run stt:start",
     "stt:health": "uv run --no-project --python .venv-stt python local_stt/health_check.py",
     "stt:qwen:download": "uv run --no-project --python .venv-stt python -m local_stt.qwen_backend",
-    "stt:test": "uv run --no-project --python .venv-stt python -m unittest local_stt.test_app local_stt.test_qwen_backend local_stt.test_setup_runtime"
+    "stt:native:install": "uv run --no-project --python .venv-stt python -m local_stt.native_host --install",
+    "stt:test": "uv run --no-project --python .venv-stt python -m unittest local_stt.test_app local_stt.test_qwen_backend local_stt.test_setup_runtime local_stt.test_native_host"
   },
   "devDependencies": {
     "typescript": "^5.8.3",

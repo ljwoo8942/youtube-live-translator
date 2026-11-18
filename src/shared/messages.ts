@@ -11,6 +11,10 @@ export type CaptionTranslationEntry = {
   translatedText: string;
 };
 
+export type LocalSttServerState =
+  | { state: "stopped" | "starting" }
+  | { state: "running"; model: string; device: string; computeType: string };
+
 export type RuntimeMessage =
   | { type: "CAPTION_SEGMENT"; segment: CaptionSegment }
   | { type: "TEST_TRANSLATION"; settings: TranslatorSettings; segment: CaptionSegment }
@@ -77,6 +81,7 @@ export type RuntimeMessage =
   | { type: "RESET_AUDIO_CAPTURE_BUFFER"; tabId?: number; videoId: string; target?: "offscreen" }
   | { type: "STOP_AUDIO_CAPTURE"; tabId?: number; videoId?: string; target?: "offscreen" }
   | { type: "GET_OFFSCREEN_AUDIO_STATE"; target?: "offscreen" }
+  | { type: "LOCAL_STT_SERVER"; action: "status" | "start" | "stop" }
   | { type: "AUDIO_CHUNK"; tabId: number; videoId: string; audioBase64: string; mimeType: string }
   | { type: "AUDIO_TRANSCRIPT"; tabId: number; videoId: string; segment: CaptionSegment }
   | { type: "STREAM_STT_TRANSCRIPT"; tabId: number; videoId: string; segment: CaptionSegment; isFinal: boolean }

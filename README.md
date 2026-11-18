@@ -105,7 +105,6 @@ npm ci
 npm run build
 npm run stt:setup
 npm run stt:qwen:download
-npm run stt:start
 ```
 
 확장 프로그램과 YouTube 페이지를 새로고침하고 전체 설정의 `로컬 STT 모델 (Whisper / Qwen) > 모델`에서 `Qwen3-ASR 0.6B` 또는 `Qwen3-ASR 1.7B`를 선택한 뒤 저장하세요. 라이브·노래 프리셋은 선택한 Qwen 모델을 유지합니다. 다운로드하지 않은 모델은 전사 요청에서 거부되며 준비 명령이 안내됩니다.
@@ -115,7 +114,7 @@ npm run stt:start
 | `qwen3-asr-0.6b` | `Qwen/Qwen3-ASR-0.6B-hf` / Transformers | `mlx-community/Qwen3-ASR-0.6B-8bit` / MLX GPU |
 | `qwen3-asr-1.7b` | `Qwen/Qwen3-ASR-1.7B-hf` / Transformers | `mlx-community/Qwen3-ASR-1.7B-8bit` / MLX GPU |
 
-서버의 시작 모델도 Qwen으로 바꾸려면 Mac에서 `YT_TRANSLATOR_STT_MODEL=qwen3-asr-0.6b npm run stt:start`를 사용하세요. Windows PowerShell에서는 `$env:YT_TRANSLATOR_STT_MODEL = 'qwen3-asr-0.6b'` 실행 후 `npm run stt:start`를 실행합니다. 1.7B도 같은 방식으로 지정합니다.
+터미널에서 직접 시작하려면 `npm run stt:start`를 사용하세요. 서버의 시작 모델도 Qwen으로 바꾸려면 Mac에서 `YT_TRANSLATOR_STT_MODEL=qwen3-asr-0.6b npm run stt:start`를 사용하세요. Windows PowerShell에서는 `$env:YT_TRANSLATOR_STT_MODEL = 'qwen3-asr-0.6b'` 실행 후 `npm run stt:start`를 실행합니다. 1.7B도 같은 방식으로 지정합니다.
 
 Windows에서 `npm run stt:setup`은 NVIDIA GPU를 감지하면 프로젝트 가상환경의 CPU 전용 PyTorch를 공식 `torch 2.15.0+cu132`로 교체하고 실제 CUDA FP16 연산까지 검사합니다. CUDA 13.2와 호환되는 NVIDIA 드라이버와 PyTorch가 지원하는 Turing(`sm_75`) 이상 GPU가 필요하며, 기존 서버를 종료한 뒤 설치 명령을 실행하세요. 패키지와 다운로드 캐시는 각각 `.venv-stt`, `.cache/uv`에 저장됩니다(이미 지정한 `UV_CACHE_DIR`은 유지). 모델 가중치는 CPU·GPU 공용이므로 다시 받을 필요가 없습니다.
 
@@ -124,6 +123,23 @@ GPU 없는 Windows와 명시적 CPU 설정은 기존 경로를 사용하고, App
 RTX 5070에서 두 모델의 실제 GPU 모델·입력·출력, HTTP·WebSocket 생성과 음성 인식을 확인했습니다. 명령과 검사 범위는 [Qwen CUDA 검증 기록](docs/qwen-cuda-validation.md)을 참고하세요.
 
 Qwen도 기존 HTTP 전사·WebSocket 롤링 오디오 창과 음성 감지, 텍스트 환각·반복 차단을 사용합니다. 결과 시간은 오디오 창의 범위이며 단어별 정렬 정보가 아닙니다. Whisper식 신뢰도 점수는 생성하지 않습니다. 네이티브 Qwen 스트리밍 상태 유지와 별도 강제 정렬 모델은 이번 연동에 포함하지 않았습니다.
+
+### 확장 팝업에서 Qwen 서버 시작·중지
+
+Windows와 Apple Silicon Mac에서는 Chrome Native Messaging 호스트를 한 번 등록하면 팝업에서 Qwen 서버를 켜고 끌 수 있습니다.
+
+1. `dist`를 Chrome에 로드하거나 이미 로드한 확장을 새로고침하세요. Chrome의 확장 프로그램 관리 화면에서 개발자 모드를 켜고 이 확장의 ID를 복사합니다.
+2. 프로젝트 폴더에서 다음 명령을 실행하세요. 예시 ID를 복사한 실제 ID로 바꿉니다.
+
+   ```bash
+   npm run stt:native:install -- abcdefghijklmnopabcdefghijklmnop
+   ```
+
+3. 전체 설정에서 `로컬 STT (Whisper / Qwen)`, 기본 STT 주소 `http://127.0.0.1:8765/v1` 및 준비된 Qwen 모델을 선택하고 저장하세요. 스트리밍을 켰다면 주소는 `ws://127.0.0.1:8765/v1/audio/stream`을 사용합니다.
+4. YouTube 탭에서 팝업의 `Qwen 서버 시작`을 누르고 첫 사용 시 Chrome의 로컬 프로그램 연결 권한을 허용하세요. 권한 창을 닫으며 팝업이 함께 닫혔다면 다시 열어 시작을 누르세요. 서버 실행 상태가 표시되면 `음성 시작`으로 탭 음성을 인식할 수 있습니다.
+5. 팝업의 `Qwen 서버 중지`는 이 확장에서 연 서버를 종료합니다. 팝업을 닫아도 서버는 유지되며, Chrome 종료나 확장 새로고침 시 함께 종료됩니다.
+
+이미 8765번에 서버가 실행 중이면 팝업에서 새 서버를 시작할 수 없습니다. 기존 서버를 사용하거나 원래 실행한 터미널에서 종료하세요. 프로젝트를 옮기거나 확장 ID가 바뀌면 호스트를 다시 등록하세요. 등록 범위는 현재 OS 사용자와 입력한 확장 ID입니다. [Chrome Native Messaging 문서](https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging)
 
 ## 로컬 AI 기본값
 
@@ -303,7 +319,8 @@ npm run stt:health
 | --- | --- |
 | 다른 사이트에서 버튼이 비활성화됨 | YouTube 전용 동작입니다. YouTube 영상 탭에서 팝업을 다시 여세요. |
 | 업데이트 후 이전 화면이 남음 | `npm run build` 후 확장 프로그램과 YouTube 페이지를 모두 새로고침하세요. |
-| STT 서버에 연결되지 않음 | `npm run stt:start` 터미널을 유지하고 `npm run stt:health`로 상태와 실제 장치를 확인하세요. |
+| STT 서버에 연결되지 않음 | 팝업의 `Qwen 서버 시작` 또는 `npm run stt:start`로 서버를 켠 뒤 `npm run stt:health`로 상태와 실제 장치를 확인하세요. |
+| Chrome 연결 프로그램을 등록하라는 메시지가 표시됨 | 확장 관리 화면에서 ID를 확인하고 `npm run stt:native:install -- 실제ID`를 실행하세요. |
 | 선택한 모델이 준비되지 않았다고 표시됨 | Qwen은 `npm run stt:qwen:download`, Whisper는 서버 시작 모델 지정 후 상태 확인으로 준비하고, 확장에서도 모델 선택 후 저장하세요. |
 | 외부 API가 연결되지 않음 | URL·엔드포인트·접근 권한·인증 방식을 확인하세요. 401/403이면 키와 제공자 권한도 확인하세요. |
 | 연결 테스트는 성공하지만 자막이 없음 | 테스트는 연결 검사입니다. YouTube에서 확장 켜기, 입력 방식, 재생 상태와 탭 캡처 권한을 확인하세요. |

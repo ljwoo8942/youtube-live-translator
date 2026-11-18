@@ -27,7 +27,8 @@
     "tabs"
   ],
   "optional_permissions": [
-    "tabCapture"
+    "tabCapture",
+    "nativeMessaging"
   ],
   "host_permissions": [
     "https://www.youtube.com/*",

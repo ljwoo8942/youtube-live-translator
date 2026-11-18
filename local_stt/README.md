@@ -38,6 +38,8 @@ npm run stt:daemon
 
 The first `/health` request loads and probes the selected engine's model. The default model is `small`. Transcription requests can also pass a `model` form field, so choosing another model in the extension loads it when it is cached locally. Set `YT_TRANSLATOR_STT_MODEL` before starting the server to prepare a new model or select a local model directory.
 
+For cached Qwen models, the [extension popup can also start and stop the server](../README.md#확장-팝업에서-qwen-서버-시작중지) after you register the Native Messaging host for your Chrome extension ID. That server binds to `127.0.0.1:8765` and runs with the Chrome connection for its lifetime. An existing listener on the port keeps running.
+
 Device selection is automatic: native Apple Silicon macOS uses MLX Metal GPU, and Windows selects CUDA when available and CPU otherwise. CUDA inference also requires the selected engine's GPU runtime. Qwen falls back to CPU if its PyTorch build cannot use CUDA; check `device`, `backend`, and `compute_type` in `/health`.
 
 Default `small` Whisper settings for ordinary speech:
