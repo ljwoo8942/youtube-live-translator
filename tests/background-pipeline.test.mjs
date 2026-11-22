@@ -16,6 +16,13 @@ function functions(path, names, context) {
   return context;
 }
 
+test("lyric streaming uses the selected language and leaves automatic language detection available", () => {
+  const { streamUrl } = functions("src/offscreen/index.ts", ["streamUrl"], { URL });
+  const config = { endpoint: "ws://127.0.0.1:8765/v1/audio/stream", contentMode: "lyrics", model: "qwen3-asr-1.7b" };
+  assert.equal(new URL(streamUrl({ ...config, sourceLanguage: "ja" })).searchParams.get("language"), "ja");
+  assert.equal(new URL(streamUrl({ ...config, sourceLanguage: "auto" })).searchParams.get("language"), null);
+});
+
 function streamHarness() {
   const pending = [], sent = [];
   const context = functions("src/background/index.ts", ["translateStreamSegment", "translateQueuedStreamSegment", "audioRequestController"], {

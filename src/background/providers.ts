@@ -1027,6 +1027,8 @@ async function translateWithOpenAiCompatible(
   const maxTokens = maxSubtitleTokensForConfig(text, config);
   const temperature = translationTemperature(settings, config);
   const topP = topPForConfig(settings, config);
+  const localGemma4 = settings.translationProvider === "lmStudio" &&
+    isLocalBaseUrl(config.baseUrl) && /(?:^|\/)gemma[-_]?4(?:[-_.]|$)/i.test(config.model);
   const url =
     config.endpointMode === "responses" ? joinOpenAiUrl(config.baseUrl, "/responses") : joinOpenAiUrl(config.baseUrl, "/chat/completions");
   const body =
@@ -1050,6 +1052,7 @@ async function translateWithOpenAiCompatible(
           temperature,
           top_p: topP,
           max_tokens: maxTokens,
+          ...(localGemma4 ? { reasoning_effort: "none" } : {}),
           stream: false
         };
 
@@ -1419,8 +1422,7 @@ async function transcribeOpenAiCompatible(config: {
   form.append("response_format", "json");
   form.append("temperature", "0");
   form.append("prompt", transcriptionPrompt(config.contentMode));
-  const mixedLanguageAudio = config.contentMode === "lyrics";
-  if (config.sourceLanguage && config.sourceLanguage !== "auto" && !mixedLanguageAudio) {
+  if (config.sourceLanguage && config.sourceLanguage !== "auto") {
     form.append("language", config.sourceLanguage);
   }
   if (config.contentMode && isLocalBaseUrl(config.baseUrl)) {

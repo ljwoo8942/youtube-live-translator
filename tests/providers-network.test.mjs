@@ -31,6 +31,47 @@ test("local STT HTTP checks and uploads identify extension requests without addi
   assert.deepEqual(requests.map((request) => request.extensionRequest), ["1", "1", null]);
 });
 
+test("local LM Studio Gemma 4 returns subtitle text with reasoning disabled", async (t) => {
+  const settings = settingsFor("lmStudio");
+  settings.lmStudio.model = "gemma4-e4b-instruct-pure";
+  settings.lmStudio.endpointMode = "chat";
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    const body = JSON.parse(init.body);
+    requests.push({ url, body });
+    return Response.json({
+      choices: [body.reasoning_effort === "none"
+        ? { finish_reason: "stop", message: { content: "오늘도 맑아." } }
+        : { finish_reason: "length", message: { content: "", reasoning_content: "thinking" } }]
+    });
+  });
+
+  const result = await translateSegment(settings, segment);
+  assert.equal(result.translatedText, "오늘도 맑아.");
+  const batch = await translateSegments(settings, segments);
+  assert.equal(batch.translations.length, 2);
+  assert.equal(requests.length, 3);
+  for (const { url, body } of requests) {
+    assert.match(url, /\/chat\/completions$/);
+    assert.equal(body.reasoning_effort, "none");
+  }
+});
+
+test("lyric transcription uses the selected language and leaves automatic language detection available", async (t) => {
+  const languages = [];
+  t.mock.method(globalThis, "fetch", async (_, init) => {
+    languages.push(init.body.get("language"));
+    return Response.json({ text: "こんにちは" });
+  });
+  const settings = settingsFor("whisper", "stt");
+  settings.contentMode = "lyrics";
+  settings.sourceLanguage = "ja";
+  await transcribeAudio(settings, audio, "audio/webm");
+  settings.sourceLanguage = "auto";
+  await transcribeAudio(settings, audio, "audio/webm");
+  assert.deepEqual(languages, ["ja", null]);
+});
+
 function settingsFor(provider, kind = "translation") {
   const settings = structuredClone(DEFAULT_SETTINGS);
   settings.openai.apiKey = "test-key";

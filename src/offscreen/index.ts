@@ -172,8 +172,7 @@ function streamUrl(config: StreamingConfig): string | undefined {
     if (config.model) {
       url.searchParams.set("model", config.model);
     }
-    const mixedLanguageAudio = config.contentMode === "lyrics";
-    if (config.sourceLanguage && config.sourceLanguage !== "auto" && !mixedLanguageAudio) {
+    if (config.sourceLanguage && config.sourceLanguage !== "auto") {
       url.searchParams.set("language", config.sourceLanguage);
     }
     if (config.contentMode) {
