@@ -2,6 +2,8 @@
 
 [한국어](user-guide.ko.md) · [English](user-guide.en.md) · [日本語](user-guide.ja.md) · [Project README](../README.md)
 
+> This is an independent, unofficial Chrome extension. It is not an official service of YouTube or NAVER CHZZK and is not affiliated with or endorsed by either platform.
+
 Start with a YouTube video that has creator-provided captions. You only need a translation API for this first test. For CHZZK or YouTube videos without official captions, follow the audio setup below.
 
 ## 1. Install the extension from source
@@ -89,3 +91,5 @@ Open **Correction dictionary (교정 사전)** in the popup, or **Song correctio
 - Providers can charge for requests, including tests and background caption pre-translation. Local STT keeps speech processing local, but translation still goes to the cloud if you leave AI API selected. Local models may require an initial download.
 
 For advanced configuration and diagnostics, see the [Advanced guide (Korean)](advanced-guide.ko.md).
+
+License: [MIT License](../LICENSE)
