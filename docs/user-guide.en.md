@@ -52,7 +52,9 @@ npm run stt:setup
 npm run stt:start
 ```
 
-Leave the terminal open. In full settings, use **Local STT + translation API preset (로컬 STT + 번역 API 프리셋)**, check the translation credentials and selected model, and use **Check local STT connection (로컬 STT 연결 확인)** or **Test local STT + translation (로컬 STT + 번역 연결 테스트)**. Save, then start audio from the video tab as above. For preparing Whisper or Qwen models, connecting LM Studio or Ollama for local translation, or controlling the local server from the popup, see the [Advanced guide (Korean)](advanced-guide.ko.md).
+Leave the terminal open. In full settings, use **Local STT + translation API preset (로컬 STT + 번역 API 프리셋)**, check the translation credentials and selected model, and use **Check local STT connection (로컬 STT 연결 확인)** or **Test local STT + translation (로컬 STT + 번역 연결 테스트)**. Save, then start audio from the video tab as above. The advanced guide covers Whisper and Qwen model preparation, Ollama, and popup server controls. [Advanced guide (Korean)](advanced-guide.ko.md)
+
+For local translation as well as local speech recognition, connect Gemma 4 through LM Studio. The settings guide also gives the Qwen 1.7B and 14-second HTTP setup tested on a fast Japanese song. [LM Studio settings guide](lm-studio-settings.en.md)
 
 ## 4. Update and reload
 

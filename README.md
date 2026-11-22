@@ -24,6 +24,8 @@ YouTube と CHZZK のライブ配信・アーカイブに翻訳字幕を表示�
 
 [고급 설정 및 기술 참고서 (한국어 / Korean / 韓国語)](docs/advanced-guide.ko.md) · [Local STT server (English)](local_stt/README.md)
 
+LM Studio · Gemma 4 설정 / Setup / 設定 [한국어](docs/lm-studio-settings.md) · [English](docs/lm-studio-settings.en.md) · [日本語](docs/lm-studio-settings.ja.md)
+
 ## 곡 교정 사전
 
 [곡 교정 사전 설정과 백업](docs/advanced-guide.ko.md#곡-교정-사전)
