@@ -182,6 +182,7 @@ const PROBABLE_AUDIO_HALLUCINATION_KEYS = new Set([
   "请不吝点赞订阅转发打赏支持明镜与点点栏目"
 ]);
 const PROBABLE_AUDIO_PROMPT_LEAK_PARTS = [
+  "ラララああwowyeahbaby",
   "transcribesungvocals",
   "transcribethemasheard",
   "donotforcetheminto",
@@ -1609,17 +1610,21 @@ function shouldStopCaptureAfterApiError(error: string): boolean {
   );
 }
 
-function clearAudioQueue(tabId: number): void {
+function cancelAudioWork(tabId: number): void {
   audioRequestControllers.get(tabId)?.abort();
   audioRequestControllers.delete(tabId);
   streamTranslationQueuesByTab.get(tabId)?.controller.abort();
   streamTranslationQueuesByTab.delete(tabId);
   audioQueues.delete(tabId);
-  audioFailureCooldowns.delete(tabId);
-  audioNoSpeechNotices.delete(tabId);
   audioLastProcessedAt.delete(tabId);
   lastFinalTranscriptByTab.delete(tabId);
   lastPartialTranslationByTab.delete(tabId);
+}
+
+function clearAudioQueue(tabId: number): void {
+  cancelAudioWork(tabId);
+  audioFailureCooldowns.delete(tabId);
+  audioNoSpeechNotices.delete(tabId);
   audioContextByTab.delete(tabId);
   lyricsAssistByTab.delete(tabId);
   correctionSessionsByTab.delete(tabId);
@@ -2777,9 +2782,11 @@ async function processAudioChunk(message: Extract<RuntimeMessage, { type: "AUDIO
 }
 
 async function processStreamTranscript(message: Extract<RuntimeMessage, { type: "STREAM_STT_TRANSCRIPT" }>): Promise<void> {
+  if (!isActiveAudioSession(message.tabId, message.videoId)) return;
+  const { signal } = audioRequestController(message.tabId);
   const { settings, translationConfigRevision } = await loadSettingsSnapshot();
   lastTranslationConfigRevision ??= translationConfigRevision;
-  if (!settings.enabled || message.tabId !== activeAudioTabId || message.videoId !== activeAudioVideoId) {
+  if (!settings.enabled || signal.aborted || !isActiveAudioSession(message.tabId, message.videoId)) {
     return;
   }
   const sanitizedText = sanitizeAudioTranscript(
@@ -2802,8 +2809,11 @@ async function processStreamTranscript(message: Extract<RuntimeMessage, { type: 
   }
 
   if (!message.isFinal) {
+    if (settings.contentMode === "lyrics" || segment.detectedContentMode === "lyrics") {
+      return;
+    }
     await notifyTab(message.tabId, { ...message, segment });
-    if (shouldTranslateStreamPartial(message.tabId, segment)) {
+    if (!signal.aborted && shouldTranslateStreamPartial(message.tabId, segment)) {
       await translateStreamSegment(message.tabId, message.videoId, segment, false, translationConfigRevision);
     }
     return;
@@ -2826,7 +2836,9 @@ async function processStreamTranscript(message: Extract<RuntimeMessage, { type: 
 
   await notifyTab(message.tabId, { type: "AUDIO_TRANSCRIPT", tabId: message.tabId, videoId: message.videoId, segment });
 
-  await translateStreamSegment(message.tabId, message.videoId, segment, true, translationConfigRevision);
+  if (!signal.aborted) {
+    await translateStreamSegment(message.tabId, message.videoId, segment, true, translationConfigRevision);
+  }
 }
 
 function shouldTranslateStreamPartial(tabId: number, segment: CaptionSegment): boolean {
@@ -3087,7 +3099,7 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
           sendResponse({ ok: true });
           return;
         }
-        clearAudioQueue(tabId);
+        cancelAudioWork(tabId);
         const response = await chrome.runtime.sendMessage<MessageResponse>({
           type: "RESET_AUDIO_CAPTURE_BUFFER",
           target: "offscreen",

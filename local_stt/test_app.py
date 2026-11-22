@@ -252,7 +252,67 @@ class ModeConfigurationTests(unittest.TestCase):
         self.assertEqual(app._beam_size_for_mode("lyrics", "medium"), app.LYRICS_BEAM_SIZE)
         self.assertGreaterEqual(app.LYRICS_BEAM_SIZE, 5)
         self.assertTrue(app.LYRICS_INITIAL_PROMPT)
-        self.assertGreaterEqual(app.LYRICS_STREAM_OVERLAP_SECONDS, 3.0)
+
+    def test_streaming_only_retries_without_vad_when_enabled(self) -> None:
+        audio = np.full(32000, 0.1, dtype=np.float32)
+        for retry in (False, True):
+            with (
+                self.subTest(retry=retry),
+                mock.patch.object(app, "DEFAULT_VAD", True),
+                mock.patch.object(app, "EMPTY_RETRY_NO_VAD", retry),
+                mock.patch.object(
+                    app, "_transcribe_audio",
+                    side_effect=[([], None, True), ([SimpleNamespace(text="The sky is light.")], None, False)],
+                ) as transcribe,
+            ):
+                text, _, _ = app._stream_transcribe_text(object(), audio, "en", "spoken")
+                self.assertEqual(text, "The sky is light." if retry else "")
+                self.assertEqual(transcribe.call_count, 2 if retry else 1)
+
+    def test_lyrics_websocket_discards_finalized_audio_during_interlude(self) -> None:
+        profile = app._stream_profile_for_model("lyrics", "qwen3-asr-1.7b")
+        headers = {"Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop"}
+
+        def infer(_model: object, audio: np.ndarray, *_args: object) -> tuple[str, bool, int]:
+            level = float(np.max(audio)) * 32768
+            text = "次の歌詞が始まる。" if level >= 9000 else "青い空を見上げる。" if level >= 6000 else ""
+            return text, False, 1
+
+        with (
+            mock.patch.object(app, "_load_model", return_value=object()),
+            mock.patch.object(app, "_stream_profile_for_model", return_value=(profile[0], 0, 0.1, profile[3], profile[4])),
+            mock.patch.object(app, "_startup_stream_timing", return_value=(0.1, 100)),
+            mock.patch.object(app, "_stream_transcribe_text", side_effect=infer),
+            TestClient(app.app).websocket_connect(
+                "/v1/audio/stream?content_mode=lyrics&model=qwen3-asr-1.7b", headers=headers
+            ) as socket,
+        ):
+            for expected in ("partial", "final"):
+                socket.send_bytes(np.full(3200, 6000, dtype="<i2").tobytes())
+                self.assertEqual(socket.receive_json()["type"], expected)
+            socket.send_bytes(np.full(3200, 1000, dtype="<i2").tobytes())
+            self.assertEqual(socket.receive_json()["type"], "status")
+            socket.send_bytes(np.full(3200, 9000, dtype="<i2").tobytes())
+            result = socket.receive_json()
+            self.assertEqual(result["type"], "partial")
+            self.assertEqual(result["text"], "次の歌詞が始まる。")
+
+    def test_short_qwen_lyrics_require_agreement_without_prompt_examples(self) -> None:
+        t = np.arange(32000, dtype=np.float32) / app.STREAM_SAMPLE_RATE
+        audio = 0.1 * np.sin(2 * np.pi * 440 * t)
+        for unprompted, expected in [("Oh, oh.", ""), ("Baby!", "Baby.")]:
+            with self.subTest(unprompted=unprompted):
+                model = mock.Mock()
+                model.transcribe.side_effect = [
+                    ([SimpleNamespace(text="Baby.")], None),
+                    ([SimpleNamespace(text=unprompted)], None),
+                ]
+                text, _, _ = app._stream_transcribe_text(
+                    model, audio, "en", "lyrics", model_name="qwen3-asr-1.7b", check_short_lyrics=True
+                )
+                self.assertEqual(text, expected)
+                self.assertTrue(model.transcribe.call_args_list[0].kwargs["initial_prompt"])
+                self.assertIsNone(model.transcribe.call_args_list[1].kwargs["initial_prompt"])
 
     def test_live_uses_permissive_vad_without_releasing_language(self) -> None:
         model = FakeWhisperModel()
@@ -299,6 +359,12 @@ class ModeConfigurationTests(unittest.TestCase):
         self.assertTrue(app._is_probable_hallucination("日本語の歌詞。日本語の歌詞。"))
         self.assertTrue(app._is_probable_hallucination("Thank you very much."))
 
+    def test_old_lyric_prompt_example_is_filtered_without_dropping_genuine_hooks(self) -> None:
+        example = "ラララ、ああ、wow、yeah、baby。"
+        self.assertTrue(app._is_probable_hallucination(example))
+        self.assertNotIn(app._speech_key(example), app._speech_key(app.DEFAULT_LYRICS_INITIAL_PROMPT))
+        self.assertFalse(app._is_probable_hallucination("ラララ、君と歌う。Wow, baby!"))
+
     def test_japanese_log_text_is_safe_for_windows_korean_codepage(self) -> None:
         logged = app._safe_log_text("ご視聴ありがとうございました", 80)
 
@@ -312,7 +378,8 @@ class ModeConfigurationTests(unittest.TestCase):
         small_profile = app._stream_profile_for_model("lyrics", "small")
         medium_profile = app._stream_profile_for_model("lyrics", "medium")
         self.assertGreater(small_profile[0], medium_profile[0])
-        self.assertGreater(small_profile[4], medium_profile[4])
+        self.assertEqual(small_profile[4], medium_profile[4])
+        self.assertEqual(small_profile[4], 0.0)
         self.assertGreater(
             app._no_speech_threshold_for_mode("live", "small"),
             app._no_speech_threshold_for_mode("live", "medium"),
@@ -334,7 +401,7 @@ class ModeConfigurationTests(unittest.TestCase):
         self.assertGreaterEqual(base_profile[0], 12.0)
         self.assertGreaterEqual(base_profile[2], 2.8)
         self.assertGreaterEqual(base_profile[3], 3.4)
-        self.assertGreaterEqual(base_profile[4], 2.6)
+        self.assertEqual(base_profile[4], 0.0)
         self.assertLess(base_profile[0], small_profile[0])
         self.assertLess(base_profile[2], small_profile[2])
         self.assertLess(base_profile[3], small_profile[3])

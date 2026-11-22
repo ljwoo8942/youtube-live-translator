@@ -312,6 +312,16 @@ function videoPlaybackEnded(): boolean {
   );
 }
 
+function resetPausedAudioBuffer(event: Event): void {
+  const video = findVideoElement();
+  if (event.target !== video || !video?.paused || !audioCaptureRequested || audioStopRequested || !activeVideoId) {
+    return;
+  }
+  void chrome.runtime.sendMessage({ type: "RESET_AUDIO_CAPTURE_BUFFER", videoId: activeVideoId }).catch((error) => {
+    console.debug("Paused audio buffer reset failed", error);
+  });
+}
+
 function shouldAcceptAudioSegment(segment?: CaptionSegment): boolean {
   if (segment?.source !== "audioStt") {
     return true;
@@ -322,6 +332,7 @@ function shouldAcceptAudioSegment(segment?: CaptionSegment): boolean {
       audioCaptureRequested &&
       !audioStopRequested &&
       !audioCaptureSuppressed &&
+      !findVideoElement()?.paused &&
       currentWatchVideoId() &&
       settings.inputMode !== "captions" &&
       (settings.inputMode === "audio" || timedTextSegments.length === 0)
@@ -1464,6 +1475,7 @@ function installObservers(): void {
     },
     true
   );
+  document.addEventListener("pause", resetPausedAudioBuffer, true);
   document.addEventListener("yt-navigate-finish", resyncVideoSessionAfterNavigation);
   document.addEventListener("yt-page-data-updated", resyncVideoSessionAfterNavigation);
   document.addEventListener("yt-player-updated", resyncVideoSessionAfterNavigation);

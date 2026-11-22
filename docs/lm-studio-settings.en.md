@@ -74,7 +74,7 @@ If the LM Studio server requires authentication, enter its token in **API token 
 2. Enable **Use local STT WebSocket streaming (로컬 STT WebSocket 스트리밍 사용)**, set **Streaming STT WebSocket (스트리밍 STT WebSocket)** to `ws://127.0.0.1:8765/v1/audio/stream`, and save.
 3. Start the LM Studio server with Gemma loaded and start the local STT server. In the video tab’s popup, click **Start audio (음성 시작)**. [Local STT server setup](../local_stt/README.md)
 
-The extension shows a provisional translation once it has enough speech text and updates the subtitle when recognition is final. Enable **Show original text (원문도 표시)** in the overlay settings to see both lines. If the WebSocket connection fails, the extension switches to HTTP transcription. To use the 14-second setup for songs, turn streaming off as shown below.
+For ordinary speech, the extension shows a provisional translation once it has enough text and updates the subtitle when recognition is final. **Songs and lyrics (노래/가사)** mode displays confirmed results. Enable **Show original text (원문도 표시)** in the overlay settings to see both lines. If the WebSocket connection fails, the extension switches to HTTP transcription. To use the 14-second setup for songs, turn streaming off as shown below.
 
 These Windows RTX 5070 measurements used preloaded models and synthetic English speech sent at playback speed. The times run from the start of the audio input to the local `gemma4-e4b-instruct-pure` translation result.
 

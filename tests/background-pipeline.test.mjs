@@ -27,12 +27,13 @@ function streamHarness(settings = { enabled: true }) {
   const pending = [], sent = [];
   const context = functions("src/background/index.ts", [
     "audioTransportConfig", "processStreamTranscript", "shouldTranslateStreamPartial", "normalizeText",
-    "translateStreamSegment", "translateQueuedStreamSegment", "audioRequestController"
+    "translateStreamSegment", "translateQueuedStreamSegment", "audioRequestController", "isActiveAudioSession"
   ], {
     AbortController, AbortSignal, streamTranslationQueuesByTab: new Map(), audioRequestControllers: new Map(),
     activeAudioTabId: 1, activeAudioVideoId: "v",
     lastTranslationConfigRevision: undefined, lastPartialTranslationByTab: new Map(), lastFinalTranscriptByTab: new Map(),
     lyricsAssistByTab: new Map(), sanitizeAudioTranscript: (text) => text, assistLyricsSegment: (_, segment) => segment,
+    notifyLyricsAssistStatus() {},
     STREAM_PARTIAL_TRANSLATION_MIN_CHARACTERS: 5, STREAM_PARTIAL_TRANSLATION_MIN_INTERVAL_MS: 1250,
     MIN_STABLE_AUDIO_CHUNK_MS: 8000,
     loadSettingsSnapshot: async () => ({ settings, translationConfigRevision: 1 }),
@@ -50,19 +51,91 @@ function streamHarness(settings = { enabled: true }) {
 const segment = (id) => ({ id, text: `speech ${id}`, source: "audioStt", startMs: 0, endMs: 1000 });
 const result = (text) => ({ ok: true, translatedText: text, provider: "test" });
 
+test("legacy STT lyric examples are blocked before translation", () => {
+  const source = readFileSync(new URL("../src/background/index.ts", import.meta.url), "utf8");
+  const [, parts] = source.match(/^const PROBABLE_AUDIO_PROMPT_LEAK_PARTS = (\[[\s\S]*?\]);/m);
+  const c = functions("src/background/index.ts", ["speechKey", "isProbableAudioHallucination"], {
+    PROBABLE_AUDIO_HALLUCINATION_KEYS: new Set(),
+    PROBABLE_AUDIO_PROMPT_LEAK_PARTS: vm.runInNewContext(parts),
+    isProbableCreditHallucination: () => false
+  });
+  assert.equal(c.isProbableAudioHallucination("ラララ、ああ、wow、yeah、baby。"), true);
+  assert.equal(c.isProbableAudioHallucination("ラララ、君と歌う。Wow, baby!"), false);
+});
+
+test("pausing the current video resets its buffer and blocks audio subtitles until resume", async () => {
+  const video = { paused: false };
+  const sent = [];
+  const c = functions("src/content/index.ts", ["shouldAcceptAudioSegment", "resetPausedAudioBuffer"], {
+    settings: { enabled: true, inputMode: "audio" },
+    activeVideoId: "v",
+    audioCaptureRequested: true, audioStopRequested: false, audioCaptureSuppressed: false,
+    findVideoElement: () => video, currentWatchVideoId: () => "v",
+    chrome: { runtime: { sendMessage: async (message) => { sent.push(message); } } }
+  });
+  assert.equal(c.shouldAcceptAudioSegment(segment("before pause")), true);
+  video.paused = true;
+  c.resetPausedAudioBuffer({ target: { paused: true } });
+  c.resetPausedAudioBuffer({ target: video });
+  await setImmediate();
+  assert.deepEqual(sent.map((message) => [message.type, message.videoId]), [["RESET_AUDIO_CAPTURE_BUFFER", "v"]]);
+  assert.equal(c.shouldAcceptAudioSegment(segment("late result")), false);
+  assert.equal(c.shouldAcceptAudioSegment({ source: "officialCaption" }), true);
+  video.paused = false;
+  assert.equal(c.shouldAcceptAudioSegment(segment("after resume")), true);
+});
+
+test("a recorder chunk that finishes encoding after reset is discarded", async () => {
+  const sent = [];
+  let finishEncoding;
+  const c = functions("src/offscreen/index.ts", ["sendAudioBlob", "discardActiveRecorder"], {
+    recorderRevision: 0, mediaRecorder: undefined, cyclingRecorder: false,
+    clearChunkTimer() {},
+    blobToBase64: () => new Promise((resolve) => { finishEncoding = resolve; }),
+    chrome: { runtime: { sendMessage: async (message) => { sent.push(message); } } }
+  });
+  const blob = { size: 3, type: "audio/webm" };
+  const oldChunk = c.sendAudioBlob(blob, blob.type, 1, "v", 0);
+  c.discardActiveRecorder();
+  finishEncoding("AQID");
+  await oldChunk;
+  assert.equal(sent.length, 0);
+
+  const newChunk = c.sendAudioBlob(blob, blob.type, 1, "v", c.recorderRevision);
+  finishEncoding("BAUG");
+  await newChunk;
+  assert.equal(sent[0].audioBase64, "BAUG");
+});
+
+test("a delayed stream notification cannot start a translation after its buffer was reset", async () => {
+  const { context: c, pending } = streamHarness();
+  let finishNotification;
+  c.notifyTab = () => new Promise((resolve) => { finishNotification = resolve; });
+  const processing = c.processStreamTranscript({
+    type: "STREAM_STT_TRANSCRIPT", tabId: 1, videoId: "v", segment: segment("old buffer"), isFinal: true
+  });
+  await setImmediate();
+  c.audioRequestControllers.get(1)?.abort();
+  c.audioRequestControllers.delete(1);
+  finishNotification();
+  await setImmediate();
+  assert.equal(pending.length, 0);
+  await processing;
+});
+
 for (const [model, translationProvider] of [
   ["qwen3-asr-0.6b", "ollama"], ["qwen3-asr-1.7b", "lmStudio"], ["base", "lmStudio"], ["small", "ollama"]
 ]) {
   test(`${model} sends a provisional ${translationProvider} translation and then its final subtitle`, async () => {
     const settings = {
       enabled: true, sttProvider: "whisper", whisper: { model }, audioChunkMs: 8000,
-      contentMode: "lyrics", streamingSttEnabled: true, translationProvider
+      contentMode: "spoken", streamingSttEnabled: true, translationProvider
     };
     const { context: c, pending, sent } = streamHarness(settings);
     const transport = c.audioTransportConfig(settings);
     assert.equal(transport.useStreaming, true);
     assert.equal(transport.streamingSttModel, model);
-    const http = c.audioTransportConfig({ ...settings, streamingSttEnabled: false });
+    const http = c.audioTransportConfig({ ...settings, contentMode: "lyrics", streamingSttEnabled: false });
     assert.equal(http.useStreaming, false);
     assert.equal(http.audioChunkMs, 14000);
 
@@ -86,6 +159,27 @@ for (const [model, translationProvider] of [
     ]);
   });
 }
+
+test("lyrics wait for confirmed recognition before displaying or translating a subtitle", async () => {
+  for (const contentMode of ["lyrics", "auto"]) {
+    const { context: c, pending, sent } = streamHarness({ enabled: true, contentMode, translationProvider: "lmStudio" });
+    const line = contentMode === "auto"
+      ? { ...segment("guessed lyric"), detectedContentMode: "lyrics" }
+      : segment("guessed lyric");
+    const message = { type: "STREAM_STT_TRANSCRIPT", tabId: 1, videoId: "v", segment: line, isFinal: false };
+    void c.processStreamTranscript(message);
+    await setImmediate();
+    assert.equal(sent.length, 0);
+    assert.equal(pending.length, 0);
+
+    const confirmed = c.processStreamTranscript({ ...message, isFinal: true });
+    await setImmediate();
+    assert.equal(pending.length, 1);
+    pending[0].resolve(result("확정 가사"));
+    await confirmed;
+    assert.equal(sent.at(-1).translatedText, "확정 가사");
+  }
+});
 
 test("audio start accepts CHZZK playback and rejects a listing, stale video ID or unrelated origin", async () => {
   let url = "https://chzzk.naver.com/video/123456?from=live";

@@ -81,7 +81,8 @@ When the extension sends `content_mode=lyrics`, the server switches to a song-fr
 - stream window: `14s`
 - stream decode interval: `1.2s`
 - minimum audio before decode: `2.4s`
-- overlap after finalized text: `3s`
+- the next window starts after the finalized audio and retains samples received during inference
+- Qwen checks short lyric candidates without the prompt before returning an HTTP result or confirming a streaming result
 - the server preserves an explicitly supplied language; an omitted language or `auto` enables automatic detection
 - deterministic decoding and a more permissive no-speech threshold
 

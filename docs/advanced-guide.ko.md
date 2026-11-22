@@ -286,7 +286,7 @@ npm run stt:health
 - `로컬 STT 연결 확인` 클릭
 - `로컬 STT + 번역 연결 테스트`로 로컬 STT와 번역 제공자 연결을 함께 확인
 
-로컬 프리셋은 `로컬 STT WebSocket 스트리밍 사용`을 활성화합니다. Qwen과 Whisper 모두 중간 인식 결과를 번역에 보내고, 인식이 확정되면 자막을 갱신합니다. LM Studio와 Ollama로도 중간 결과를 번역할 수 있습니다. WebSocket 스트림에 실패하면 선택한 Whisper 호환 제공자의 HTTP 전사 청크 방식으로 전환합니다. 클라우드 API STT를 사용하려면 STT 제공자를 `OpenAI-compatible`로 직접 선택하세요. `LM Studio STT 먼저 시도`를 선택한 경우에는 실패 시 설정된 Whisper 호환 제공자로 대체합니다.
+로컬 프리셋은 `로컬 STT WebSocket 스트리밍 사용`을 활성화합니다. Qwen과 Whisper는 일반 음성의 중간 결과를 LM Studio 또는 Ollama로도 번역할 수 있습니다. `노래/가사` 모드는 확정된 결과부터 표시하며, 다음 전사 창은 이미 확정에 사용한 오디오 이후부터 시작합니다. WebSocket 스트림에 실패하면 선택한 Whisper 호환 제공자의 HTTP 전사 청크 방식으로 전환합니다. 클라우드 API STT를 사용하려면 STT 제공자를 `OpenAI-compatible`로 직접 선택하세요. `LM Studio STT 먼저 시도`를 선택한 경우에는 실패 시 설정된 Whisper 호환 제공자로 대체합니다.
 
 기존 백그라운드 실행 방식을 의도적으로 사용하려면 `npm run stt:daemon`을 실행할 수 있지만, 안정적인 기본 경로는 포그라운드의 `npm run stt:start`입니다.
 

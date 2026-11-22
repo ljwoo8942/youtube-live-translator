@@ -92,9 +92,10 @@ LYRICS_STREAM_WINDOW_SECONDS = float(os.environ.get("YT_TRANSLATOR_STT_LYRICS_ST
 LYRICS_STREAM_DECODE_INTERVAL_SECONDS = float(os.environ.get("YT_TRANSLATOR_STT_LYRICS_STREAM_DECODE_INTERVAL_SECONDS", "1.2"))
 LYRICS_STREAM_MIN_AUDIO_SECONDS = float(os.environ.get("YT_TRANSLATOR_STT_LYRICS_STREAM_MIN_AUDIO_SECONDS", "2.4"))
 LYRICS_STREAM_FINAL_INTERVAL_SECONDS = float(os.environ.get("YT_TRANSLATOR_STT_LYRICS_STREAM_FINAL_INTERVAL_SECONDS", "3.0"))
-LYRICS_STREAM_OVERLAP_SECONDS = float(os.environ.get("YT_TRANSLATOR_STT_LYRICS_STREAM_OVERLAP_SECONDS", "3.0"))
-DEFAULT_LYRICS_INITIAL_PROMPT = "日本語の歌詞。ボーカロイドの早口、英語フック、擬音、ラララ、ああ、wow、yeah、baby。"
+LYRICS_STREAM_OVERLAP_SECONDS = 0.0  # Retained singing can seed subtitles during an instrumental break.
+DEFAULT_LYRICS_INITIAL_PROMPT = "日本語の歌詞。ボーカロイドの早口、英語フック、擬音。"
 LYRICS_INITIAL_PROMPT = os.environ.get("YT_TRANSLATOR_STT_LYRICS_INITIAL_PROMPT", "").strip() or DEFAULT_LYRICS_INITIAL_PROMPT
+SHORT_LYRIC_HYPOTHESIS_MAX_CHARACTERS = 8
 LIVE_INITIAL_PROMPT = os.environ.get("YT_TRANSLATOR_STT_LIVE_INITIAL_PROMPT", "").strip() or None
 LYRICS_NO_SPEECH_THRESHOLD = float(os.environ.get("YT_TRANSLATOR_STT_LYRICS_NO_SPEECH_THRESHOLD", "0.92"))
 LIVE_NO_SPEECH_THRESHOLD = float(os.environ.get("YT_TRANSLATOR_STT_LIVE_NO_SPEECH_THRESHOLD", "0.72"))
@@ -160,6 +161,7 @@ PROBABLE_HALLUCINATION_KEYS = {
     "请不吝点赞订阅转发打赏支持明镜与点点栏目",
 }
 PROMPT_LEAK_KEY_PARTS = {
+    "ラララああwowyeahbaby",
     "transcribesungvocals",
     "transcribethemasheard",
     "donotforcetheminto",
@@ -504,9 +506,9 @@ def _stream_profile_for_model(content_mode: str | None, model_name: str | None) 
             LYRICS_STREAM_OVERLAP_SECONDS,
         )
         if _is_base_model(model_name):
-            return (12.0, profile[1], 2.8, 3.4, 2.6)
+            return (12.0, profile[1], 2.8, 3.4, profile[4])
         if _is_small_model(model_name):
-            return (max(profile[0], 15.0), profile[1], max(profile[2], 3.5), max(profile[3], 4.0), max(profile[4], 3.5))
+            return (max(profile[0], 15.0), profile[1], max(profile[2], 3.5), max(profile[3], 4.0), profile[4])
         return profile
     if _is_live_mode(content_mode):
         profile = (
@@ -1022,25 +1024,36 @@ def _transcribe_audio(
     no_speech_threshold: float | None = 0.6,
     content_mode: str | None = None,
     model_name: str | None = None,
+    *,
+    check_short_lyrics: bool = True,
 ) -> tuple[list[Any], Any, bool]:
     normalized_language = _normalized_language(language)
+    options = {
+        "language": normalized_language,
+        "beam_size": beam_size,
+        "vad_filter": vad_filter,
+        "vad_parameters": _vad_parameters_for_mode(content_mode) if vad_filter else None,
+        "condition_on_previous_text": False,
+        "temperature": DECODE_TEMPERATURE,
+        "no_speech_threshold": no_speech_threshold,
+        "multilingual": _multilingual_for_mode(normalized_language, content_mode),
+        "language_detection_segments": (6 if _is_base_model(model_name) else 5 if _is_small_model(model_name) else 3)
+        if normalized_language is None
+        else 1,
+    }
     with _inference_lock:
-        segments, info = whisper_model.transcribe(
-            audio,
-            language=normalized_language,
-            beam_size=beam_size,
-            vad_filter=vad_filter,
-            vad_parameters=_vad_parameters_for_mode(content_mode) if vad_filter else None,
-            initial_prompt=initial_prompt,
-            condition_on_previous_text=False,
-            temperature=DECODE_TEMPERATURE,
-            no_speech_threshold=no_speech_threshold,
-            multilingual=_multilingual_for_mode(normalized_language, content_mode),
-            language_detection_segments=(6 if _is_base_model(model_name) else 5 if _is_small_model(model_name) else 3)
-            if normalized_language is None
-            else 1,
-        )
-        return list(segments), info, vad_filter
+        segments, info = whisper_model.transcribe(audio, initial_prompt=initial_prompt, **options)
+        segment_list = list(segments)
+        if check_short_lyrics and initial_prompt and _is_lyrics_mode(content_mode) and model_name in QWEN_MODELS:
+            text = _segment_text(segment_list)
+            key = _speech_key(text)
+            if 0 < len(key) <= SHORT_LYRIC_HYPOTHESIS_MAX_CHARACTERS and not _is_probable_hallucination(text):
+                # Short suggestions can come from the lyric examples instead of the audio.
+                unprompted, _ = whisper_model.transcribe(audio, initial_prompt=None, **options)
+                verification = _segment_text(_filter_transcription_segments(list(unprompted), content_mode, model_name))
+                if _speech_key(verification) != key:
+                    segment_list = []
+        return segment_list, info, vad_filter
 
 
 def _transcribe_live_lyrics_fallback(
@@ -1076,6 +1089,7 @@ def _stream_transcribe_text(
     content_mode: str | None,
     preserve_turns: bool = False,
     model_name: str | None = None,
+    check_short_lyrics: bool = False,
 ) -> tuple[str, bool, int]:
     prepared_audio = _prepare_audio_for_mode(audio, content_mode)
     beam_size = _beam_size_for_mode(content_mode, model_name)
@@ -1095,6 +1109,7 @@ def _stream_transcribe_text(
         no_speech_threshold,
         content_mode,
         model_name,
+        check_short_lyrics=check_short_lyrics,
     )
     segment_list = _filter_transcription_segments(segment_list, content_mode, model_name)
     text = _segment_text(segment_list, preserve_turns)
@@ -1106,7 +1121,7 @@ def _stream_transcribe_text(
             preserve_turns,
             model_name,
         )
-    elif not text and vad_filter:
+    elif not text and vad_filter and EMPTY_RETRY_NO_VAD:
         segment_list, _info, vad_used = _transcribe_audio(
             whisper_model,
             prepared_audio,
@@ -1441,6 +1456,7 @@ async def audio_stream(websocket: WebSocket) -> None:
                     content_mode,
                     preserve_turns,
                     requested_model,
+                    bool(last_partial),
                 )
             except Exception as exc:  # noqa: BLE001
                 if closed or generation != decoded_generation:
@@ -1457,6 +1473,9 @@ async def audio_stream(websocket: WebSocket) -> None:
                 normalized = ""
                 text = ""
             if not normalized:
+                if profile == "lyrics":
+                    last_partial = ""
+                    partial_started_at = None
                 empty_decode_count += 1
                 if now - last_status_at >= 3.0:
                     last_status_at = now

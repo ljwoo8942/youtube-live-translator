@@ -10,6 +10,7 @@ let sttSocket: WebSocket | undefined;
 let activeTabId: number | undefined;
 let activeVideoId: string | undefined;
 let chunkTimer: number | undefined;
+let recorderRevision = 0;
 let activeAudioChunkMs = 8000;
 let activeMode: "stream" | "chunk" | undefined;
 let cyclingRecorder = false;
@@ -63,6 +64,7 @@ function stopRecorderForChunk(): void {
 }
 
 function discardActiveRecorder(): void {
+  recorderRevision += 1;
   clearChunkTimer();
   cyclingRecorder = false;
   const recorder = mediaRecorder;
@@ -78,13 +80,13 @@ function scheduleChunkStop(): void {
   chunkTimer = window.setTimeout(stopRecorderForChunk, activeAudioChunkMs);
 }
 
-async function sendAudioBlob(blob: Blob, mimeType: string, tabId: number, videoId: string): Promise<void> {
+async function sendAudioBlob(blob: Blob, mimeType: string, tabId: number, videoId: string, revision: number): Promise<void> {
   if (!blob.size) {
     return;
   }
 
   const audioBase64 = await blobToBase64(blob);
-  if (!audioBase64) {
+  if (!audioBase64 || revision !== recorderRevision) {
     return;
   }
 
@@ -119,6 +121,7 @@ function startRecorderCycle(): void {
   activeMode = "chunk";
   const tabIdForRecorder = activeTabId;
   const videoIdForRecorder = activeVideoId;
+  const revisionForRecorder = recorderRevision;
   const mimeType = chooseMimeType();
   const chunks: Blob[] = [];
   const recorder = new MediaRecorder(activeStream, mimeType ? { mimeType } : undefined);
@@ -131,10 +134,11 @@ function startRecorderCycle(): void {
   });
 
   recorder.addEventListener("stop", () => {
+    const ownsRecorder = mediaRecorder === recorder;
     const shouldRestart =
-      cyclingRecorder && Boolean(activeStream && activeTabId === tabIdForRecorder && activeVideoId === videoIdForRecorder);
-    const shouldDiscard = discardedRecorders.has(recorder);
-    cyclingRecorder = false;
+      ownsRecorder && cyclingRecorder && Boolean(activeStream && activeTabId === tabIdForRecorder && activeVideoId === videoIdForRecorder);
+    const shouldDiscard = discardedRecorders.has(recorder) || revisionForRecorder !== recorderRevision;
+    if (ownsRecorder) cyclingRecorder = false;
     discardedRecorders.delete(recorder);
 
     if (!shouldDiscard) {
@@ -142,7 +146,8 @@ function startRecorderCycle(): void {
         new Blob(chunks, { type: mimeType || chunks[0]?.type || "audio/webm" }),
         mimeType,
         tabIdForRecorder,
-        videoIdForRecorder
+        videoIdForRecorder,
+        revisionForRecorder
       ).catch((error) => {
         console.debug("Audio chunk relay failed", error);
       });

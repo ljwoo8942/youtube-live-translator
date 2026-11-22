@@ -61,7 +61,7 @@ npm run build
 
 **대안: 내 컴퓨터에서 음성 인식.** [uv](https://docs.astral.sh/uv/getting-started/installation/) 설치 후 프로젝트 폴더에서 `npm run stt:setup`, `npm run stt:start`를 실행하고 터미널을 열어 둡니다. **전체 설정**의 **로컬 STT + 번역 API 프리셋**을 적용한 뒤 **로컬 STT + 번역 연결 테스트 → 설정 저장**을 진행합니다. 영상에서 **음성 시작**을 누르는 것은 동일합니다. 이 조합은 음성 인식만 로컬이고 번역은 API로 보냅니다. Qwen, 로컬 번역, 팝업 서버 제어는 [고급 설정 가이드](advanced-guide.ko.md)를 참고하세요.
 
-Qwen 또는 Whisper로 첫 자막을 앞당기려면 **전체 설정**에서 **로컬 STT WebSocket 스트리밍 사용**을 켜고 저장합니다. 영상 탭에서 **음성 시작**을 누르면 LM Studio와 Ollama에서도 중간 인식 결과부터 번역되고, 인식이 확정되면 자막이 갱신됩니다.
+Qwen 또는 Whisper로 첫 자막을 앞당기려면 **전체 설정**에서 **로컬 STT WebSocket 스트리밍 사용**을 켜고 저장합니다. 영상 탭에서 **음성 시작**을 누르면 일반 음성의 중간 인식 결과부터 LM Studio 또는 Ollama로 번역할 수 있습니다. **노래/가사** 모드는 확정된 인식 결과부터 표시합니다.
 
 Gemma 4로 번역을 로컬에서 처리하는 방법과 빠른 일본어 노래에서 검증한 14초 HTTP 설정은 설정 가이드를 참고하세요. [LM Studio 설정 가이드](lm-studio-settings.md)
 
