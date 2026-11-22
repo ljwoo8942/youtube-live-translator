@@ -270,7 +270,8 @@ class ModeConfigurationTests(unittest.TestCase):
                 self.assertEqual(transcribe.call_count, 2 if retry else 1)
 
     def test_lyrics_websocket_discards_finalized_audio_during_interlude(self) -> None:
-        profile = app._stream_profile_for_model("lyrics", "qwen3-asr-1.7b")
+        model_name = "qwen3-asr-1.7b"
+        profile = app._stream_profile_for_model("lyrics", model_name)
         headers = {"Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop"}
 
         def infer(_model: object, audio: np.ndarray, *_args: object) -> tuple[str, bool, int]:
@@ -279,17 +280,19 @@ class ModeConfigurationTests(unittest.TestCase):
             return text, False, 1
 
         with (
+            mock.patch.object(app, "_cached_models", return_value=[model_name]),
             mock.patch.object(app, "_load_model", return_value=object()),
             mock.patch.object(app, "_stream_profile_for_model", return_value=(profile[0], 0, 0.1, profile[3], profile[4])),
             mock.patch.object(app, "_startup_stream_timing", return_value=(0.1, 100)),
             mock.patch.object(app, "_stream_transcribe_text", side_effect=infer),
             TestClient(app.app).websocket_connect(
-                "/v1/audio/stream?content_mode=lyrics&model=qwen3-asr-1.7b", headers=headers
+                f"/v1/audio/stream?content_mode=lyrics&model={model_name}", headers=headers
             ) as socket,
         ):
             for expected in ("partial", "final"):
                 socket.send_bytes(np.full(3200, 6000, dtype="<i2").tobytes())
-                self.assertEqual(socket.receive_json()["type"], expected)
+                message = socket.receive_json()
+                self.assertEqual(message["type"], expected, message)
             socket.send_bytes(np.full(3200, 1000, dtype="<i2").tobytes())
             self.assertEqual(socket.receive_json()["type"], "status")
             socket.send_bytes(np.full(3200, 9000, dtype="<i2").tobytes())
