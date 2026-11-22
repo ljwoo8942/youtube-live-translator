@@ -23,15 +23,25 @@ test("lyric streaming uses the selected language and leaves automatic language d
   assert.equal(new URL(streamUrl({ ...config, sourceLanguage: "auto" })).searchParams.get("language"), null);
 });
 
-function streamHarness() {
+function streamHarness(settings = { enabled: true }) {
   const pending = [], sent = [];
-  const context = functions("src/background/index.ts", ["translateStreamSegment", "translateQueuedStreamSegment", "audioRequestController"], {
-    AbortController, streamTranslationQueuesByTab: new Map(), audioRequestControllers: new Map(),
+  const context = functions("src/background/index.ts", [
+    "audioTransportConfig", "processStreamTranscript", "shouldTranslateStreamPartial", "normalizeText",
+    "translateStreamSegment", "translateQueuedStreamSegment", "audioRequestController"
+  ], {
+    AbortController, AbortSignal, streamTranslationQueuesByTab: new Map(), audioRequestControllers: new Map(),
     activeAudioTabId: 1, activeAudioVideoId: "v",
-    loadSettingsSnapshot: async () => ({ settings: { enabled: true }, translationConfigRevision: 1 }),
+    lastTranslationConfigRevision: undefined, lastPartialTranslationByTab: new Map(), lastFinalTranscriptByTab: new Map(),
+    lyricsAssistByTab: new Map(), sanitizeAudioTranscript: (text) => text, assistLyricsSegment: (_, segment) => segment,
+    STREAM_PARTIAL_TRANSLATION_MIN_CHARACTERS: 5, STREAM_PARTIAL_TRANSLATION_MIN_INTERVAL_MS: 1250,
+    MIN_STABLE_AUDIO_CHUNK_MS: 8000,
+    loadSettingsSnapshot: async () => ({ settings, translationConfigRevision: 1 }),
     matchUserCorrection: async () => undefined,
     segmentWithAudioContext: (_, segment) => segment,
-    translateAndRespond: (segment, signal) => new Promise((resolve) => pending.push({ segment, signal, resolve })),
+    translateAndRespond: (segment, signal) => new Promise((resolve, reject) => {
+      pending.push({ segment, signal, resolve });
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    }),
     notifyTab: async (_, message) => sent.push(message), rememberAudioContext() {},
     isBlockedHallucinationError: () => false, shouldStopCaptureAfterApiError: () => false
   });
@@ -39,6 +49,43 @@ function streamHarness() {
 }
 const segment = (id) => ({ id, text: `speech ${id}`, source: "audioStt", startMs: 0, endMs: 1000 });
 const result = (text) => ({ ok: true, translatedText: text, provider: "test" });
+
+for (const [model, translationProvider] of [
+  ["qwen3-asr-0.6b", "ollama"], ["qwen3-asr-1.7b", "lmStudio"], ["base", "lmStudio"], ["small", "ollama"]
+]) {
+  test(`${model} sends a provisional ${translationProvider} translation and then its final subtitle`, async () => {
+    const settings = {
+      enabled: true, sttProvider: "whisper", whisper: { model }, audioChunkMs: 8000,
+      contentMode: "lyrics", streamingSttEnabled: true, translationProvider
+    };
+    const { context: c, pending, sent } = streamHarness(settings);
+    const transport = c.audioTransportConfig(settings);
+    assert.equal(transport.useStreaming, true);
+    assert.equal(transport.streamingSttModel, model);
+    const http = c.audioTransportConfig({ ...settings, streamingSttEnabled: false });
+    assert.equal(http.useStreaming, false);
+    assert.equal(http.audioChunkMs, 14000);
+
+    const message = { type: "STREAM_STT_TRANSCRIPT", tabId: 1, videoId: "v", segment: segment("first"), isFinal: false };
+    const provisional = c.processStreamTranscript(message);
+    await setImmediate();
+    assert.equal(sent[0].type, "STREAM_STT_TRANSCRIPT");
+    assert.equal(pending.length, 1);
+    pending[0].resolve(result("임시 번역"));
+    await provisional;
+
+    const confirmed = c.processStreamTranscript({ ...message, segment: segment("confirmed"), isFinal: true });
+    await setImmediate();
+    assert.equal(pending[1].segment.text, "speech confirmed");
+    pending[1].resolve(result("확정 번역"));
+    await confirmed;
+    const translations = sent.filter(({ type }) => type === "TRANSLATION_READY");
+    assert.deepEqual(translations.map(({ segment, provider, translatedText }) => [segment.text, provider, translatedText]), [
+      ["speech first", "test (partial)", "임시 번역"],
+      ["speech confirmed", "test", "확정 번역"]
+    ]);
+  });
+}
 
 test("audio start accepts CHZZK playback and rejects a listing, stale video ID or unrelated origin", async () => {
   let url = "https://chzzk.naver.com/video/123456?from=live";
@@ -119,21 +166,23 @@ test("continuous input does not starve slow translations and only the latest par
   assert.equal(c.streamTranslationQueuesByTab.size, 0);
 });
 
-test("a final transcript waits ahead of newer partials without being overwritten", async () => {
+test("a final transcript cancels a different in-flight partial and takes priority over newer partials", async () => {
   const { context: c, pending, sent } = streamHarness();
   const task = c.translateStreamSegment(1, "v", segment("start"), false, 1);
   await setImmediate();
   await c.translateStreamSegment(1, "v", segment("final"), true, 1);
   await c.translateStreamSegment(1, "v", segment("next"), false, 1);
-  pending[0].resolve(result("start"));
   await setImmediate();
+  assert.equal(pending[0].signal.aborted, true);
   assert.equal(pending[1].segment.id, "final");
   pending[1].resolve(result("final"));
   await setImmediate();
   assert.equal(pending[2].segment.id, "next");
   pending[2].resolve(result("next"));
   await task;
-  assert.equal(sent[1].provider, "test");
+  assert.deepEqual(sent.map(({ provider, translatedText }) => [provider, translatedText]), [
+    ["test", "final"], ["test (partial)", "next"]
+  ]);
 });
 
 test("an old session response cannot enter a restarted session for the same video", async () => {

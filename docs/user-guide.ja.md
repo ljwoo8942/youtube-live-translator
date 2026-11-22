@@ -126,7 +126,9 @@ npm run stt:health
 
 ポップアップの `로컬 STT 시작`（ローカル STT を起動）は、別途 Chrome Native Messaging の登録を済ませた場合に使う機能です。上のターミナル方式では登録は不要です。Qwen の準備、モデル変更、ポップアップからの起動、Ollama の設定は詳細ガイドを参照してください。[詳細ガイド（韓国語）](advanced-guide.ko.md)
 
-音声認識と翻訳をパソコン内で行うには、LM Studio を介して Gemma 4 を接続します。テンポの速い日本語曲で検証した Qwen 1.7B と 14 秒の HTTP 音声認識の設定も掲載しています。[LM Studio 設定ガイド](lm-studio-settings.ja.md)
+Qwen や Whisper の字幕を早く表示するには、全体設定で `로컬 STT WebSocket 스트리밍 사용`（ローカル STT の WebSocket ストリーミング）をオンにして保存し、動画タブで音声認識を開始します。LM Studio や Ollama でも途中の認識結果から訳文を表示し、認識が確定すると字幕を更新します。
+
+Gemma 4 でローカル翻訳を使う手順と、テンポの速い日本語曲で検証した 14 秒の HTTP 音声認識の設定は、設定ガイドを参照してください。[LM Studio 設定ガイド](lm-studio-settings.ja.md)
 
 ## 5. 毎日の操作と字幕の調整
 

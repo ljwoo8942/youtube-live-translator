@@ -86,6 +86,7 @@ const lastPartialTranslationByTab = new Map<number, { text: string; at: number }
 type StreamTranslationQueue = {
   videoId: string;
   controller: AbortController;
+  activePartial?: { text: string; controller: AbortController };
   pending?: { segment: CaptionSegment; isFinal: boolean; revision: number };
   pendingFinal?: { segment: CaptionSegment; isFinal: boolean; revision: number };
 };
@@ -2802,8 +2803,8 @@ async function processStreamTranscript(message: Extract<RuntimeMessage, { type: 
 
   if (!message.isFinal) {
     await notifyTab(message.tabId, { ...message, segment });
-    if (settings.translationProvider === "openai" && shouldTranslateStreamPartial(message.tabId, segment)) {
-      void translateStreamSegment(message.tabId, message.videoId, segment, false, translationConfigRevision);
+    if (shouldTranslateStreamPartial(message.tabId, segment)) {
+      await translateStreamSegment(message.tabId, message.videoId, segment, false, translationConfigRevision);
     }
     return;
   }
@@ -2851,6 +2852,9 @@ async function translateStreamSegment(tabId: number, videoId: string, segment: C
     if (isFinal) {
       existing.pendingFinal = work;
       existing.pending = undefined;
+      if (existing.activePartial && existing.activePartial.text !== segment.text) {
+        existing.activePartial.controller.abort();
+      }
     } else {
       existing.pending = work;
     }
@@ -2861,13 +2865,18 @@ async function translateStreamSegment(tabId: number, videoId: string, segment: C
   try {
     let current: typeof work | undefined = work;
     while (current && streamTranslationQueuesByTab.get(tabId) === queue && !queue.controller.signal.aborted) {
-      await translateQueuedStreamSegment(tabId, videoId, current.segment, current.isFinal, current.revision, queue);
+      queue.activePartial = current.isFinal ? undefined : { text: current.segment.text, controller: new AbortController() };
+      const signal = queue.activePartial
+        ? AbortSignal.any([queue.controller.signal, queue.activePartial.controller.signal])
+        : queue.controller.signal;
+      await translateQueuedStreamSegment(tabId, videoId, current.segment, current.isFinal, current.revision, queue, signal)
+        .catch((error) => {
+          if (!signal.aborted) throw error;
+        });
       current = queue.pendingFinal ?? queue.pending;
       if (queue.pendingFinal) queue.pendingFinal = undefined;
       else queue.pending = undefined;
     }
-  } catch (error) {
-    if (!queue.controller.signal.aborted) throw error;
   } finally {
     if (streamTranslationQueuesByTab.get(tabId) === queue) streamTranslationQueuesByTab.delete(tabId);
   }
@@ -2875,36 +2884,18 @@ async function translateStreamSegment(tabId: number, videoId: string, segment: C
 
 async function translateQueuedStreamSegment(
   tabId: number, videoId: string, segment: CaptionSegment, isFinal: boolean,
-  translationConfigRevision: number, queue: StreamTranslationQueue
+  translationConfigRevision: number, queue: StreamTranslationQueue, signal: AbortSignal
 ): Promise<void> {
   const snapshot = await loadSettingsSnapshot();
-  if (snapshot.translationConfigRevision !== translationConfigRevision || queue.controller.signal.aborted) return;
+  if (snapshot.translationConfigRevision !== translationConfigRevision || signal.aborted) return;
 
   const correction = await matchUserCorrection(tabId, videoId, segment, isFinal);
+  if (signal.aborted) return;
+  const translation = correction
+    ? { ok: true as const, translatedText: correction.translatedText, provider: correction.provider }
+    : await translateAndRespond(segmentWithAudioContext(tabId, segment), signal, snapshot.settings);
   if (
-    correction &&
-    streamTranslationQueuesByTab.get(tabId) === queue && !queue.controller.signal.aborted &&
-    tabId === activeAudioTabId &&
-    videoId === activeAudioVideoId
-  ) {
-    if (isFinal) {
-      rememberAudioContext(tabId, segment.text);
-    }
-    await notifyTab(tabId, {
-      type: "TRANSLATION_READY",
-      translationConfigRevision,
-      segment,
-      translatedText: correction.translatedText,
-      provider: isFinal ? correction.provider : `${correction.provider} (partial)`,
-      videoId
-    });
-    return;
-  }
-
-  if (queue.controller.signal.aborted) return;
-  const translation = await translateAndRespond(segmentWithAudioContext(tabId, segment), queue.controller.signal, snapshot.settings);
-  if (
-    streamTranslationQueuesByTab.get(tabId) !== queue || queue.controller.signal.aborted ||
+    streamTranslationQueuesByTab.get(tabId) !== queue || signal.aborted || (!isFinal && queue.pendingFinal) ||
     tabId !== activeAudioTabId ||
     videoId !== activeAudioVideoId
   ) {

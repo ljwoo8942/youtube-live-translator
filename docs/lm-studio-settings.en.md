@@ -68,6 +68,21 @@ Start LM Studio's local server from **Developer > Local Server**. In the extensi
 
 If the LM Studio server requires authentication, enter its token in **API token (`API 토큰`)** and select the matching authentication mode. Run **Test LM Studio translation (`LM Studio 번역 테스트`)**, check the translated text, and click **Save settings (`설정 저장`)**.
 
+## Lower subtitle latency with local STT streaming
+
+1. In full settings, select **Local STT** (`로컬 STT (Whisper / Qwen)`) and choose your STT model.
+2. Enable **Use local STT WebSocket streaming (로컬 STT WebSocket 스트리밍 사용)**, set **Streaming STT WebSocket (스트리밍 STT WebSocket)** to `ws://127.0.0.1:8765/v1/audio/stream`, and save.
+3. Start the LM Studio server with Gemma loaded and start the local STT server. In the video tab’s popup, click **Start audio (음성 시작)**. [Local STT server setup](../local_stt/README.md)
+
+The extension shows a provisional translation once it has enough speech text and updates the subtitle when recognition is final. Enable **Show original text (원문도 표시)** in the overlay settings to see both lines. If the WebSocket connection fails, the extension switches to HTTP transcription. To use the 14-second setup for songs, turn streaming off as shown below.
+
+These Windows RTX 5070 measurements used preloaded models and synthetic English speech sent at playback speed. The times run from the start of the audio input to the local `gemma4-e4b-instruct-pure` translation result.
+
+| Speech recognition model | First provisional translation | First confirmed translation |
+| --- | ---: | ---: |
+| Qwen3-ASR 1.7B | 1.43 s | 3.78 s |
+| Whisper base | 1.27 s | 3.59 s |
+
 ## Setup for fast Japanese songs
 
 Install `uv` and run these commands from the project folder to prepare the local STT environment and Qwen models.
