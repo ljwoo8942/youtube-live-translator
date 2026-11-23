@@ -1,18 +1,11 @@
 import type { LocalSttServerState } from "../shared/messages";
+import { usesNativeSttEndpoint } from "../shared/localStt";
 import type { TranslatorSettings } from "../shared/types";
 
 const HOST_NAME = "com.yt_live_translator.stt";
 const SUPPORTED_MODELS = ["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo", "qwen3-asr-0.6b", "qwen3-asr-1.7b"];
 let port: chrome.runtime.Port | undefined;
 let running: Extract<LocalSttServerState, { state: "running" }> | undefined;
-
-export function usesNativeSttEndpoint(settings: TranslatorSettings): boolean {
-  return settings.sttProvider === "whisper" &&
-    /^http:\/\/(127\.0\.0\.1|localhost):8765(?:\/v1)?\/?$/i.test(settings.whisper.baseUrl.trim()) &&
-    settings.whisper.endpoint === "/audio/transcriptions" &&
-    (!settings.streamingSttEnabled ||
-      /^ws:\/\/(127\.0\.0\.1|localhost):8765\/v1\/audio\/stream$/i.test(settings.streamingSttEndpoint.trim()));
-}
 
 export function getLocalSttServerState(): LocalSttServerState {
   return running ?? { state: port ? "starting" : "stopped" };

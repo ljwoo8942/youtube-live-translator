@@ -155,7 +155,7 @@ test("popup manual audio start is prepared before settings broadcast can auto-st
   const startHandlerStart = popup.indexOf('document.querySelector("#startAudio")');
   const startHandlerEnd = popup.indexOf('document.querySelector("#stopAudio")', startHandlerStart);
   const startHandler = popup.slice(startHandlerStart, startHandlerEnd);
-  const prepareIndex = startHandler.indexOf("await prepareAudioCapture()");
+  const prepareIndex = startHandler.indexOf("await prepareAudioCapture(selectedSttProvider)");
   const persistIndex = startHandler.indexOf("await persist({");
   const startIndex = startHandler.indexOf("await startPreparedAudioCapture(prepared)");
   assert.match(prepareHelper, /type: "PREPARE_AUDIO_CAPTURE"/);
@@ -486,19 +486,20 @@ test("manual audio start clears stale stop intent before starting tab capture", 
   const startIndex = popup.indexOf("function startPreparedAudioCapture", prepareIndex);
   assert.ok(prepareIndex >= 0);
   assert.ok(startIndex > prepareIndex);
-  assert.match(popup, /videoId:\s*prepared\?\.ok\s*\?\s*prepared\.videoId\s*:\s*undefined/);
+  assert.match(popup.slice(prepareIndex, startIndex), /type: "PREPARE_AUDIO_CAPTURE"[\s\S]*?return \{ tabId, videoId \}/);
   assert.match(popup, /videoId:\s*prepared\.videoId/);
 });
 
-test("popup checks the playback URL before requesting capture permission", () => {
+test("popup checks the selected video before requesting permission and revalidates it before capturing", () => {
   const prepareStart = popup.indexOf("async function prepareAudioCapture");
   const prepareEnd = popup.indexOf("function startPreparedAudioCapture", prepareStart);
   const prepareAudio = popup.slice(prepareStart, prepareEnd);
   assert.ok(prepareStart >= 0);
   assert.match(
     prepareAudio,
-    /const page = getVideoPage\(tab\?\.url\);[\s\S]*?if \(!page\?\.videoId\) \{[\s\S]*?throw new Error[\s\S]*?await ensureTabCapturePermission\(\);/
+    /const videoId = currentTabPage\?\.videoId;[\s\S]*?if \(!tabId \|\| !videoId\) \{[\s\S]*?throw new Error[\s\S]*?await ensureTabCapturePermission\(/
   );
+  assert.match(prepareAudio, /if \(tab\?\.id !== tabId \|\| page\?\.videoId !== videoId\)/);
 });
 
 test("content injection and settings broadcasts target the three supported hosts", () => {

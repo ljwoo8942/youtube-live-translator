@@ -98,7 +98,7 @@ LM Studio의 `Developer > Local Server`에서 서버를 시작한 뒤 다음 값
 
 1. **전체 설정**에서 `로컬 STT (Whisper / Qwen)`과 사용할 모델을 선택합니다.
 2. **로컬 STT WebSocket 스트리밍 사용**을 켜고 **스트리밍 STT WebSocket**에 `ws://127.0.0.1:8765/v1/audio/stream`을 설정한 뒤 저장합니다.
-3. Gemma가 로드된 LM Studio 서버와 로컬 STT 서버를 실행합니다. 영상 탭의 팝업에서 **음성 시작**을 누릅니다. [로컬 STT 서버 설정](../local_stt/README.md)
+3. Gemma가 로드된 LM Studio 서버를 실행한 뒤 영상 탭의 팝업에서 **음성 시작**을 누릅니다. 호스트를 등록하고 모델을 준비한 기본 로컬 STT는 이때 자동으로 시작됩니다. [로컬 STT 서버 설정](../local_stt/README.md)
 
 일반 음성은 중간 인식 결과가 충분히 길면 임시 번역을 표시하고 인식이 확정되면 자막을 갱신합니다. **노래/가사** 모드는 확정된 인식 결과부터 표시합니다. 원문을 함께 보려면 **오버레이**의 **원문도 표시**를 켭니다. WebSocket 연결이 실패하면 HTTP 전사로 전환합니다. 노래에서 14초 설정을 사용하려면 아래 표대로 스트리밍을 끕니다.
 
@@ -134,7 +134,7 @@ npm run stt:qwen:download
 
 이 조합은 음성을 14초씩 모아 HTTP로 전사합니다. 선택한 음성 언어는 WebSocket과 HTTP 전사에 모두 적용됩니다. 여러 언어가 섞인 노래는 `자동 감지`를 사용할 수 있습니다.
 
-팝업에서 서버를 시작하려면 Chrome 확장 관리 화면(`chrome://extensions`)에서 설치된 확장의 ID를 확인하고 `npm run stt:native:install -- YOUR_EXTENSION_ID`에서 `YOUR_EXTENSION_ID`를 바꿔 한 번 실행하세요. 설정을 저장한 뒤 영상 탭의 팝업에서 `로컬 STT 시작`을 누르고 서버가 준비되면 `음성 시작`을 누릅니다.
+자동 실행을 쓰려면 Chrome 확장 관리 화면(`chrome://extensions`)에서 설치한 확장의 ID를 확인하세요. `npm run stt:native:install -- YOUR_EXTENSION_ID`에 실제 ID를 넣어 한 번 실행하고 STT 모델을 준비합니다. 설정을 저장한 뒤 영상 팝업에서 **음성 시작**을 누릅니다. Chrome이 권한을 요청하면 허용하세요. 기본 주소에서 이미 실행 중인 서버는 바로 사용합니다.
 
 ## 문제 해결
 

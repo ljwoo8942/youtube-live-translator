@@ -124,7 +124,7 @@ npm run stt:health
 
 最初は Whisper の既定モデル `small` で試してください。M シリーズ Mac は MLX、Windows は利用できる NVIDIA GPU があれば CUDA、なければ CPU を使います。Windows の仮想環境 `.venv-stt` を Mac にコピーせず、使うパソコンごとにセットアップしてください。
 
-ポップアップの `로컬 STT 시작`（ローカル STT を起動）は、別途 Chrome Native Messaging の登録を済ませた場合に使う機能です。上のターミナル方式では登録は不要です。Qwen の準備、モデル変更、ポップアップからの起動、Ollama の設定は詳細ガイドを参照してください。[詳細ガイド（韓国語）](advanced-guide.ko.md)
+自動起動を使うには、Chrome Native Messaging ホストを登録してモデルを準備します。既定のアドレスを使用する場合、動画タブのポップアップで `음성 시작`（音声認識を開始）を押すとサーバーと字幕が起動します。Chrome の許可画面が出たら許可します。Qwen の準備や Ollama の設定も詳細ガイドで確認できます。[詳細ガイド（韓国語）](advanced-guide.ko.md)
 
 Qwen や Whisper の字幕を早く表示するには、全体設定で `로컬 STT WebSocket 스트리밍 사용`（ローカル STT の WebSocket ストリーミング）をオンにして保存し、動画タブで音声認識を開始します。話し声は LM Studio や Ollama でも途中の認識結果から翻訳できます。`노래/가사`（歌・歌詞）モードでは、確定した認識結果から表示します。
 

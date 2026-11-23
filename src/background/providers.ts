@@ -14,7 +14,7 @@ type OpenAiCompatibleConfig = {
 const MODEL_DISCOVERY_CACHE_MS = 30_000;
 const lmStudioModelCache = new Map<string, { at: number; models: string[] }>();
 const PREFERRED_LM_STUDIO_MODEL_PATTERNS = [/^google\/gemma-4-e2b$/i, /gemma[-_/]?4[-_/]?e2b/i, /e2b/i, /gemma/i];
-const LOCAL_STT_START_HINT = "별도 터미널에서 npm run stt:start를 실행하고 그 창을 닫지 않은 채 다시 시도하세요.";
+const LOCAL_STT_START_HINT = "기본 로컬 STT는 영상 탭 팝업의 음성 시작으로 자동 실행할 수 있습니다. 서버를 직접 실행하려면 터미널에서 npm run stt:start를 실행하세요.";
 
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");

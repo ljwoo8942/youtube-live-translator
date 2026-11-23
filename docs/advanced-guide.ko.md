@@ -137,12 +137,12 @@ Windows와 Apple Silicon Mac에서는 Chrome Native Messaging 호스트를 한 �
    ```
 
 3. 전체 설정에서 `로컬 STT (Whisper / Qwen)`, 기본 STT 주소 `http://127.0.0.1:8765/v1` 및 준비된 모델을 선택하고 저장하세요. 스트리밍을 켰다면 주소는 `ws://127.0.0.1:8765/v1/audio/stream`을 사용합니다.
-4. YouTube 또는 치지직 탭에서 팝업의 `로컬 STT 시작`을 누르고 첫 사용 시 Chrome의 로컬 프로그램 연결 권한을 허용하세요. 권한 창을 닫으며 팝업이 함께 닫혔다면 다시 열어 시작을 누르세요. 실행 중인 모델과 장치가 표시되면 `음성 시작`으로 탭 음성을 인식할 수 있습니다.
-5. 팝업의 `로컬 STT 중지`는 이 확장에서 연 서버를 종료합니다. 다른 모델로 바꾸려면 먼저 서버를 중지한 뒤 모델을 저장하고 다시 시작하세요. 팝업을 닫아도 서버는 유지되며, Chrome 종료나 확장 새로고침 시 함께 종료됩니다.
+4. YouTube 또는 치지직 영상 탭에서 팝업의 `음성 시작`을 누르세요. 기본 주소의 로컬 STT 서버가 꺼져 있으면 자동으로 기동하고, 선택한 모델이 준비되면 음성 자막을 시작합니다. 첫 사용 시 Chrome이 요청하는 탭 캡처와 로컬 프로그램 연결 권한을 허용하세요. 권한 안내가 표시되거나 팝업이 닫히면 다시 열어 `음성 시작`을 누르세요.
+5. `음성 중지`는 탭 캡처를 끝내고 `로컬 STT 중지`는 확장이 연 서버를 종료합니다. 다른 모델로 바꾸려면 서버를 중지하고 새 모델을 저장한 뒤 `음성 시작`을 누르세요. 확장이 연 서버는 팝업을 닫아도 유지되며 Chrome 종료나 확장 새로고침 시 함께 종료됩니다.
 
 팝업에서는 캐시된 모델을 사용합니다. Whisper 모델을 처음 준비할 때는 `YT_TRANSLATOR_STT_MODEL`에 모델 이름을 지정해 `npm run stt:start`를 실행한 뒤 다른 터미널에서 `npm run stt:health`를 실행하세요. 모델 준비가 끝나면 터미널 서버를 종료하세요. Qwen 모델은 `npm run stt:qwen:download`로 준비할 수 있습니다. [운영체제별 모델 준비 명령](../local_stt/README.md#run)
 
-이미 8765번에 서버가 실행 중이면 팝업에서 새 서버를 시작할 수 없습니다. 기존 서버를 사용하거나 원래 실행한 터미널에서 종료하세요. 프로젝트를 옮기거나 확장 ID가 바뀌면 호스트를 다시 등록하세요. 등록 범위는 현재 OS 사용자와 입력한 확장 ID입니다. [Chrome Native Messaging 문서](https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging)
+이미 기본 주소에서 호환 서버가 실행 중이면 해당 서버에 바로 연결합니다. 사용자가 실행한 서버는 실행한 터미널에서 관리하세요. 프로젝트를 옮기거나 확장 ID가 바뀌면 호스트를 다시 등록하세요. 등록 범위는 현재 OS 사용자와 입력한 확장 ID입니다. [Chrome Native Messaging 문서](https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging)
 
 ## 로컬 AI 기본값
 
@@ -326,7 +326,7 @@ npm run stt:health
 | --- | --- |
 | 다른 사이트에서 버튼이 비활성화됨 | YouTube 또는 치지직 영상 탭에서 팝업을 다시 여세요. |
 | 업데이트 후 이전 화면이 남음 | `npm run build` 후 확장 프로그램과 영상 탭을 모두 새로고침하세요. |
-| STT 서버에 연결되지 않음 | 팝업의 `로컬 STT 시작` 또는 `npm run stt:start`로 서버를 켠 뒤 `npm run stt:health`로 상태와 실제 장치를 확인하세요. |
+| STT 서버에 연결되지 않음 | 기본 로컬 STT는 호스트 등록과 모델 준비를 확인한 뒤 영상 팝업에서 `음성 시작`을 누르세요. 직접 실행하려면 `npm run stt:start`를 쓰고 `npm run stt:health`로 상태와 장치를 확인하세요. |
 | Chrome 연결 프로그램을 등록하라는 메시지가 표시됨 | 확장 관리 화면에서 ID를 확인하고 `npm run stt:native:install -- 실제ID`를 실행하세요. |
 | 선택한 모델이 준비되지 않았다고 표시됨 | Qwen은 `npm run stt:qwen:download`, Whisper는 서버 시작 모델 지정 후 상태 확인으로 준비하고, 확장에서도 모델 선택 후 저장하세요. |
 | 외부 API가 연결되지 않음 | URL·엔드포인트·접근 권한·인증 방식을 확인하세요. 401/403이면 키와 제공자 권한도 확인하세요. |

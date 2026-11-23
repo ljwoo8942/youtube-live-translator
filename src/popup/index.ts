@@ -1,12 +1,15 @@
 import { loadSettings } from "../shared/storage";
-import type { LocalSttServerState, MessageResponse } from "../shared/messages";
+import { needsLocalSttStart, usesNativeSttEndpoint } from "../shared/localStt";
+import type { AudioCaptureStartResponse, LocalSttServerState, MessageResponse } from "../shared/messages";
 import type { ContentMode, InputMode, SttProvider, TranslationProvider, TranslatorSettings } from "../shared/types";
 import { getVideoPage } from "../shared/videoSites";
 import "./style.css";
 
 const app = document.querySelector<HTMLDivElement>("#app");
 let settings: TranslatorSettings;
+let currentTabId: number | undefined;
 let currentTabPage: ReturnType<typeof getVideoPage>;
+let needsNativeSttPermission = false;
 let correctionEnabled = true;
 let correctionCount = 0;
 let actionPending = false;
@@ -27,52 +30,58 @@ async function persist(patch: Partial<TranslatorSettings>): Promise<void> {
   settings = response.settings;
 }
 
-async function ensureTabCapturePermission(): Promise<void> {
-  if (await chrome.permissions.contains({ permissions: ["tabCapture"] })) {
-    return;
-  }
-  const granted = await chrome.permissions.request({ permissions: ["tabCapture"] });
+async function ensureTabCapturePermission(requestNativeStt: boolean): Promise<void> {
+  const permissions = requestNativeStt ? ["tabCapture", "nativeMessaging"] : ["tabCapture"];
+  const granted = await chrome.permissions.request({ permissions });
   if (!granted) {
-    throw new Error("음성 자막을 사용하려면 영상 탭 캡처 권한을 허용해야 합니다.");
+    throw new Error(requestNativeStt
+      ? "음성 자막과 로컬 STT를 시작하려면 Chrome의 탭 캡처 및 로컬 프로그램 연결 권한을 허용하세요."
+      : "음성 자막을 사용하려면 영상 탭 캡처 권한을 허용해야 합니다.");
   }
 }
 
 type PreparedAudioCapture = {
-  tabId?: number;
-  videoId?: string;
+  tabId: number;
+  videoId: string;
 };
 
-async function prepareAudioCapture(): Promise<PreparedAudioCapture> {
-  const tab = await activeTab();
-  const page = getVideoPage(tab?.url);
-  if (!page?.videoId) {
+async function prepareAudioCapture(sttProvider = settings.sttProvider): Promise<PreparedAudioCapture> {
+  const tabId = currentTabId;
+  const videoId = currentTabPage?.videoId;
+  if (!tabId || !videoId) {
     throw new Error("YouTube 또는 치지직 영상 재생 페이지에서 음성 시작을 눌러 주세요.");
   }
-  await ensureTabCapturePermission();
-  const prepared = tab?.id
-    ? await chrome.tabs
-        .sendMessage<MessageResponse<{ videoId: string }>>(tab.id, { type: "PREPARE_AUDIO_CAPTURE" })
-        .catch(() => undefined)
-    : undefined;
+  await ensureTabCapturePermission(needsNativeSttPermission && usesNativeSttEndpoint({ ...settings, sttProvider }));
+  const tab = await activeTab();
+  const page = getVideoPage(tab?.url);
+  if (tab?.id !== tabId || page?.videoId !== videoId) {
+    throw new Error("영상이 바뀌었습니다. 현재 재생 탭에서 다시 시작하세요.");
+  }
+  const prepared = await chrome.tabs
+    .sendMessage<MessageResponse<{ videoId: string }>>(tabId, { type: "PREPARE_AUDIO_CAPTURE" })
+    .catch(() => undefined);
   if (prepared && !prepared.ok) throw new Error(prepared.error);
   if (page.site === "chzzk" && !prepared?.ok) {
     throw new Error("치지직 영상 탭을 새로고침한 뒤 다시 시도하세요.");
   }
-  return {
-    tabId: tab?.id,
-    videoId: prepared?.ok ? prepared.videoId : undefined
-  };
+  if (prepared?.ok && prepared.videoId !== videoId) {
+    throw new Error("영상이 바뀌었습니다. 현재 재생 탭에서 다시 시작하세요.");
+  }
+  return { tabId, videoId };
 }
 
-function startPreparedAudioCapture(
-  prepared: PreparedAudioCapture
-): Promise<MessageResponse<{ tabId: number; mode?: string }> | undefined> {
-  return chrome.runtime.sendMessage<MessageResponse<{ tabId: number; mode?: string }>>({
+async function startPreparedAudioCapture(prepared: PreparedAudioCapture): Promise<AudioCaptureStartResponse | undefined> {
+  if (usesNativeSttEndpoint(settings)) {
+    setStatus("로컬 STT 연결과 음성 자막을 준비하는 중입니다.");
+  }
+  const response = await chrome.runtime.sendMessage<AudioCaptureStartResponse>({
     type: "START_AUDIO_CAPTURE",
     tabId: prepared.tabId,
     videoId: prepared.videoId,
     ensureTabCapturePermission: true
   });
+  if (response?.needsNativeSttPermission) needsNativeSttPermission = true;
+  return response;
 }
 
 function setStatus(text: string): void {
@@ -88,12 +97,8 @@ function localSttStatusText(state: LocalSttServerState): string {
   return "이 확장에서 실행 중인 로컬 STT 서버가 없습니다.";
 }
 
-async function controlLocalSttServer(action: "start" | "stop"): Promise<void> {
-  if (action === "start" && !(await chrome.permissions.request({ permissions: ["nativeMessaging"] }))) {
-    throw new Error("로컬 STT 서버를 시작하려면 Chrome의 로컬 프로그램 연결 권한을 허용하세요.");
-  }
-  if (action === "start") setStatus("로컬 STT 모델을 불러오는 중입니다.");
-  const response = await chrome.runtime.sendMessage<MessageResponse<LocalSttServerState>>({ type: "LOCAL_STT_SERVER", action });
+async function stopLocalSttServer(): Promise<void> {
+  const response = await chrome.runtime.sendMessage<MessageResponse<LocalSttServerState>>({ type: "LOCAL_STT_SERVER", action: "stop" });
   if (!response?.ok) throw new Error(response?.error ?? "로컬 STT 서버 응답을 받지 못했습니다.");
   setStatus(localSttStatusText(response));
 }
@@ -298,7 +303,6 @@ function render(): void {
         <button id="stopAudio">음성 중지</button>
       </div>
       <div class="actions">
-        <button id="startLocalSttServer">로컬 STT 시작</button>
         <button id="stopLocalSttServer">로컬 STT 중지</button>
       </div>
       <div class="actions">
@@ -480,14 +484,15 @@ function render(): void {
 
   document.querySelector("#startAudio")?.addEventListener("click", () => {
     runAction(async () => {
-      const prepared = await prepareAudioCapture();
+      const selectedSttProvider = (sttProvider?.value ?? settings.sttProvider) as SttProvider;
+      const prepared = await prepareAudioCapture(selectedSttProvider);
       const captureInputMode = isChzzk && settings.inputMode === "captionsThenAudio" ? "captionsThenAudio" : "audio";
       await persist({
         enabled: true,
         inputMode: captureInputMode,
         contentMode: (contentMode?.value ?? settings.contentMode) as ContentMode,
         translationProvider: (translationProvider?.value ?? settings.translationProvider) as TranslationProvider,
-        sttProvider: (sttProvider?.value ?? settings.sttProvider) as SttProvider,
+        sttProvider: selectedSttProvider,
         sourceLanguage: sourceLanguage?.value || "auto",
         targetLanguage: targetLanguage?.value.trim() || "ko"
       });
@@ -503,11 +508,8 @@ function render(): void {
     });
   });
 
-  document.querySelector("#startLocalSttServer")?.addEventListener("click", () => {
-    runAction(() => controlLocalSttServer("start"));
-  });
   document.querySelector("#stopLocalSttServer")?.addEventListener("click", () => {
-    runAction(() => controlLocalSttServer("stop"));
+    runAction(stopLocalSttServer);
   });
 
   document.querySelector("#stopAudio")?.addEventListener("click", () => {
@@ -536,14 +538,20 @@ function render(): void {
 }
 
 async function main(): Promise<void> {
-  currentTabPage = getVideoPage((await activeTab())?.url);
-  const [loadedSettings, correctionStatus] = await Promise.all([
+  const [tab, loadedSettings, correctionStatus] = await Promise.all([
+    activeTab(),
     loadSettings(),
     chrome.runtime.sendMessage<MessageResponse<{ enabled: boolean; count: number }>>({
       type: "GET_CORRECTION_STATUS"
     })
   ]);
+  currentTabId = tab?.id;
+  currentTabPage = getVideoPage(tab?.url);
   settings = loadedSettings;
+  if (currentTabPage?.videoId && usesNativeSttEndpoint(settings) &&
+      !(await chrome.permissions.contains({ permissions: ["nativeMessaging"] }))) {
+    needsNativeSttPermission = await needsLocalSttStart(settings);
+  }
   if (correctionStatus?.ok) {
     correctionEnabled = correctionStatus.enabled;
     correctionCount = correctionStatus.count;

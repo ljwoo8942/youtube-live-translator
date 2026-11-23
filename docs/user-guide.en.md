@@ -54,6 +54,8 @@ npm run stt:start
 
 Leave the terminal open. In full settings, use **Local STT + translation API preset (로컬 STT + 번역 API 프리셋)**, check the translation credentials and selected model, and use **Check local STT connection (로컬 STT 연결 확인)** or **Test local STT + translation (로컬 STT + 번역 연결 테스트)**. Save, then start audio from the video tab as above. The advanced guide covers Whisper and Qwen model preparation, Ollama, and popup server controls. [Advanced guide (Korean)](advanced-guide.ko.md)
 
+To start the default local server and audio subtitles from a single button, register the Native Messaging host and prepare a model. Click **Start audio (음성 시작)** in the video popup and allow Chrome permissions when prompted. [Automatic startup setup (Korean)](advanced-guide.ko.md#확장-팝업에서-로컬-stt-서버-시작중지)
+
 To get earlier subtitles with Qwen or Whisper, enable **Use local STT WebSocket streaming (로컬 STT WebSocket 스트리밍 사용)** in full settings, save, and start audio from the video tab. LM Studio and Ollama can translate intermediate results for ordinary speech. **Songs and lyrics (노래/가사)** mode displays confirmed results.
 
 The settings guide covers local Gemma 4 translation and the 14-second HTTP setup tested on a fast Japanese song. [LM Studio settings guide](lm-studio-settings.en.md)

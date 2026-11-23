@@ -1,11 +1,12 @@
 import { loadSettings, loadSettingsSnapshot, patchSettings, toContentSettings } from "../shared/storage";
 import type { CaptionSegment, PageCaptionSnapshot, PageCaptionTrack, TranslatorSettings } from "../shared/types";
-import type { CaptionTranslationEntry, MessageResponse, RuntimeMessage } from "../shared/messages";
+import type { AudioCaptureStartResponse, CaptionTranslationEntry, MessageResponse, RuntimeMessage } from "../shared/messages";
 import { BLOCKED_HALLUCINATION_ERROR, getErrorMessage } from "../shared/messages";
+import { needsLocalSttStart, usesNativeSttEndpoint } from "../shared/localStt";
 import { TRANSLATION_PROMPT_VERSION } from "../shared/translationVersion";
 import { getVideoPage, isChzzkVideoId, VIDEO_SITE_MATCHES } from "../shared/videoSites";
 import { assertTranscriptionReady, assertTranslationReady, transcribeAudio, translateSegment, translateSegments } from "./providers";
-import { getLocalSttServerState, startLocalSttServer, stopLocalSttServer, usesNativeSttEndpoint } from "./nativeStt";
+import { getLocalSttServerState, startLocalSttServer, stopLocalSttServer } from "./nativeStt";
 import {
   createCaptionCacheContext,
   getCachedCaptionTranslations,
@@ -65,7 +66,7 @@ let activeAudioTabId: number | undefined;
 let activeAudioVideoId: string | undefined;
 let lastBroadcastSettingsRevision = -1;
 let startingAudioCapture:
-  | { tabId: number; videoId?: string; promise: Promise<MessageResponse<{ tabId: number; mode?: string }>> }
+  | { tabId: number; videoId?: string; allowLocalSttStart: boolean; promise: Promise<AudioCaptureStartResponse> }
   | undefined;
 let audioLifecycleQueue: Promise<void> = Promise.resolve();
 const translationCache = new Map<string, string>();
@@ -2253,8 +2254,9 @@ async function startAudioCaptureInternal(
   senderTabId?: number,
   requestedTabId?: number,
   requestedVideoId?: string,
-  canRequestTabCapturePermission = false
-): Promise<MessageResponse<{ tabId: number; mode?: string }>> {
+  canRequestTabCapturePermission = false,
+  allowLocalSttStart = false
+): Promise<AudioCaptureStartResponse> {
   const tabId = requestedTabId ?? senderTabId;
   if (!tabId) {
     return { ok: false, error: "음성을 인식할 영상 탭을 찾지 못했습니다." };
@@ -2281,10 +2283,37 @@ async function startAudioCaptureInternal(
     return { ok: false, error: `최근 API/STT 오류 때문에 ${seconds}초 후 다시 시도하세요: ${recentFailure.error}` };
   }
 
+  let settings = await loadSettings();
+  let startedLocalStt = false;
+  try {
+    if (allowLocalSttStart && await needsLocalSttStart(settings)) {
+      assertTranslationReady(settings);
+      if (!(await chrome.permissions.contains({ permissions: ["nativeMessaging"] }))) {
+        return {
+          ok: false,
+          error: "음성 시작을 다시 눌러 Chrome의 로컬 프로그램 연결 권한을 허용하세요.",
+          needsNativeSttPermission: true
+        };
+      }
+      await startLocalSttServer(settings);
+      startedLocalStt = true;
+      settings = await loadSettings();
+      if (!settings.enabled || settings.inputMode === "captions") {
+        return { ok: false, error: "음성 자막 설정이 바뀌었습니다. 현재 설정을 확인해 주세요." };
+      }
+      if (getVideoPage(await getTabUrl(tabId))?.videoId !== videoId) {
+        return { ok: false, error: "영상이 바뀌었습니다. 현재 재생 탭에서 다시 시작하세요." };
+      }
+    }
+  } catch (error) {
+    return { ok: false, error: getErrorMessage(error) };
+  }
+
   let liveTabIds = await liveCapturedTabIds();
   if (liveTabIds.includes(tabId) && (await ownsLiveAudioCapture(tabId))) {
     const state = await getOffscreenAudioState();
     if (state?.activeVideoId === videoId) {
+      if (startedLocalStt) return reconfigureAudioCaptureInternal(tabId, videoId, state.activeVideoId);
       return reuseAudioCapture(tabId, videoId, state);
     }
     if (state?.activeVideoId && isChzzkVideoId(state.activeVideoId) === isChzzkVideoId(videoId)) {
@@ -2304,7 +2333,6 @@ async function startAudioCaptureInternal(
     await stopAudioCaptureInternal(activeAudioTabId);
   }
 
-  const settings = await loadSettings();
   try {
     await assertTranscriptionReady(settings);
     assertTranslationReady(settings);
@@ -2392,22 +2420,24 @@ async function startAudioCapture(
   senderTabId?: number,
   requestedTabId?: number,
   requestedVideoId?: string,
-  canRequestTabCapturePermission = false
-): Promise<MessageResponse<{ tabId: number; mode?: string }>> {
+  canRequestTabCapturePermission = false,
+  allowLocalSttStart = false
+): Promise<AudioCaptureStartResponse> {
   const tabId = requestedTabId ?? senderTabId;
   if (!tabId) {
     return { ok: false, error: "음성을 인식할 영상 탭을 찾지 못했습니다." };
   }
   const videoId = requestedVideoId ?? getVideoPage(await getTabUrl(tabId))?.videoId;
 
-  if (startingAudioCapture?.tabId === tabId && startingAudioCapture.videoId === videoId) {
+  if (startingAudioCapture?.tabId === tabId && startingAudioCapture.videoId === videoId &&
+      (!allowLocalSttStart || startingAudioCapture.allowLocalSttStart)) {
     return startingAudioCapture.promise;
   }
 
   const promise = enqueueAudioLifecycle(() =>
-    startAudioCaptureInternal(undefined, tabId, videoId, canRequestTabCapturePermission)
+    startAudioCaptureInternal(undefined, tabId, videoId, canRequestTabCapturePermission, allowLocalSttStart)
   );
-  startingAudioCapture = { tabId, videoId, promise };
+  startingAudioCapture = { tabId, videoId, allowLocalSttStart, promise };
   try {
     return await promise;
   } finally {
@@ -3070,12 +3100,14 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
       }
 
       if (message.type === "START_AUDIO_CAPTURE") {
+        const fromPopup = sender.id === chrome.runtime.id && sender.url === chrome.runtime.getURL("popup.html");
         sendResponse(
           await startAudioCapture(
             sender.tab?.id,
             message.tabId,
             message.videoId,
-            Boolean(message.ensureTabCapturePermission)
+            fromPopup && Boolean(message.ensureTabCapturePermission),
+            fromPopup
           )
         );
         return;

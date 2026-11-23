@@ -72,7 +72,7 @@ If the LM Studio server requires authentication, enter its token in **API token 
 
 1. In full settings, select **Local STT** (`로컬 STT (Whisper / Qwen)`) and choose your STT model.
 2. Enable **Use local STT WebSocket streaming (로컬 STT WebSocket 스트리밍 사용)**, set **Streaming STT WebSocket (스트리밍 STT WebSocket)** to `ws://127.0.0.1:8765/v1/audio/stream`, and save.
-3. Start the LM Studio server with Gemma loaded and start the local STT server. In the video tab’s popup, click **Start audio (음성 시작)**. [Local STT server setup](../local_stt/README.md)
+3. Start the LM Studio server with Gemma loaded. In the video tab’s popup, click **Start audio (음성 시작)**. With the host registered and a model cached, the extension starts the default local STT server automatically. [Local STT server setup](../local_stt/README.md)
 
 For ordinary speech, the extension shows a provisional translation once it has enough text and updates the subtitle when recognition is final. **Songs and lyrics (노래/가사)** mode displays confirmed results. Enable **Show original text (원문도 표시)** in the overlay settings to see both lines. If the WebSocket connection fails, the extension switches to HTTP transcription. To use the 14-second setup for songs, turn streaming off as shown below.
 
@@ -108,7 +108,7 @@ The settings below were used to transcribe and translate 1:00–1:30 of the 「�
 
 This setup collects 14-second audio chunks for HTTP transcription. The audio language setting applies to both WebSocket and HTTP transcription. Choose **Automatic detection (`자동 감지`)** for songs with multiple languages.
 
-To start the STT server from the popup, copy the installed extension's ID from `chrome://extensions` and run `npm run stt:native:install -- YOUR_EXTENSION_ID` once with your actual ID. Save the settings, open the popup on the video tab, and click **Start local STT (`로컬 STT 시작`)**. When the server is ready, click **Start audio (`음성 시작`)**.
+For automatic STT startup, copy the installed extension's ID from `chrome://extensions` and run `npm run stt:native:install -- YOUR_EXTENSION_ID` once with your actual ID. Prepare the STT model, save your settings, and click **Start audio (음성 시작)** in the video popup. Allow the Chrome permissions when prompted. The extension reuses a compatible server that is already running at the default address.
 
 ## Troubleshooting
 

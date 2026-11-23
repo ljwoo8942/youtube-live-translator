@@ -120,6 +120,10 @@ export type MessageResponse<T = unknown> =
   | ({ ok: true } & T)
   | { ok: false; error: string };
 
+export type AudioCaptureStartResponse = MessageResponse<{ tabId: number; mode?: string }> & {
+  needsNativeSttPermission?: true;
+};
+
 export function getErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message;

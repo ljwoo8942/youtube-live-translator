@@ -16,6 +16,34 @@ function functions(path, names, context) {
   return context;
 }
 
+test("the popup requests only the needed permissions from the click before awaiting the active tab", async () => {
+  const url = "https://chzzk.naver.com/video/123456";
+  const page = getVideoPage(url);
+  const requested = [];
+  let tabUrl = url;
+  const popup = functions("src/popup/index.ts", ["ensureTabCapturePermission", "prepareAudioCapture"], {
+    currentTabId: 7, currentTabPage: page, settings: { sttProvider: "whisper" },
+    needsNativeSttPermission: true, usesNativeSttEndpoint: ({ sttProvider }) => sttProvider === "whisper",
+    activeTab: async () => ({ id: 7, url: tabUrl }), getVideoPage,
+    chrome: {
+      permissions: {
+        request({ permissions }) {
+          requested.push(Array.from(permissions));
+          return Promise.resolve(true);
+        }
+      },
+      tabs: { sendMessage: async () => ({ ok: true, videoId: page.videoId }) }
+    }
+  });
+  const local = popup.prepareAudioCapture();
+  assert.deepEqual(requested[0], ["tabCapture", "nativeMessaging"]);
+  assert.equal((await local).videoId, page.videoId);
+  await popup.prepareAudioCapture("openai");
+  assert.deepEqual(requested[1], ["tabCapture"]);
+  tabUrl = "https://chzzk.naver.com/video/654321";
+  await assert.rejects(popup.prepareAudioCapture(), /영상이 바뀌었습니다/);
+});
+
 test("lyric streaming uses the selected language and leaves automatic language detection available", () => {
   const { streamUrl } = functions("src/offscreen/index.ts", ["streamUrl"], { URL });
   const config = { endpoint: "ws://127.0.0.1:8765/v1/audio/stream", contentMode: "lyrics", model: "qwen3-asr-1.7b" };
