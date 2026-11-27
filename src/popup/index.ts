@@ -1,6 +1,6 @@
 import { loadSettings } from "../shared/storage";
 import { needsLocalSttStart, usesNativeSttEndpoint } from "../shared/localStt";
-import type { AudioCaptureStartResponse, LocalSttServerState, MessageResponse } from "../shared/messages";
+import type { AudioCaptureStartResponse, AudioCaptureStopResponse, LocalSttServerState, MessageResponse } from "../shared/messages";
 import type { ContentMode, InputMode, SttProvider, TranslationProvider, TranslatorSettings } from "../shared/types";
 import { getVideoPage } from "../shared/videoSites";
 import "./style.css";
@@ -95,12 +95,6 @@ function localSttStatusText(state: LocalSttServerState): string {
   if (state.state === "running") return `로컬 STT 실행 중 · ${state.model} · ${state.device} / ${state.computeType}`;
   if (state.state === "starting") return "로컬 STT 서버를 시작하는 중입니다.";
   return "이 확장에서 실행 중인 로컬 STT 서버가 없습니다.";
-}
-
-async function stopLocalSttServer(): Promise<void> {
-  const response = await chrome.runtime.sendMessage<MessageResponse<LocalSttServerState>>({ type: "LOCAL_STT_SERVER", action: "stop" });
-  if (!response?.ok) throw new Error(response?.error ?? "로컬 STT 서버 응답을 받지 못했습니다.");
-  setStatus(localSttStatusText(response));
 }
 
 function closePopupAfterSuccess(): void {
@@ -301,9 +295,6 @@ function render(): void {
         <button id="save" class="primary">저장</button>
         <button id="startAudio">음성 시작</button>
         <button id="stopAudio">음성 중지</button>
-      </div>
-      <div class="actions">
-        <button id="stopLocalSttServer">로컬 STT 중지</button>
       </div>
       <div class="actions">
         <button id="options">전체 설정</button>
@@ -508,27 +499,35 @@ function render(): void {
     });
   });
 
-  document.querySelector("#stopLocalSttServer")?.addEventListener("click", () => {
-    runAction(stopLocalSttServer);
-  });
-
   document.querySelector("#stopAudio")?.addEventListener("click", () => {
     runAction(async () => {
       const tab = await activeTab();
-      const prepared = tab?.id
+      const tabId = tab?.id;
+      const page = getVideoPage(tab?.url);
+      if (!tabId || tabId !== currentTabId || !page || page.site !== currentTabPage?.site || page.videoId !== currentTabPage?.videoId) {
+        throw new Error("탭이나 영상이 바뀌었습니다. 현재 탭에서 팝업을 다시 열어 주세요.");
+      }
+
+      const videoId = page.videoId;
+      const prepared = videoId
         ? await chrome.tabs
-            .sendMessage<MessageResponse<{ videoId: string }>>(tab.id, { type: "PREPARE_AUDIO_STOP" })
+            .sendMessage<MessageResponse<{ videoId: string }>>(tabId, { type: "PREPARE_AUDIO_STOP" })
             .catch(() => undefined)
         : undefined;
-      const response = await chrome.runtime.sendMessage<MessageResponse>({
-        type: "STOP_AUDIO_CAPTURE",
-        tabId: tab?.id,
-        videoId: prepared?.ok ? prepared.videoId : undefined
-      });
-      setStatus(response?.ok ? "음성 인식을 중지했습니다." : response?.error ?? "음성 인식 중지 응답을 받지 못했습니다.");
-      if (response?.ok) {
-        closePopupAfterSuccess();
+      if (prepared?.ok && prepared.videoId !== videoId) {
+        throw new Error("영상이 바뀌었습니다. 현재 탭에서 팝업을 다시 열어 주세요.");
       }
+
+      const response = await chrome.runtime.sendMessage<AudioCaptureStopResponse>({
+        type: "STOP_AUDIO_CAPTURE",
+        tabId,
+        videoId
+      });
+      if (!response?.ok) {
+        throw new Error(response?.error ?? "음성 인식 중지 응답을 받지 못했습니다.");
+      }
+      setStatus(response.localSttStopped ? "음성 인식과 로컬 STT 서버를 중지했습니다." : "음성 인식을 중지했습니다.");
+      closePopupAfterSuccess();
     });
   });
 

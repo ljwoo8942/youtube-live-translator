@@ -53,6 +53,7 @@ test("lyric streaming uses the selected language and leaves automatic language d
 
 function streamHarness(settings = { enabled: true }) {
   const pending = [], sent = [];
+  settings = { lmStudio: { baseUrl: "http://127.0.0.1:1234/v1" }, ollama: { baseUrl: "http://127.0.0.1:11434" }, ...settings };
   const context = functions("src/background/index.ts", [
     "audioTransportConfig", "processStreamTranscript", "shouldTranslateStreamPartial", "normalizeText",
     "translateStreamSegment", "translateQueuedStreamSegment", "audioRequestController", "isActiveAudioSession"
@@ -62,13 +63,15 @@ function streamHarness(settings = { enabled: true }) {
     lastTranslationConfigRevision: undefined, lastPartialTranslationByTab: new Map(), lastFinalTranscriptByTab: new Map(),
     lyricsAssistByTab: new Map(), sanitizeAudioTranscript: (text) => text, assistLyricsSegment: (_, segment) => segment,
     notifyLyricsAssistStatus() {},
+    correctionSessionsByTab: new Map(),
+    isLocalBaseUrl: (url) => ["127.0.0.1", "localhost", "[::1]"].includes(new URL(url).hostname),
     STREAM_PARTIAL_TRANSLATION_MIN_CHARACTERS: 5, STREAM_PARTIAL_TRANSLATION_MIN_INTERVAL_MS: 1250,
     MIN_STABLE_AUDIO_CHUNK_MS: 8000,
     loadSettingsSnapshot: async () => ({ settings, translationConfigRevision: 1 }),
     matchUserCorrection: async () => undefined,
     segmentWithAudioContext: (_, segment) => segment,
-    translateAndRespond: (segment, signal) => new Promise((resolve, reject) => {
-      pending.push({ segment, signal, resolve });
+    translateAndRespond: (segment, signal, _settings, draft) => new Promise((resolve, reject) => {
+      pending.push({ segment, signal, resolve, draft });
       signal.addEventListener("abort", () => reject(signal.reason), { once: true });
     }),
     notifyTab: async (_, message) => sent.push(message), rememberAudioContext() {},
@@ -113,6 +116,33 @@ test("pausing the current video resets its buffer and blocks audio subtitles unt
   assert.equal(c.shouldAcceptAudioSegment(segment("after resume")), true);
 });
 
+test("tab capture stays active near the end of a video and stops when playback has ended", async () => {
+  let video = null;
+  let stops = 0;
+  const content = functions("src/content/index.ts", ["videoPlaybackEnded", "tick"], {
+    activeVideoId: "chzzk:video:123456", audioCaptureRequested: true,
+    settings: { enabled: true, inputMode: "audio" }, isYouTubeSite: false,
+    findVideoElement: () => video, handleUrlChange() {}, handleVideoElementChange() {},
+    stopAudioFallback: async () => { stops++; },
+    startAudioFallbackIfNeeded: async () => {}
+  });
+
+  await content.tick();
+  assert.equal(stops, 0);
+
+  video = { duration: 25, currentTime: 24.8, ended: false, loop: true };
+  await content.tick();
+  assert.equal(stops, 0);
+
+  video.loop = false;
+  await content.tick();
+  assert.equal(stops, 0);
+
+  video.ended = true;
+  await content.tick();
+  assert.equal(stops, 1);
+});
+
 test("a recorder chunk that finishes encoding after reset is discarded", async () => {
   const sent = [];
   let finishEncoding;
@@ -149,6 +179,49 @@ test("a delayed stream notification cannot start a translation after its buffer 
   await setImmediate();
   assert.equal(pending.length, 0);
   await processing;
+});
+
+test("a local preview can display while progress and dictionary lookup are pending", async () => {
+  const { context: c, pending, sent } = streamHarness({ enabled: true, contentMode: "spoken", translationProvider: "lmStudio" });
+  let finishProgress, finishCorrection;
+  c.notifyTab = async (_, message) => {
+    sent.push(message);
+    if (message.type === "STREAM_STT_TRANSCRIPT") {
+      await new Promise((resolve) => { finishProgress = resolve; });
+    }
+  };
+  c.matchUserCorrection = () => new Promise((resolve) => { finishCorrection = resolve; });
+  const transcript = { type: "STREAM_STT_TRANSCRIPT", tabId: 1, videoId: "v", segment: segment("utterance"), isFinal: false };
+  const preview = c.processStreamTranscript(transcript);
+  await setImmediate();
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].draft, true);
+  pending[0].resolve(result("임시 번역"));
+  await setImmediate();
+  assert.equal(sent.at(-1).translatedText, "임시 번역");
+  finishProgress();
+  await preview;
+
+  const confirmed = c.processStreamTranscript({ ...transcript, isFinal: true });
+  await setImmediate();
+  finishCorrection({ translatedText: "교정된 번역", provider: "사용자 교정" });
+  await confirmed;
+  assert.equal(sent.at(-1).translatedText, "교정된 번역");
+  assert.equal(pending.length, 1);
+});
+
+test("a confirmed local transcript supersedes a pending preview of the same text", async () => {
+  const { context: c, pending, sent } = streamHarness({ enabled: true, contentMode: "spoken", translationProvider: "ollama" });
+  const line = segment("same utterance");
+  const preview = c.translateStreamSegment(1, "v", line, false, 1);
+  await setImmediate();
+  await c.translateStreamSegment(1, "v", line, true, 1);
+  await setImmediate();
+  assert.equal(pending[0].signal.aborted, true);
+  assert.equal(pending.length, 2);
+  pending[1].resolve(result("확정 번역"));
+  await preview;
+  assert.deepEqual(sent.map((message) => message.translatedText), ["확정 번역"]);
 });
 
 for (const [model, translationProvider] of [
@@ -416,6 +489,121 @@ test("closing the last translation consumer aborts the provider fetch", async ()
   await assert.rejects(request, { name: "AbortError" });
   assert.equal(providerSignal.aborted, true);
   assert.equal(c.translationInFlight.size, 0);
+});
+
+test("an accepted draft does not seed the confirmed translation cache", async () => {
+  const memo = new Map();
+  const outputs = ["임시 번역", "확정 번역"];
+  const c = functions("src/background/index.ts", ["translateAndRespond"], {
+    AbortController, translationInFlight: new Map(), hasCorruptedSubtitleText: () => false,
+    cacheKey: () => "same", getMemoryCachedTranslation: (key) => memo.get(key),
+    rememberTranslation: (key, text) => memo.set(key, text),
+    sanitizeTranslatedSubtitle: (_, text) => text, getErrorMessage: (error) => error.message,
+    translateSegment: async () => result(outputs.shift())
+  });
+  const settings = { enabled: true, contentMode: "spoken" };
+  const line = segment("same");
+  assert.equal((await c.translateAndRespond(line, undefined, settings, true)).translatedText, "임시 번역");
+  assert.equal(memo.size, 0);
+  assert.equal((await c.translateAndRespond(line, undefined, settings)).translatedText, "확정 번역");
+  assert.equal((await c.translateAndRespond(line, undefined, settings)).provider, "cache");
+  assert.equal(outputs.length, 0);
+});
+
+test("a rejected draft skips the repair request until confirmation", async () => {
+  const guides = [];
+  const c = functions("src/background/index.ts", ["translateAndRespond"], {
+    AbortController, translationInFlight: new Map(), hasCorruptedSubtitleText: () => false,
+    cacheKey: () => "same", getMemoryCachedTranslation: () => undefined, rememberTranslation() {},
+    BLOCKED_HALLUCINATION_ERROR: "blocked",
+    sanitizeTranslatedSubtitle: (_, text) => text === "incorrect" ? "" : text,
+    translationCorrectionGuidance: () => "repair",
+    getErrorMessage: (error) => error.message,
+    translateSegment: async (_, __, guide) => {
+      guides.push(guide);
+      return result(guide ? "검증된 번역" : "incorrect");
+    }
+  });
+  const settings = { enabled: true, contentMode: "spoken" };
+  const line = segment("same");
+  assert.equal((await c.translateAndRespond(line, undefined, settings, true)).ok, false);
+  assert.deepEqual(guides, [undefined]);
+  assert.equal((await c.translateAndRespond(line, undefined, settings)).translatedText, "검증된 번역");
+  assert.deepEqual(guides, [undefined, undefined, "repair"]);
+});
+
+test("Japanese to Korean wording rules preserve a correct English translation", () => {
+  const c = functions("src/background/index.ts", [
+    "translationCorrectionGuidance", "sanitizeTranslatedSubtitle", "normalizeSubtitleLines",
+    "isKoreanTargetLanguage", "polishKoreanSubtitleDiction", "polishJapaneseKoreanMeaning",
+    "isUnsupportedJapaneseTelepathyTranslation", "isUnsupportedJapanesePregnancyTranslation",
+    "isUnsupportedJapaneseAddedAction", "isUnsupportedJapaneseDislikeRelation", "isUnsupportedJapaneseGoalTranslation"
+  ], {
+    console: { debug() {} }, hasCorruptedSubtitleText: () => false, isModelRefusalOrMetaText: () => false,
+    hasExcessiveTextRepetition: () => false, isProbableGeneratedBoilerplate: () => false,
+    isProbableCtaHallucination: () => false, restoreSourceEdgeMarkers: (_, text) => text,
+    sanitizeAudioTranscript: (text) => text
+  });
+  const line = { ...segment("sense"), text: "テレパシーが通じた。" };
+  const english = { contentMode: "spoken", targetLanguage: "en" };
+  const korean = { ...english, targetLanguage: "ko" };
+  assert.equal(c.sanitizeTranslatedSubtitle(line, "Telepathy worked.", english), "Telepathy worked.");
+  assert.equal(c.translationCorrectionGuidance(line, "Telepathy worked.", english), undefined);
+  assert.equal(c.sanitizeTranslatedSubtitle(line, "마음이 통했어.", korean), "");
+  assert.equal(c.sanitizeTranslatedSubtitle(line, "텔레파시가 통했어.", korean), "텔레파시가 통했어.");
+});
+
+test("translation cache distinguishes capitalization and speaker turns", () => {
+  const { cacheKey } = functions("src/background/index.ts", ["cacheKey", "normalizeText", "normalizeSubtitleLines"], {
+    TRANSLATION_PROMPT_VERSION: "test"
+  });
+  const settings = { translationProvider: "ollama", ollama: { baseUrl: "http://localhost:11434", model: "test" } };
+  const line = segment("key");
+  assert.notEqual(cacheKey(settings, { ...line, text: "IT works." }), cacheKey(settings, { ...line, text: "It works." }));
+  assert.notEqual(cacheKey(settings, { ...line, text: "Wait.\nGo now." }), cacheKey(settings, { ...line, text: "Wait. Go now." }));
+  assert.notEqual(cacheKey(settings, line), cacheKey(settings, { ...line, source: "youtubeTimedText" }));
+});
+
+test("confirmed local audio repairs a plausible mistranslation that passed the existing rules", async () => {
+  const reviews = [];
+  const c = functions("src/background/index.ts", ["translateAndRespond"], {
+    AbortController, translationInFlight: new Map(), hasCorruptedSubtitleText: () => false,
+    cacheKey: () => "meeting", getMemoryCachedTranslation: () => undefined, rememberTranslation() {},
+    sanitizeTranslatedSubtitle: (_, translation) => translation, getErrorMessage: (error) => error.message,
+    translateSegment: async () => result("내일 회의에 갈 거예요."),
+    reviewLocalAudioTranslation: async (_, line, translation, guidance) => {
+      reviews.push({ text: line.text, translation, guidance });
+      return { decision: "correct", translation: "내일 회의에 가지 않을 거예요." };
+    }
+  });
+  const settings = { enabled: true, contentMode: "spoken", translationProvider: "lmStudio" };
+  const line = { ...segment("meeting"), text: "明日は会議に行きません。" };
+  assert.equal((await c.translateAndRespond(line, undefined, settings, true)).translatedText, "내일 회의에 갈 거예요.");
+  assert.equal(reviews.length, 0);
+  const confirmed = await c.translateAndRespond(line, undefined, settings);
+  assert.equal(confirmed.translatedText, "내일 회의에 가지 않을 거예요.");
+  assert.equal(confirmed.provider, "로컬 교정");
+  assert.deepEqual(reviews, [{ text: line.text, translation: "내일 회의에 갈 거예요.", guidance: undefined }]);
+});
+
+test("a local review preserves the accepted translation on keep or a changed source number", async () => {
+  const valid = "회의에 15명이 왔어.";
+  for (const [review, provider] of [
+    [{ decision: "keep" }, "로컬 검토 완료"],
+    [{ decision: "correct", translation: "회의에 50명이 왔어." }, "test"]
+  ]) {
+    const c = functions("src/background/index.ts", ["translateAndRespond"], {
+      AbortController, translationInFlight: new Map(), hasCorruptedSubtitleText: () => false,
+      cacheKey: () => "attendance", getMemoryCachedTranslation: () => undefined, rememberTranslation() {},
+      sanitizeTranslatedSubtitle: (_, translation) => translation, getErrorMessage: (error) => error.message,
+      translateSegment: async () => result(valid), reviewLocalAudioTranslation: async () => review
+    });
+    const settings = { enabled: true, translationProvider: "ollama" };
+    const line = { ...segment("attendance"), text: "会議には15人が来た。" };
+    const confirmed = await c.translateAndRespond(line, undefined, settings);
+    assert.equal(confirmed.provider, provider);
+    assert.equal(confirmed.translatedText, valid);
+  }
 });
 
 test("the first changed-settings broadcast cancels work in a restarted service worker", async () => {

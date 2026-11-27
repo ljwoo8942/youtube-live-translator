@@ -1432,12 +1432,13 @@ async def audio_stream(websocket: WebSocket) -> None:
     try:
         while not closed:
             await audio_updated.wait()
-            audio_updated.clear()
             delay = stream_decode_interval_seconds - (time.perf_counter() - last_decode_at)
             if delay > 0:
                 await asyncio.sleep(delay)
             if closed:
                 break
+            # This snapshot includes every frame received during the decode interval.
+            audio_updated.clear()
             now = time.perf_counter()
             required_samples = startup_min_samples if not last_final else min_samples
             if buffered_samples < required_samples:

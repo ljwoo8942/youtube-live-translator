@@ -8,6 +8,10 @@ const workerScript = buildSync({
   entryPoints: [fileURLToPath(new URL("../src/background/index.ts", import.meta.url))],
   bundle: true, format: "iife", platform: "browser", write: false
 }).outputFiles[0].text;
+const offscreenScript = buildSync({
+  entryPoints: [fileURLToPath(new URL("../src/offscreen/index.ts", import.meta.url))],
+  bundle: true, format: "iife", platform: "browser", write: false
+}).outputFiles[0].text;
 
 const extensionId = "a".repeat(32);
 const popup = { id: extensionId, url: `chrome-extension://${extensionId}/popup.html` };
@@ -21,9 +25,54 @@ function event() {
   };
 }
 
+test("a stop queued for the previous video cannot release a reconfigured capture", { timeout: 2000 }, async () => {
+  const messages = event();
+  const statuses = [];
+  let stoppedTracks = 0;
+  const track = { stop() { stoppedTracks += 1; } };
+  const stream = { getTracks: () => [track] };
+  const chrome = {
+    runtime: { onMessage: messages, sendMessage: async (message) => { statuses.push(message); } }
+  };
+  vm.runInNewContext(offscreenScript, {
+    chrome,
+    console,
+    navigator: { mediaDevices: { getUserMedia: async () => stream } },
+    window: { setTimeout: () => 1, clearTimeout() {} },
+    AudioContext: class {
+      state = "running";
+      createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
+      async close() { this.state = "closed"; }
+    },
+    MediaRecorder: class {
+      static isTypeSupported() { return true; }
+      state = "inactive";
+      addEventListener() {}
+      start() { this.state = "recording"; }
+      stop() { this.state = "inactive"; }
+    }
+  });
+  const send = (type, payload = {}) => new Promise((resolve) => {
+    messages.emit({ type, target: "offscreen", tabId: 7, ...payload }, {}, resolve);
+  });
+
+  assert.equal((await send("START_AUDIO_CAPTURE", { videoId: "old", streamId: "stream" })).ok, true);
+  const change = send("RECONFIGURE_AUDIO_CAPTURE", { expectedVideoId: "old", videoId: "new" });
+  const staleStop = send("STOP_AUDIO_CAPTURE", { videoId: "old" });
+  assert.ok((await Promise.all([change, staleStop])).every((response) => response.ok));
+  const current = await send("GET_OFFSCREEN_AUDIO_STATE");
+  assert.equal(current.recording, true);
+  assert.equal(current.activeVideoId, "new");
+  assert.equal(stoppedTracks, 0);
+  assert.ok(statuses.every((status) => status.state !== "idle"));
+  assert.equal((await send("STOP_AUDIO_CAPTURE", { videoId: "new" })).ok, true);
+  assert.equal(stoppedTracks, 1);
+});
+
 function workerHarness({
   model = "qwen3-asr-0.6b", baseUrl = "http://127.0.0.1:8765/v1", hostError,
-  sttProvider = "whisper", initiallyListening = false, nativePermission = true, navigateWhenReady = false
+  sttProvider = "whisper", initiallyListening = false, nativePermission = true, navigateWhenReady = false,
+  captureStopFails = false
 } = {}) {
   const commands = [];
   const events = [];
@@ -47,6 +96,12 @@ function workerHarness({
         events.push("reconfigure");
         return { ok: true, mode: capture?.mode };
       }
+      if (message.type === "STOP_AUDIO_CAPTURE" && message.target === "offscreen" &&
+          capture?.activeTabId === message.tabId && capture?.activeVideoId === message.videoId) {
+        if (captureStopFails) throw new Error("Failed to stop the recorder");
+        capture = undefined;
+        events.push("capture stopped");
+      }
       return { ok: true };
     },
     connectNative(application) {
@@ -69,6 +124,7 @@ function workerHarness({
               this.onMessage.emit({ ok: true, state: "running", model: command.model, device: "cuda", computeType: "float16" });
             } else {
               listening = false;
+              events.push("server stopped");
               this.onMessage.emit({ ok: true, state: "stopped" });
             }
           });
@@ -110,10 +166,16 @@ function workerHarness({
   return {
     commands, events,
     closeServer: () => { listening = false; },
+    navigate: (url) => { tabUrl = url; },
     disconnect: () => port.onDisconnect.emit(),
     capture: (sender = popup) => new Promise((resolve) => {
       runtime.onMessage.emit({
         type: "START_AUDIO_CAPTURE", tabId: 7, videoId: "chzzk:video:123456", ensureTabCapturePermission: true
+      }, sender, resolve);
+    }),
+    stopCapture: (sender = popup, payload = {}) => new Promise((resolve) => {
+      runtime.onMessage.emit({
+        type: "STOP_AUDIO_CAPTURE", tabId: 7, videoId: "chzzk:video:123456", ...payload
       }, sender, resolve);
     }),
     send: (action, sender = popup, payload = {}) => new Promise((resolve) => {
@@ -153,6 +215,59 @@ test("the unified start restores a stopped local server for an existing tab capt
   assert.deepEqual(worker.commands, [{ action: "start", model: "qwen3-asr-0.6b" }]);
   assert.equal(worker.events.filter((event) => event === "stream ID").length, 1);
   assert.equal(worker.events.at(-1), "reconfigure");
+});
+
+test("popup stop releases tab capture before shutting down its Qwen or Whisper server", async () => {
+  for (const model of ["qwen3-asr-1.7b", "base"]) {
+    const worker = workerHarness({ model });
+    assert.equal((await worker.capture()).ok, true);
+    const response = await worker.stopCapture();
+    assert.equal(response.ok, true);
+    assert.equal(response.localSttStopped, true);
+    assert.deepEqual(worker.events.slice(-2), ["capture stopped", "server stopped"]);
+    assert.equal((await worker.send("status")).state, "stopped");
+    assert.equal((await worker.stopCapture()).ok, true);
+    assert.deepEqual(worker.commands, [{ action: "start", model }, { action: "stop" }]);
+  }
+});
+
+test("popup stop releases capture when STT is external", async () => {
+  const worker = workerHarness({ initiallyListening: true, nativePermission: false });
+  assert.equal((await worker.capture()).ok, true);
+  const response = await worker.stopCapture();
+  assert.equal(response.ok, true);
+  assert.equal(response.localSttStopped, undefined);
+  assert.equal(worker.events.at(-1), "capture stopped");
+  assert.deepEqual(worker.commands, []);
+});
+
+test("automatic stop leaves the owned server available for restart and popup stop can shut it down when idle", async () => {
+  const worker = workerHarness();
+  assert.equal((await worker.capture()).ok, true);
+  const content = { id: extensionId, url: "https://chzzk.naver.com/video/123456", tab: { id: 7 } };
+  assert.equal((await worker.stopCapture(content)).ok, true);
+  assert.equal(worker.events.at(-1), "capture stopped");
+  assert.equal((await worker.send("status")).state, "running");
+  worker.navigate("https://chzzk.naver.com/");
+  assert.equal((await worker.stopCapture(popup, { videoId: undefined })).localSttStopped, true);
+});
+
+test("popup stop preserves capture and the owned server after a tab switch or navigation", async () => {
+  const worker = workerHarness();
+  assert.equal((await worker.capture()).ok, true);
+  assert.equal((await worker.stopCapture(popup, { tabId: 8 })).ok, false);
+  worker.navigate("https://chzzk.naver.com/video/654321");
+  assert.equal((await worker.stopCapture()).ok, false);
+  assert.equal((await worker.send("status")).state, "running");
+  assert.equal(worker.events.at(-1), "capture");
+});
+
+test("popup stop reports an error and keeps the server when the recorder remains active", async () => {
+  const worker = workerHarness({ captureStopFails: true });
+  assert.equal((await worker.capture()).ok, true);
+  assert.equal((await worker.stopCapture()).ok, false);
+  assert.equal((await worker.send("status")).state, "running");
+  assert.equal(worker.events.at(-1), "capture");
 });
 
 test("native startup requires popup authorization and skips capture if the video has changed", async () => {

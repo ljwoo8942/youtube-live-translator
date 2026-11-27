@@ -124,6 +124,8 @@ export type AudioCaptureStartResponse = MessageResponse<{ tabId: number; mode?: 
   needsNativeSttPermission?: true;
 };
 
+export type AudioCaptureStopResponse = MessageResponse<{ localSttStopped?: true }>;
+
 export function getErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message;

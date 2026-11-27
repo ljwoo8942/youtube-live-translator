@@ -1,11 +1,11 @@
 import { loadSettings, loadSettingsSnapshot, patchSettings, toContentSettings } from "../shared/storage";
 import type { CaptionSegment, PageCaptionSnapshot, PageCaptionTrack, TranslatorSettings } from "../shared/types";
-import type { AudioCaptureStartResponse, CaptionTranslationEntry, MessageResponse, RuntimeMessage } from "../shared/messages";
+import type { AudioCaptureStartResponse, AudioCaptureStopResponse, CaptionTranslationEntry, MessageResponse, RuntimeMessage } from "../shared/messages";
 import { BLOCKED_HALLUCINATION_ERROR, getErrorMessage } from "../shared/messages";
 import { needsLocalSttStart, usesNativeSttEndpoint } from "../shared/localStt";
 import { TRANSLATION_PROMPT_VERSION } from "../shared/translationVersion";
 import { getVideoPage, isChzzkVideoId, VIDEO_SITE_MATCHES } from "../shared/videoSites";
-import { assertTranscriptionReady, assertTranslationReady, transcribeAudio, translateSegment, translateSegments } from "./providers";
+import { assertTranscriptionReady, assertTranslationReady, isLocalBaseUrl, PRESERVED_ENGLISH_LYRIC_HOOKS, reviewLocalAudioTranslation, transcribeAudio, translateSegment, translateSegments } from "./providers";
 import { getLocalSttServerState, startLocalSttServer, stopLocalSttServer } from "./nativeStt";
 import {
   createCaptionCacheContext,
@@ -87,7 +87,7 @@ const lastPartialTranslationByTab = new Map<number, { text: string; at: number }
 type StreamTranslationQueue = {
   videoId: string;
   controller: AbortController;
-  activePartial?: { text: string; controller: AbortController };
+  activePartial?: { text: string; controller: AbortController; draft?: boolean };
   pending?: { segment: CaptionSegment; isFinal: boolean; revision: number };
   pendingFinal?: { segment: CaptionSegment; isFinal: boolean; revision: number };
 };
@@ -352,7 +352,6 @@ const TRANSLATION_REFUSAL_KEYS = new Set([
   "asanai",
   "asanailanguagemodel"
 ]);
-const PRESERVED_ENGLISH_LYRIC_HOOKS = new Set(["oh", "yeah", "baby", "la", "wow", "na", "ah", "ah-ah"]);
 
 type OffscreenAudioState = {
   activeTabId?: number;
@@ -675,9 +674,12 @@ function startCorrectionSession(tabId: number, videoId: string): CorrectionSessi
     if (!preferences.enabled || correctionSessionsByTab.get(tabId) !== state) {
       return;
     }
-    const [media, songs, settings] = await Promise.all([
+    const songs = await correctionLibrary();
+    if (songs.length === 0 || correctionSessionsByTab.get(tabId) !== state) {
+      return;
+    }
+    const [media, settings] = await Promise.all([
       readPageMediaContext(tabId, videoId),
-      correctionLibrary(),
       loadSettings()
     ]);
     if (!media || correctionSessionsByTab.get(tabId) !== state) {
@@ -1407,20 +1409,22 @@ function translationCorrectionGuidance(
       .map(([token, count]) => `${token} ${count}회`);
     guidance.push(`원문 영어 훅을 번역하거나 한글로 음역하지 말고 그대로 유지한다: ${hooks.join(", ")}.`);
   }
-  if (isUnsupportedJapaneseTelepathyTranslation(segment.text, translatedText)) {
-    guidance.push("テレパシー와 テレパシ는 반드시 텔레파시로 옮긴다.");
-  }
-  if (isUnsupportedJapanesePregnancyTranslation(segment.text, translatedText)) {
-    guidance.push("子供ができた는 임신했다가 아니라 아이가 생겼다로 옮긴다.");
-  }
-  if (isUnsupportedJapaneseAddedAction(segment.text, translatedText)) {
-    guidance.push("気付けば는 어느새 또는 정신 차려 보니이며, 마음을 열었다는 행동을 추가하지 않는다.");
-  }
-  if (isUnsupportedJapaneseDislikeRelation(segment.text, translatedText)) {
-    guidance.push("人が嫌いな子는 사람이 싫은 아이가 아니라 사람을 싫어하는 아이로 옮긴다.");
-  }
-  if (isUnsupportedJapaneseGoalTranslation(segment.text, translatedText)) {
-    guidance.push("스포츠 문맥이 아닌 ゴール은 골이 아니라 끝이나 목표로 옮긴다.");
+  if (isKoreanTargetLanguage(settings.targetLanguage)) {
+    if (isUnsupportedJapaneseTelepathyTranslation(segment.text, translatedText)) {
+      guidance.push("テレパシー와 テレパシ는 반드시 텔레파시로 옮긴다.");
+    }
+    if (isUnsupportedJapanesePregnancyTranslation(segment.text, translatedText)) {
+      guidance.push("子供ができた는 임신했다가 아니라 아이가 생겼다로 옮긴다.");
+    }
+    if (isUnsupportedJapaneseAddedAction(segment.text, translatedText)) {
+      guidance.push("気付けば는 어느새 또는 정신 차려 보니이며, 마음을 열었다는 행동을 추가하지 않는다.");
+    }
+    if (isUnsupportedJapaneseDislikeRelation(segment.text, translatedText)) {
+      guidance.push("人が嫌いな子는 사람이 싫은 아이가 아니라 사람을 싫어하는 아이로 옮긴다.");
+    }
+    if (isUnsupportedJapaneseGoalTranslation(segment.text, translatedText)) {
+      guidance.push("스포츠 문맥이 아닌 ゴール은 골이 아니라 끝이나 목표로 옮긴다.");
+    }
   }
   return guidance.length > 0 ? guidance.join(" ") : undefined;
 }
@@ -1446,31 +1450,7 @@ function sanitizeTranslatedSubtitle(
   if (!normalized || isModelRefusalOrMetaText(normalized) || (hasExcessiveTextRepetition(normalized) && !hasAllowedLyricRefrain)) {
     return "";
   }
-  if (settings.contentMode === "lyrics" && isMissingRequiredEnglishLyricHook(segment.text, normalized)) {
-    console.debug("Blocked translation that removed an English lyric hook", {
-      source: segment.text,
-      translated: normalized
-    });
-    return "";
-  }
-  if (isUnsupportedJapanesePregnancyTranslation(segment.text, normalized)) {
-    console.debug("Blocked unsupported pregnancy translation", { source: segment.text, translated: normalized });
-    return "";
-  }
-  if (isUnsupportedJapaneseAddedAction(segment.text, normalized)) {
-    console.debug("Blocked unsupported Japanese added action", { source: segment.text, translated: normalized });
-    return "";
-  }
-  if (isUnsupportedJapaneseTelepathyTranslation(segment.text, normalized)) {
-    console.debug("Blocked unsupported Japanese telepathy translation", { source: segment.text, translated: normalized });
-    return "";
-  }
-  if (isUnsupportedJapaneseDislikeRelation(segment.text, normalized)) {
-    console.debug("Blocked reversed Japanese dislike relation", { source: segment.text, translated: normalized });
-    return "";
-  }
-  if (isUnsupportedJapaneseGoalTranslation(segment.text, normalized)) {
-    console.debug("Blocked unsupported Japanese goal translation", { source: segment.text, translated: normalized });
+  if (translationCorrectionGuidance(segment, normalized, settings)) {
     return "";
   }
 
@@ -1503,16 +1483,17 @@ function cacheKey(settings: Awaited<ReturnType<typeof loadSettings>>, segment: C
         : settings.translationProvider === "ollama"
           ? `${settings.ollama.baseUrl}:${settings.ollama.model}`
           : settings.translationProvider;
-  return [
+  return JSON.stringify([
     TRANSLATION_PROMPT_VERSION,
     settings.translationProvider,
     provider,
     settings.sourceLanguage,
     settings.targetLanguage,
     settings.contentMode,
-    normalizeText(segment.text),
-    normalizeText(segment.contextText ?? "")
-  ].join("|");
+    segment.source,
+    normalizeSubtitleLines(segment.text),
+    normalizeSubtitleLines(segment.contextText ?? "")
+  ]);
 }
 
 function getMemoryCachedTranslation(key: string): string | undefined {
@@ -1683,7 +1664,8 @@ async function handleTestTranslation(
 async function translateAndRespond(
   segment: CaptionSegment,
   signal?: AbortSignal,
-  settings?: TranslatorSettings
+  settings?: TranslatorSettings,
+  draft = false
 ): Promise<MessageResponse<{ translatedText: string; provider: string }>> {
   settings ??= await loadSettings();
   signal?.throwIfAborted();
@@ -1704,36 +1686,58 @@ async function translateAndRespond(
     return { ok: true, translatedText: cached, provider: "cache" };
   }
 
-  let request = translationInFlight.get(key);
+  const requestKey = draft ? `draft:${key}` : key;
+  let request = translationInFlight.get(requestKey);
   if (!request) {
     const controller = new AbortController();
     const translationPromise: TranslationRequest["promise"] = (async () => {
       try {
         let result = await translateSegment(effectiveSettings, segment, undefined, controller.signal);
         let translatedText = sanitizeTranslatedSubtitle(segment, result.translatedText, effectiveSettings);
-        if (!translatedText) {
-          const correctionGuidance = translationCorrectionGuidance(segment, result.translatedText, effectiveSettings);
-          if (correctionGuidance) {
+        let provider: string = result.provider;
+        if (!draft) {
+          const correctionGuidance = translatedText
+            ? undefined
+            : translationCorrectionGuidance(segment, result.translatedText, effectiveSettings);
+          if (segment.source === "audioStt" &&
+              (effectiveSettings.translationProvider === "lmStudio" || effectiveSettings.translationProvider === "ollama")) {
+            const review = await reviewLocalAudioTranslation(
+              effectiveSettings, segment, translatedText || result.translatedText, correctionGuidance, controller.signal
+            );
+            if (review?.decision === "keep" && translatedText) {
+              provider = "로컬 검토 완료";
+            } else if (review?.decision === "correct") {
+              const corrected = sanitizeTranslatedSubtitle(segment, review.translation, effectiveSettings);
+              const numbers = (text: string) => text.normalize("NFKC").match(/\d+(?:[.,]\d+)*/g)?.sort().join(" ") ?? "";
+              const sourceNumbers = numbers(segment.text);
+              if (corrected && (!sourceNumbers || numbers(corrected) === sourceNumbers)) {
+                provider = corrected === translatedText ? "로컬 검토 완료" : "로컬 교정";
+                translatedText = corrected;
+              }
+            }
+          }
+          if (!translatedText && correctionGuidance) {
             controller.signal.throwIfAborted();
             result = await translateSegment(effectiveSettings, segment, correctionGuidance, controller.signal);
             translatedText = sanitizeTranslatedSubtitle(segment, result.translatedText, effectiveSettings);
+            provider = result.provider;
           }
         }
         if (!translatedText) {
           return { ok: false as const, error: BLOCKED_HALLUCINATION_ERROR };
         }
         controller.signal.throwIfAborted();
-        rememberTranslation(key, translatedText);
+        if (!draft) rememberTranslation(key, translatedText);
 
-        return { ok: true as const, translatedText, provider: result.provider };
+        return { ok: true as const, translatedText, provider };
       } catch (error) {
         return { ok: false as const, error: getErrorMessage(error) };
       }
     })().finally(() => {
-      if (translationInFlight.get(key) === request) translationInFlight.delete(key);
+      if (translationInFlight.get(requestKey) === request) translationInFlight.delete(requestKey);
     });
     request = { promise: translationPromise, controller, users: 0 };
-    translationInFlight.set(key, request);
+    translationInFlight.set(requestKey, request);
   }
   request.users += 1;
   let cancel: (() => void) | undefined;
@@ -1750,7 +1754,7 @@ async function translateAndRespond(
     // A visible caption may still need a request whose pretranslation consumer was cancelled.
     if (request.users === 0) {
       request.controller.abort();
-      if (translationInFlight.get(key) === request) translationInFlight.delete(key);
+      if (translationInFlight.get(requestKey) === request) translationInFlight.delete(requestKey);
     }
   }
 }
@@ -2504,8 +2508,30 @@ async function stopAudioCaptureInternal(tabId?: number, expectedVideoId?: string
   return { ok: true };
 }
 
-function stopAudioCapture(tabId?: number, expectedVideoId?: string): Promise<MessageResponse> {
-  return enqueueAudioLifecycle(() => stopAudioCaptureInternal(tabId, expectedVideoId));
+function stopAudioCapture(tabId?: number, expectedVideoId?: string, fromPopup = false): Promise<AudioCaptureStopResponse> {
+  return enqueueAudioLifecycle(async () => {
+    if (!fromPopup) return stopAudioCaptureInternal(tabId, expectedVideoId);
+
+    const page = tabId ? getVideoPage(await getTabUrl(tabId)) : undefined;
+    if (!page || page.videoId !== expectedVideoId) {
+      return { ok: false, error: "영상이 바뀌었습니다. 현재 탭에서 팝업을 다시 열어 주세요." };
+    }
+
+    const result: AudioCaptureStopResponse = expectedVideoId
+      ? await stopAudioCaptureInternal(tabId, expectedVideoId)
+      : { ok: true };
+    if (!result.ok || getLocalSttServerState().state !== "running") return result;
+
+    const remaining = await getOffscreenAudioState();
+    // Chrome can still report this tab as captured after the offscreen recorder has released it.
+    if (activeAudioTabId || remaining?.recording ||
+        (await liveCapturedTabIds()).some((id) => id !== tabId || remaining?.recording !== false)) {
+      return { ok: false, error: "음성 캡처가 실행 중입니다. 캡처 중인 영상 탭에서 다시 중지해 주세요." };
+    }
+
+    await stopLocalSttServer();
+    return { ok: true, localSttStopped: true };
+  });
 }
 
 async function notifyTab(tabId: number, message: RuntimeMessage): Promise<void> {
@@ -2842,9 +2868,14 @@ async function processStreamTranscript(message: Extract<RuntimeMessage, { type: 
     if (settings.contentMode === "lyrics" || segment.detectedContentMode === "lyrics") {
       return;
     }
-    await notifyTab(message.tabId, { ...message, segment });
+    const progress = notifyTab(message.tabId, { ...message, segment });
     if (!signal.aborted && shouldTranslateStreamPartial(message.tabId, segment)) {
-      await translateStreamSegment(message.tabId, message.videoId, segment, false, translationConfigRevision);
+      await Promise.all([
+        progress,
+        translateStreamSegment(message.tabId, message.videoId, segment, false, translationConfigRevision)
+      ]);
+    } else {
+      await progress;
     }
     return;
   }
@@ -2894,7 +2925,7 @@ async function translateStreamSegment(tabId: number, videoId: string, segment: C
     if (isFinal) {
       existing.pendingFinal = work;
       existing.pending = undefined;
-      if (existing.activePartial && existing.activePartial.text !== segment.text) {
+      if (existing.activePartial && (existing.activePartial.draft || existing.activePartial.text !== segment.text)) {
         existing.activePartial.controller.abort();
       }
     } else {
@@ -2929,13 +2960,22 @@ async function translateQueuedStreamSegment(
   translationConfigRevision: number, queue: StreamTranslationQueue, signal: AbortSignal
 ): Promise<void> {
   const snapshot = await loadSettingsSnapshot();
-  if (snapshot.translationConfigRevision !== translationConfigRevision || signal.aborted) return;
+  if (snapshot.translationConfigRevision !== translationConfigRevision || signal.aborted || (!isFinal && queue.pendingFinal)) return;
 
-  const correction = await matchUserCorrection(tabId, videoId, segment, isFinal);
-  if (signal.aborted) return;
+  const { settings } = snapshot;
+  const draft = !isFinal && (
+    (settings.translationProvider === "lmStudio" && isLocalBaseUrl(settings.lmStudio.baseUrl)) ||
+    (settings.translationProvider === "ollama" && isLocalBaseUrl(settings.ollama.baseUrl))
+  );
+  if (draft && queue.activePartial) queue.activePartial.draft = true;
+  const correctionState = correctionSessionsByTab.get(tabId);
+  const correction = !draft || (correctionState?.videoId === videoId && correctionState.session)
+    ? await matchUserCorrection(tabId, videoId, segment, isFinal)
+    : undefined;
+  if (signal.aborted || (!isFinal && queue.pendingFinal)) return;
   const translation = correction
     ? { ok: true as const, translatedText: correction.translatedText, provider: correction.provider }
-    : await translateAndRespond(segmentWithAudioContext(tabId, segment), signal, snapshot.settings);
+    : await translateAndRespond(draft ? segment : segmentWithAudioContext(tabId, segment), signal, settings, draft);
   if (
     streamTranslationQueuesByTab.get(tabId) !== queue || signal.aborted || (!isFinal && queue.pendingFinal) ||
     tabId !== activeAudioTabId ||
@@ -3143,7 +3183,8 @@ chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
       }
 
       if (message.type === "STOP_AUDIO_CAPTURE") {
-        sendResponse(await stopAudioCapture(message.tabId ?? sender.tab?.id, message.videoId));
+        const fromPopup = sender.id === chrome.runtime.id && sender.url === chrome.runtime.getURL("popup.html");
+        sendResponse(await stopAudioCapture(message.tabId ?? sender.tab?.id, message.videoId, fromPopup));
         return;
       }
 

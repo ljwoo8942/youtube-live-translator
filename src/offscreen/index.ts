@@ -4,8 +4,9 @@ let activeStream: MediaStream | undefined;
 let mediaRecorder: MediaRecorder | undefined;
 let audioContext: AudioContext | undefined;
 let audioSource: MediaStreamAudioSourceNode | undefined;
-let processorNode: ScriptProcessorNode | undefined;
-let silentGain: GainNode | undefined;
+let processorNode: AudioWorkletNode | undefined;
+let pcmWorkletLoaded = false;
+let streamAudioRevision = 0;
 let sttSocket: WebSocket | undefined;
 let activeTabId: number | undefined;
 let activeVideoId: string | undefined;
@@ -20,6 +21,7 @@ let streamFrameCount = 0;
 let lastClientStreamStatusAt = 0;
 let captureLifecycleQueue: Promise<void> = Promise.resolve();
 const discardedRecorders = new WeakSet<MediaRecorder>();
+const MAX_STREAM_BUFFER_BYTES = 32_000;
 
 type StreamingConfig = {
   endpoint: string;
@@ -192,87 +194,51 @@ function streamUrl(config: StreamingConfig): string | undefined {
   }
 }
 
-function mixToMono(buffer: AudioBuffer): Float32Array {
-  const channelCount = Math.max(1, buffer.numberOfChannels);
-  if (channelCount === 1) {
-    return buffer.getChannelData(0);
-  }
-
-  const output = new Float32Array(buffer.length);
-  const channelScale = 1 / channelCount;
-  for (let channel = 0; channel < channelCount; channel += 1) {
-    const input = buffer.getChannelData(channel);
-    for (let index = 0; index < output.length; index += 1) {
-      output[index] += input[index] * channelScale;
-    }
-  }
-  return output;
-}
-
-function downsampleTo16k(input: Float32Array, inputRate: number): Float32Array {
-  if (inputRate === 16000) {
-    return input;
-  }
-
-  const ratio = inputRate / 16000;
-  const outputLength = Math.max(1, Math.floor(input.length / ratio));
-  const output = new Float32Array(outputLength);
-  for (let index = 0; index < outputLength; index += 1) {
-    const start = Math.floor(index * ratio);
-    const end = Math.min(input.length, Math.max(start + 1, Math.floor((index + 1) * ratio)));
-    let sum = 0;
-    for (let sourceIndex = start; sourceIndex < end; sourceIndex += 1) {
-      sum += input[sourceIndex];
-    }
-    output[index] = sum / Math.max(1, end - start);
-  }
-  return output;
-}
-
-function pcm16Buffer(samples: Float32Array): ArrayBuffer {
-  const buffer = new ArrayBuffer(samples.length * 2);
-  const view = new DataView(buffer);
-  for (let index = 0; index < samples.length; index += 1) {
-    const sample = Math.max(-1, Math.min(1, samples[index]));
-    view.setInt16(index * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
-  }
-  return buffer;
-}
-
 function teardownStreamingNodes(): void {
-  processorNode?.disconnect();
-  silentGain?.disconnect();
-  processorNode = undefined;
-  silentGain = undefined;
-  if (sttSocket && sttSocket.readyState <= WebSocket.OPEN) {
-    sttSocket.close();
+  if (processorNode) {
+    audioSource?.disconnect(processorNode);
+    processorNode.disconnect();
+    processorNode.port.onmessage = null;
+    processorNode.port.close();
+    processorNode = undefined;
   }
+  const socket = sttSocket;
   sttSocket = undefined;
+  if (socket && socket.readyState <= WebSocket.OPEN) socket.close();
+  streamAudioRevision = 0;
   streamFrameCount = 0;
   lastClientStreamStatusAt = 0;
 }
 
 function startStreamingProcessor(source: MediaStreamAudioSourceNode, socket: WebSocket): void {
-  if (!audioContext || !activeTabId) {
-    return;
-  }
-
-  activeMode = "stream";
-  const processor = audioContext.createScriptProcessor(4096, 1, 1);
-  const gain = audioContext.createGain();
-  gain.gain.value = 0;
+  if (!audioContext) throw new Error("활성 오디오 컨텍스트가 없습니다.");
+  const processor = new AudioWorkletNode(audioContext, "stt-pcm", {
+    channelCount: 1,
+    channelCountMode: "explicit",
+    channelInterpretation: "speakers",
+    outputChannelCount: [1]
+  });
+  source.connect(processor);
+  processor.connect(audioContext.destination);
   processorNode = processor;
-  silentGain = gain;
-
-  processor.addEventListener("audioprocess", (event) => {
-    if (socket.readyState !== WebSocket.OPEN || !audioContext) {
+  activeMode = "stream";
+  const fallBackToRecorder = (statusText: string): void => {
+    if (sttSocket !== socket) return;
+    teardownStreamingNodes();
+    startRecorderCycle();
+    void relayStatus("recording", undefined, activeTabId, statusText);
+  };
+  processor.addEventListener("processorerror", () => {
+    fallBackToRecorder("스트리밍 오디오 처리 실패, HTTP STT fallback");
+  });
+  processor.port.onmessage = ({ data }: MessageEvent<{ buffer: ArrayBuffer; revision: number }>) => {
+    if (sttSocket !== socket || socket.readyState !== WebSocket.OPEN || data.revision !== streamAudioRevision) return;
+    if (socket.bufferedAmount + data.buffer.byteLength > MAX_STREAM_BUFFER_BYTES) {
+      fallBackToRecorder("스트리밍 오디오 전송 지연, HTTP STT fallback");
       return;
     }
-
-    const mixed = mixToMono(event.inputBuffer);
-    const downsampled = downsampleTo16k(mixed, audioContext.sampleRate);
     try {
-      socket.send(pcm16Buffer(downsampled));
+      socket.send(data.buffer);
     } catch {
       return;
     }
@@ -282,11 +248,7 @@ function startStreamingProcessor(source: MediaStreamAudioSourceNode, socket: Web
       lastClientStreamStatusAt = now;
       void relayStatus("recording", undefined, activeTabId, `브라우저 오디오 전송 중 (${streamFrameCount} frames)`);
     }
-  });
-
-  source.connect(processor);
-  processor.connect(gain);
-  gain.connect(audioContext.destination);
+  };
 }
 
 function relayStreamTranscript(payload: unknown, tabId: number, videoId: string): void {
@@ -338,7 +300,7 @@ function relayStreamTranscript(payload: unknown, tabId: number, videoId: string)
 }
 
 async function startStreamingStt(source: MediaStreamAudioSourceNode, config: StreamingConfig): Promise<boolean> {
-  if (!activeTabId || !activeVideoId || !config.endpoint) {
+  if (!audioContext || !activeTabId || !activeVideoId || !config.endpoint) {
     return false;
   }
 
@@ -352,9 +314,13 @@ async function startStreamingStt(source: MediaStreamAudioSourceNode, config: Str
 
   let socket: WebSocket;
   try {
+    if (!pcmWorkletLoaded) {
+      await audioContext.audioWorklet.addModule(chrome.runtime.getURL("stt-pcm-worklet.js"));
+      pcmWorkletLoaded = true;
+    }
     socket = new WebSocket(url);
   } catch {
-    void relayStatus("recording", undefined, tabIdForSocket, "스트리밍 STT 연결 생성 실패, HTTP STT fallback", videoIdForSocket);
+    void relayStatus("recording", undefined, tabIdForSocket, "스트리밍 오디오 초기화 실패, HTTP STT fallback", videoIdForSocket);
     return false;
   }
   socket.binaryType = "arraybuffer";
@@ -376,12 +342,20 @@ async function startStreamingStt(source: MediaStreamAudioSourceNode, config: Str
       }
       settled = true;
       window.clearTimeout(timeout);
-      startStreamingProcessor(source, socket);
+      try {
+        startStreamingProcessor(source, socket);
+      } catch (error) {
+        console.debug("Could not start streaming audio processor", error);
+        teardownStreamingNodes();
+        resolve(false);
+        return;
+      }
       void relayStatus("recording", undefined, tabIdForSocket, "로컬 스트리밍 STT 연결됨", videoIdForSocket);
       resolve(true);
     });
 
     socket.addEventListener("message", (event) => {
+      if (sttSocket !== socket) return;
       try {
         relayStreamTranscript(JSON.parse(String(event.data)), tabIdForSocket, videoIdForSocket);
       } catch (error) {
@@ -442,6 +416,7 @@ async function stopCapture(): Promise<{ tabId?: number; videoId?: string }> {
     mediaRecorder = undefined;
     activeStream = undefined;
     audioContext = undefined;
+    pcmWorkletLoaded = false;
     audioSource = undefined;
     activeTabId = undefined;
     activeVideoId = undefined;
@@ -510,6 +485,8 @@ function resetCaptureBuffer(tabId: number, videoId: string): void {
     return;
   }
   if (activeMode === "stream" && sttSocket?.readyState === WebSocket.OPEN) {
+    streamAudioRevision += 1;
+    processorNode?.port.postMessage(streamAudioRevision);
     sttSocket.send("reset");
     return;
   }
@@ -623,16 +600,19 @@ chrome.runtime.onMessage.addListener((rawMessage, _sender, sendResponse) => {
       }
 
       if (message.type === "STOP_AUDIO_CAPTURE") {
-        if (
-          message.tabId &&
-          message.videoId &&
-          (activeTabId !== message.tabId || activeVideoId !== message.videoId)
-        ) {
-          sendResponse({ ok: true });
-          return;
+        const stopped = await enqueueCaptureLifecycle(async () => {
+          if (
+            message.tabId &&
+            message.videoId &&
+            (activeTabId !== message.tabId || activeVideoId !== message.videoId)
+          ) {
+            return undefined;
+          }
+          return stopCapture();
+        });
+        if (stopped) {
+          await relayStatus("idle", undefined, stopped.tabId, undefined, stopped.videoId);
         }
-        const stopped = await enqueueCaptureLifecycle(stopCapture);
-        await relayStatus("idle", undefined, stopped.tabId, undefined, stopped.videoId);
         sendResponse({ ok: true });
         return;
       }

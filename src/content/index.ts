@@ -302,14 +302,7 @@ function videoCanProduceAudio(): boolean {
 }
 
 function videoPlaybackEnded(): boolean {
-  const video = findVideoElement();
-  if (!video) {
-    return false;
-  }
-  return Boolean(
-    video.ended ||
-      (Number.isFinite(video.duration) && video.duration > 1 && video.duration - video.currentTime < 0.5)
-  );
+  return findVideoElement()?.ended === true;
 }
 
 function resetPausedAudioBuffer(event: Event): void {

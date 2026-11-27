@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
 import { getVideoPage, VIDEO_SITE_MATCHES } from "../src/shared/videoSites.ts";
 import {
   assistOfficialCaptionSegment,
@@ -208,7 +209,6 @@ test("audio setting changes reconfigure STT without reacquiring the tab stream",
 test("transient pause during fullscreen transitions does not restart tab capture", () => {
   assert.match(content, /if \(audioCaptureRequested && videoPlaybackEnded\(\)\) \{\s*await stopAudioFallback\(\);/);
   assert.doesNotMatch(content, /audioCaptureRequested && !videoCanProduceAudio\(\)/);
-  assert.match(content, /function videoPlaybackEnded\(\)[\s\S]*?if \(!video\) \{\s*return false;/);
 });
 
 test("current audio transcripts are not dropped by transient video readiness state", () => {
@@ -477,7 +477,7 @@ test("Korean lyrics prompt avoids dry declarative prose endings", () => {
   assert.match(providers, /한국어 가사 자막은 보고서처럼 매 줄을 ~다, ~한다, ~된다, ~였다로 닫지 않는다/);
   assert.match(providers, /초안이 ~다, ~한다, ~된다, ~였다로 끝나면 원문이 의도적 선언문이 아닌 한 다시 써서 가사다운 종결로 바꾼다/);
   assert.match(providers, /한국어 일반 자막도 기본값을 문어체 ~다로 두지 않는다/);
-  assert.match(providers, /痛むごとに血が流れて落ちていく -> 아플 때마다 피가 흘러내려/);
+  assert.match(providers, /\["痛むごとに血が流れて落ちていく", "아플 때마다 피가 흘러내려"\]/);
   assert.match(translationVersion, /subtitle-fidelity-first-v29/);
 });
 
@@ -565,20 +565,49 @@ test("offscreen lifecycle commands only accept explicitly routed background mess
   assert.match(background, /type: "GET_OFFSCREEN_AUDIO_STATE",\s*target: "offscreen"/);
 });
 
-test("streaming STT mixes stereo audio before downsampling", () => {
-  assert.match(offscreen, /function mixToMono\(buffer: AudioBuffer\): Float32Array \{/);
-  assert.match(offscreen, /buffer\.numberOfChannels/);
-  assert.match(offscreen, /buffer\.getChannelData\(channel\)/);
-  assert.match(offscreen, /const mixed = mixToMono\(event\.inputBuffer\)/);
-  assert.match(offscreen, /const downsampled = downsampleTo16k\(mixed, audioContext\.sampleRate\)/);
-  assert.doesNotMatch(offscreen, /event\.inputBuffer\.getChannelData\(0\)[\s\S]{0,80}downsampleTo16k/);
+test("streaming STT downmixes in the audio graph and bounds pending socket data", () => {
+  assert.match(offscreen, /new AudioWorkletNode[\s\S]*?channelCount: 1,\s*channelCountMode: "explicit"/);
+  assert.doesNotMatch(offscreen, /createScriptProcessor/);
+  assert.match(offscreen, /socket\.bufferedAmount \+ data\.buffer\.byteLength > MAX_STREAM_BUFFER_BYTES/);
+  assert.match(offscreen, /data\.revision !== streamAudioRevision/);
 });
 
-test("streaming STT downsampling averages source ranges for music input", () => {
-  assert.match(offscreen, /const start = Math\.floor\(index \* ratio\)/);
-  assert.match(offscreen, /const end = Math\.min\(input\.length, Math\.max\(start \+ 1, Math\.floor\(\(index \+ 1\) \* ratio\)\)\)/);
-  assert.match(offscreen, /for \(let sourceIndex = start; sourceIndex < end; sourceIndex \+= 1\)/);
-  assert.doesNotMatch(offscreen, /Math\.floor\(index \* ratio\)\)\] \?\? 0/);
+test("streaming PCM keeps the sample rate across quanta and discards partial frames on reset", () => {
+  const script = readSource("public/stt-pcm-worklet.js");
+  for (const sampleRate of [8000, 16000, 44100, 48000]) {
+    const frames = [];
+    let Processor;
+    runInNewContext(script, {
+      sampleRate,
+      AudioWorkletProcessor: class {
+        port = { postMessage: (frame) => frames.push(frame) };
+      },
+      registerProcessor(name, implementation) {
+        assert.equal(name, "stt-pcm");
+        Processor = implementation;
+      }
+    });
+    const processor = new Processor();
+    const feed = (count, value) => {
+      for (let i = 0; i < count; i += 128) {
+        processor.process([[new Float32Array(Math.min(128, count - i)).fill(value)]]);
+      }
+    };
+
+    feed(sampleRate * 0.04, 1);
+    assert.equal(frames.length, 0);
+    processor.port.onmessage({ data: 1 });
+    feed(sampleRate * 2, -0.25);
+    assert.equal(frames.length, 25);
+    for (const { buffer, revision } of frames) {
+      assert.equal(revision, 1);
+      assert.equal(buffer.byteLength, 2560);
+      const pcm = new DataView(buffer);
+      for (let offset = 0; offset < buffer.byteLength; offset += 2) {
+        assert.equal(pcm.getInt16(offset, true), -8192);
+      }
+    }
+  }
 });
 
 test("playing events preserve the active STT buffer and tab capture", () => {
@@ -632,7 +661,7 @@ test("mini retry clears stale stop intent before restarting the actual offscreen
 test("SPA capture stops and status updates are isolated by video session", () => {
   assert.match(content, /const previousVideoId = activeVideoId;[\s\S]*?stopAudioFallback\(false, previousVideoId\)/);
   assert.match(content, /sendMessage\(\{ type: "STOP_AUDIO_CAPTURE", videoId: captureVideoId \}\)/);
-  assert.match(background, /stopAudioCapture\(message\.tabId \?\? sender\.tab\?\.id, message\.videoId\)/);
+  assert.match(background, /stopAudioCapture\(message\.tabId \?\? sender\.tab\?\.id, message\.videoId, fromPopup\)/);
   assert.match(offscreen, /activeTabId !== message\.tabId \|\| activeVideoId !== message\.videoId/);
   assert.match(content, /if \(!message\.videoId \|\| message\.videoId !== activeVideoId\)/);
   assert.match(

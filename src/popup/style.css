@@ -253,10 +253,6 @@ input:focus {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
-#stopLocalSttServer {
-  grid-column: 1 / -1;
-}
-
 .primary-actions button {
   padding-inline: 8px;
 }

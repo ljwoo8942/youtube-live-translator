@@ -656,6 +656,53 @@ class FakeStreamSocket:
 
 
 class StreamSchedulingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_audio_received_during_throttle_is_decoded_once(self) -> None:
+        socket = FakeStreamSocket(3)
+        sleeping, release = asyncio.Event(), asyncio.Event()
+        sent: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        record = socket.send_json
+        windows: list[int] = []
+
+        async def delay(_seconds: float) -> None:
+            sleeping.set()
+            await release.wait()
+
+        async def send(message: dict[str, object]) -> None:
+            await record(message)
+            sent.put_nowait(message)
+
+        def infer(_model: object, audio: np.ndarray, *_args: object) -> tuple[str, bool, int]:
+            windows.append(audio.size)
+            return "first line" if len(windows) == 1 else "fresh line", False, 1
+
+        socket.send_json = send
+        with (
+            mock.patch.object(app, "_load_model", return_value=object()),
+            mock.patch.object(app, "_stream_profile_for_model", return_value=(1, 1, 0.01, 100, 0)),
+            mock.patch.object(app, "_startup_stream_timing", return_value=(0.01, 100)),
+            mock.patch.object(app.asyncio, "sleep", side_effect=delay),
+            mock.patch.object(app, "_stream_transcribe_text", side_effect=infer),
+        ):
+            socket.audio(1)
+            task = asyncio.create_task(app.audio_stream(socket))
+            try:
+                await asyncio.wait_for(sent.get(), 2)
+                socket.audio(2)
+                await asyncio.wait_for(sleeping.wait(), 2)
+                socket.audio(3)
+                await asyncio.wait_for(socket.incoming.join(), 2)
+                release.set()
+                await asyncio.wait_for(sent.get(), 2)
+                with self.assertRaises(TimeoutError):
+                    await asyncio.wait_for(sent.get(), 0.2)
+                socket.incoming.put_nowait({"type": "websocket.disconnect"})
+                await asyncio.wait_for(task, 2)
+            finally:
+                release.set()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(windows, [800, 2400])
+
     async def test_finalization_retains_audio_received_while_inference_is_running(self) -> None:
         socket = FakeStreamSocket(3)
         started = [threading.Event(), threading.Event()]
