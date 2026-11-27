@@ -94,13 +94,26 @@ test("legacy STT lyric examples are blocked before translation", () => {
   assert.equal(c.isProbableAudioHallucination("ラララ、君と歌う。Wow, baby!"), false);
 });
 
-test("pausing the current video resets its buffer and blocks audio subtitles until resume", async () => {
+test("brief player pauses preserve the buffer and sustained pauses reset the current video", async () => {
   const video = { paused: false };
   const sent = [];
+  const timers = new Map();
+  let nextTimer = 0;
+  const runTimers = () => {
+    for (const [id, callback] of timers) {
+      timers.delete(id);
+      callback();
+    }
+  };
   const c = functions("src/content/index.ts", ["shouldAcceptAudioSegment", "resetPausedAudioBuffer"], {
     settings: { enabled: true, inputMode: "audio" },
     activeVideoId: "v",
     audioCaptureRequested: true, audioStopRequested: false, audioCaptureSuppressed: false,
+    pausedAudioResetTimer: undefined, PAUSED_AUDIO_RESET_GRACE_MS: 200,
+    window: {
+      setTimeout(callback) { const id = ++nextTimer; timers.set(id, callback); return id; },
+      clearTimeout(id) { timers.delete(id); }
+    },
     findVideoElement: () => video, currentWatchVideoId: () => "v",
     chrome: { runtime: { sendMessage: async (message) => { sent.push(message); } } }
   });
@@ -108,10 +121,24 @@ test("pausing the current video resets its buffer and blocks audio subtitles unt
   video.paused = true;
   c.resetPausedAudioBuffer({ target: { paused: true } });
   c.resetPausedAudioBuffer({ target: video });
+  assert.equal(sent.length, 0);
+  video.paused = false;
+  runTimers();
+  assert.equal(sent.length, 0);
+
+  video.paused = true;
+  c.resetPausedAudioBuffer({ target: video });
+  c.resetPausedAudioBuffer({ target: video });
+  assert.equal(timers.size, 1);
+  assert.equal(c.shouldAcceptAudioSegment(segment("late result")), false);
+  runTimers();
   await setImmediate();
   assert.deepEqual(sent.map((message) => [message.type, message.videoId]), [["RESET_AUDIO_CAPTURE_BUFFER", "v"]]);
-  assert.equal(c.shouldAcceptAudioSegment(segment("late result")), false);
   assert.equal(c.shouldAcceptAudioSegment({ source: "officialCaption" }), true);
+  c.resetPausedAudioBuffer({ target: video });
+  c.activeVideoId = "next";
+  runTimers();
+  assert.equal(sent.length, 1);
   video.paused = false;
   assert.equal(c.shouldAcceptAudioSegment(segment("after resume")), true);
 });

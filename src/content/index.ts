@@ -29,8 +29,7 @@ const TIMED_TEXT_TRANSLATION_PREFETCH_MS = 4000;
 const PRETRANSLATE_RETRY_COOLDOWN_MS = 15_000;
 const PRETRANSLATE_PRIORITY_BUCKET_MS = 5_000;
 const OVERLAY_REFRESH_DELAY_MS = 100;
-const FULLSCREEN_AUDIO_RESUME_DELAY_MS = 180;
-const FULLSCREEN_AUDIO_FALLBACK_MS = 1500;
+const PAUSED_AUDIO_RESET_GRACE_MS = 200;
 const MANUAL_AUDIO_START_PENDING_MS = 3500;
 const OFFICIAL_CAPTION_DOM_READ_DELAY_MS = 30;
 const OFFICIAL_TIMED_TEXT_GRACE_MS = 650;
@@ -70,8 +69,7 @@ let audioStartBlockedUntil = 0;
 let manualAudioStartPendingUntil = 0;
 let overlayRefreshTimer: number | undefined;
 let officialCaptionDomReadTimer: number | undefined;
-let fullscreenAudioResumeTimer: number | undefined;
-let resumeAudioAfterFullscreenIntentRequested = false;
+let pausedAudioResetTimer: number | undefined;
 let captionTrackRefreshTimers: number[] = [];
 let videoSessionCaptionLoadTimers: number[] = [];
 let pendingTimedTextTrackKey = "";
@@ -307,12 +305,22 @@ function videoPlaybackEnded(): boolean {
 
 function resetPausedAudioBuffer(event: Event): void {
   const video = findVideoElement();
-  if (event.target !== video || !video?.paused || !audioCaptureRequested || audioStopRequested || !activeVideoId) {
+  const videoId = activeVideoId;
+  if (event.target !== video || !video?.paused || !audioCaptureRequested || audioStopRequested || !videoId) {
     return;
   }
-  void chrome.runtime.sendMessage({ type: "RESET_AUDIO_CAPTURE_BUFFER", videoId: activeVideoId }).catch((error) => {
-    console.debug("Paused audio buffer reset failed", error);
-  });
+  if (pausedAudioResetTimer !== undefined) window.clearTimeout(pausedAudioResetTimer);
+
+  // A fullscreen transition can pause the same media element briefly.
+  pausedAudioResetTimer = window.setTimeout(() => {
+    pausedAudioResetTimer = undefined;
+    if (videoId !== activeVideoId || !audioCaptureRequested || audioStopRequested || !video.paused || video !== findVideoElement()) {
+      return;
+    }
+    void chrome.runtime.sendMessage({ type: "RESET_AUDIO_CAPTURE_BUFFER", videoId }).catch((error) => {
+      console.debug("Paused audio buffer reset failed", error);
+    });
+  }, PAUSED_AUDIO_RESET_GRACE_MS);
 }
 
 function shouldAcceptAudioSegment(segment?: CaptionSegment): boolean {
@@ -1315,67 +1323,8 @@ async function runTick(): Promise<void> {
   }
 }
 
-function scheduleFullscreenAudioResume(delayMs: number): void {
-  if (fullscreenAudioResumeTimer !== undefined) {
-    window.clearTimeout(fullscreenAudioResumeTimer);
-  }
-  fullscreenAudioResumeTimer = window.setTimeout(() => {
-    fullscreenAudioResumeTimer = undefined;
-    resumeAudioAfterFullscreenIntent();
-  }, delayMs);
-}
-
-function resumeAudioAfterFullscreenIntent(): void {
-  if (!resumeAudioAfterFullscreenIntentRequested) {
-    return;
-  }
-  if (stoppingAudioCapture) {
-    scheduleFullscreenAudioResume(100);
-    return;
-  }
-  resumeAudioAfterFullscreenIntentRequested = false;
-  audioCaptureSuppressed = false;
-  audioStopRequested = false;
-  audioStartBlockedUntil = 0;
-  manualAudioStartPendingUntil = 0;
-  void startAudioFallbackIfNeeded();
-}
-
-async function suspendAudioForFullscreenIntent(): Promise<void> {
-  if (
-    !settings.enabled ||
-    !audioCaptureRequested ||
-    audioStopRequested ||
-    stoppingAudioCapture ||
-    !activeVideoId
-  ) {
-    return;
-  }
-  const requestedVideoId = activeVideoId;
-  resumeAudioAfterFullscreenIntentRequested = true;
-  audioCaptureSuppressed = true;
-  setAudioControlStatus("전체화면 전환 · 음성 STT 일시 중지");
-  scheduleFullscreenAudioResume(FULLSCREEN_AUDIO_FALLBACK_MS);
-  await stopAudioFallback(false, requestedVideoId);
-}
-
-function handleFullscreenPointerIntent(event: PointerEvent): void {
-  const target = event.target;
-  if (!(target instanceof Element) || !target.closest(".ytp-fullscreen-button")) {
-    return;
-  }
-  const player = findPlayerElement();
-  if (document.fullscreenElement || player?.classList.contains("ytp-fullscreen")) {
-    return;
-  }
-  void suspendAudioForFullscreenIntent();
-}
-
 function handleFullscreenChange(): void {
   if (!isYouTubeSite) scheduleOverlayRefresh();
-  if (resumeAudioAfterFullscreenIntentRequested && document.fullscreenElement) {
-    scheduleFullscreenAudioResume(FULLSCREEN_AUDIO_RESUME_DELAY_MS);
-  }
 }
 
 function isOverlayMutationElement(element: Element): boolean {
@@ -1472,7 +1421,6 @@ function installObservers(): void {
   document.addEventListener("yt-navigate-finish", resyncVideoSessionAfterNavigation);
   document.addEventListener("yt-page-data-updated", resyncVideoSessionAfterNavigation);
   document.addEventListener("yt-player-updated", resyncVideoSessionAfterNavigation);
-  document.addEventListener("pointerdown", handleFullscreenPointerIntent, true);
   document.addEventListener("fullscreenchange", handleFullscreenChange, true);
   window.addEventListener("popstate", resyncVideoSessionAfterNavigation);
   document.addEventListener(

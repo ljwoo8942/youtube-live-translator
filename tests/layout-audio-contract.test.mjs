@@ -222,25 +222,14 @@ test("current audio transcripts are not dropped by transient video readiness sta
   assert.match(acceptAudioSegment, /!audioCaptureSuppressed/);
 });
 
-test("fullscreen entry suspends tab capture before the click and resumes it after entry", () => {
+test("fullscreen changes refresh placement without interrupting tab capture", () => {
   assert.match(content, /document\.addEventListener\("fullscreenchange", handleFullscreenChange, true\)/);
-  assert.match(content, /document\.addEventListener\("pointerdown", handleFullscreenPointerIntent, true\)/);
-  assert.match(
-    content,
-    /function handleFullscreenPointerIntent\(event: PointerEvent\): void \{[\s\S]*?target\.closest\("\.ytp-fullscreen-button"\)[\s\S]*?void suspendAudioForFullscreenIntent\(\);/
-  );
-  assert.match(
-    content,
-    /async function suspendAudioForFullscreenIntent\(\): Promise<void> \{[\s\S]*?await stopAudioFallback\(false, requestedVideoId\);/
-  );
-  assert.match(
-    content,
-    /function handleFullscreenChange\(\): void \{[\s\S]*?document\.fullscreenElement[\s\S]*?scheduleFullscreenAudioResume\(FULLSCREEN_AUDIO_RESUME_DELAY_MS\);/
-  );
-  assert.match(
-    content,
-    /function resumeAudioAfterFullscreenIntent\(\): void \{[\s\S]*?audioCaptureSuppressed = false;[\s\S]*?audioStopRequested = false;[\s\S]*?void startAudioFallbackIfNeeded\(\);/
-  );
+  assert.doesNotMatch(content, /handleFullscreenPointerIntent|suspendAudioForFullscreenIntent|FULLSCREEN_AUDIO_RESUME_DELAY_MS/);
+  const fullscreenStart = content.indexOf("function handleFullscreenChange");
+  const fullscreenEnd = content.indexOf("function isOverlayMutationElement", fullscreenStart);
+  const handler = content.slice(fullscreenStart, fullscreenEnd);
+  assert.match(handler, /scheduleOverlayRefresh\(\)/);
+  assert.doesNotMatch(handler, /AudioCapture|AudioFallback|FullscreenAudioResume/);
   assert.doesNotMatch(content, /fullscreenSettlingUntil|FULLSCREEN_SETTLE_MS|prepareForFullscreenTransition/);
   assert.match(
     content,
@@ -270,7 +259,6 @@ test("STT overlay callbacks never reattach the overlay during fullscreen recover
 
 test("content script never toggles YouTube's native fullscreen control", () => {
   assert.doesNotMatch(content, /recoverStaleYouTubeFullscreenState|scheduleFullscreenStateVerification/);
-  assert.match(content, /target\.closest\("\.ytp-fullscreen-button"\)/);
   assert.doesNotMatch(content, /\b(?:requestFullscreen|exitFullscreen)\s*\(|fullscreenButton\.click\(\)|button\.click\(\)/);
 });
 
